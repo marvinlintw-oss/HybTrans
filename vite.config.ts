@@ -3,10 +3,20 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
-  base: './', // 關鍵：確保在 GitHub Pages (/HybTrans/) 與本機皆能正確解析資源與 Worker 路徑
+  base: './',
   plugins: [react()],
   optimizeDeps: {
-    exclude: ['onnxruntime-web', '@mlc-ai/web-llm'],
+    // 關鍵：將 Worker 會用到的 @huggingface/transformers 預先列入 include，
+    // 徹底阻止首次上傳音檔啟動 Worker 時觸發 Vite "re-optimizing dependencies" 自動 Refresh！
+    include: [
+      '@huggingface/transformers',
+      'opencc-js',
+      'lucide-react',
+      'zustand',
+      'mammoth',
+      'jszip',
+    ],
+    exclude: ['@mlc-ai/web-llm'],
   },
   worker: {
     format: 'es',

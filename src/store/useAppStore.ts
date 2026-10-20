@@ -3,6 +3,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import {
   CorrectionPatchItem,
+  DiarizationConfig,
   DictEntry,
   DictScope,
   EngineConfig,
@@ -17,11 +18,6 @@ import {
 import { TIER_PRESET_SPECS } from '../services/modelCacheManager';
 import { DEFAULT_PUBLIC_DICTIONARY, mergeDictLists } from '../utils/dictIO';
 
-/**
- * 跨視窗與跨段落智慧整理器：
- * 1. 若後一段開頭是前一段的補充子句（如「沒有要支援店面翻修的」），自動將該子句搬回前一段語者！
- * 2. 若相鄰兩段為同一位語者且間隔 <= 5 秒、合併後 <= 260 字，自動合併為單一完整段落！
- */
 function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
   if (allSegments.length <= 1) return allSegments;
 
@@ -30,44 +26,6 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
     words: [...s.words],
   }));
 
-  // Pass 1: 跨段落句子搬移 (若 curr 開頭包含「沒有要支援...，可是...」，把前半句搬給 prev！)
-  for (let i = 1; i < list.length; i++) {
-    const prev = list[i - 1];
-    const curr = list[i];
-    if (prev.speakerId !== curr.speakerId && curr.start - prev.end <= 2.0) {
-      const currText = curr.words.map((w) => w.text).join('');
-      const splitIdx = curr.words.findIndex((w, idx) =>
-        idx > 0 && /^(可是|不是|不過|那如果)/.test(w.text)
-      );
-
-      if (
-        splitIdx > 0 &&
-        /^(沒有要支援|沒有要支持)/.test(currText)
-      ) {
-        const movedWords = curr.words.slice(0, splitIdx);
-        const remainWords = curr.words.slice(splitIdx);
-        if (movedWords.length > 0 && remainWords.length > 0) {
-          // 將前半句句尾標點改為句號，搬回給上一位語者
-          if (prev.words.length > 0) {
-            const lastPrev = prev.words[prev.words.length - 1];
-            if (lastPrev.text === '。') {
-              prev.words[prev.words.length - 1] = { ...lastPrev, text: '，' };
-            }
-          }
-          const lastMoved = movedWords[movedWords.length - 1];
-          if (lastMoved.text === '，') {
-            movedWords[movedWords.length - 1] = { ...lastMoved, text: '。' };
-          }
-          prev.words = [...prev.words, ...movedWords];
-          prev.end = movedWords[movedWords.length - 1].end;
-          curr.words = remainWords;
-          curr.start = remainWords[0].start;
-        }
-      }
-    }
-  }
-
-  // Pass 2: 同一個語者連續講的話自動合併成一段 (上限 260 字)
   const merged: Segment[] = [];
   for (const seg of list) {
     if (seg.words.length === 0) continue;
@@ -101,6 +59,21 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
   return merged;
 }
 
+const DEFAULT_DIARIZATION_CONFIG: DiarizationConfig = {
+  engineMode: 'mode_b_advanced_dsp',
+  clusterMethod: 'spectral_cosine',
+  executionBackend: 'wasm',
+  onnxModelFilename: 'nemo_en_titanet_small.int8.onnx',
+  localWasmBasePath: './wasm/',
+  localModelBasePath: './models/',
+  yieldEveryNUnits: 12,
+  enableGlobalMeanCentering: true,
+  languageHint: 'zh',
+  shortTurnConfidenceKeepThreshold: 0.68,
+  pingPongMaxDurSec: 2.2,
+  enablePauseAndSemanticWeighting: true,
+};
+
 interface AppState {
   config: EngineConfig;
   chunks: MacroChunkState[];
@@ -114,6 +87,7 @@ interface AppState {
   modelDownload: ModelDownloadStatus;
 
   updateConfig: (partial: Partial<EngineConfig>) => void;
+  updateDiarizationConfig: (partial: Partial<DiarizationConfig>) => void;
   applyGranularityTier: (tier: GranularityTier) => void;
   initChunks: (totalDurationSec: number) => void;
   updateChunkState: (index: number, partial: Partial<MacroChunkState>) => void;
@@ -162,6 +136,7 @@ export const useAppStore = create<AppState>()(
         mediumAttentionChars: defaultTierSpec.mediumAttentionChars,
         maxRelistenQuota: defaultTierSpec.maxRelistenQuotaPerChunk,
         relistenPaddingSec: defaultTierSpec.relistenPaddingSec,
+        diarizationConfig: DEFAULT_DIARIZATION_CONFIG,
       },
       chunks: [],
       segments: [],
@@ -184,8 +159,44 @@ export const useAppStore = create<AppState>()(
           config: { ...state.config, ...partial },
         })),
 
+      updateDiarizationConfig: (partial) =>
+        set((state) => ({
+          config: {
+            ...state.config,
+            diarizationConfig: {
+              ...(state.config.diarizationConfig || DEFAULT_DIARIZATION_CONFIG),
+              ...partial,
+            },
+          },
+        })),
+
+      /**
+       * 切換頂部「輕量穩定 / 進階平衡 / 旗艦精修」時，同步連動語者分離演算法深度與重聽配額！
+       */
       applyGranularityTier: (tier) => {
         const spec = TIER_PRESET_SPECS[tier];
+        const currentDiar = get().config.diarizationConfig || DEFAULT_DIARIZATION_CONFIG;
+
+        const tierDiarPatch: Partial<DiarizationConfig> =
+          tier === 'eco_safe'
+            ? {
+                engineMode: 'mode_a_classic',
+                clusterMethod: 'ahc_cosine',
+                yieldEveryNUnits: 8,
+              }
+            : tier === 'balanced_pro'
+            ? {
+                engineMode: 'mode_b_advanced_dsp',
+                clusterMethod: 'spectral_cosine',
+                yieldEveryNUnits: 14,
+              }
+            : {
+                engineMode: 'mode_b_advanced_dsp',
+                clusterMethod: 'spectral_cosine',
+                yieldEveryNUnits: 24,
+                shortTurnConfidenceKeepThreshold: 0.65,
+              };
+
         set((state) => ({
           config: {
             ...state.config,
@@ -198,6 +209,10 @@ export const useAppStore = create<AppState>()(
             mediumAttentionChars: spec.mediumAttentionChars,
             maxRelistenQuota: spec.maxRelistenQuotaPerChunk,
             relistenPaddingSec: spec.relistenPaddingSec,
+            diarizationConfig: {
+              ...currentDiar,
+              ...tierDiarPatch,
+            },
           },
         }));
       },
@@ -351,6 +366,9 @@ export const useAppStore = create<AppState>()(
               next[sp.id] = {
                 ...next[sp.id],
                 centroid: sp.centroid || next[sp.id].centroid,
+                f0Hz: sp.f0Hz ?? next[sp.id].f0Hz,
+                embedding: sp.embedding || next[sp.id].embedding,
+                featureMode: sp.featureMode || next[sp.id].featureMode,
               };
             }
           }
@@ -432,7 +450,7 @@ export const useAppStore = create<AppState>()(
           dictionary: state.dictionary.filter((d) => d.id !== id),
         })),
 
-      promoteDictEntryScope: (id, targetScope) =>
+      promoteDictEntryScope: (id: string, targetScope: DictScope) =>
         set((state) => ({
           dictionary: state.dictionary.map((d) =>
             d.id === id ? { ...d, scope: targetScope } : d
@@ -444,7 +462,7 @@ export const useAppStore = create<AppState>()(
       setCurrentTime: (sec) => set({ currentTime: sec }),
     }),
     {
-      name: 'hybrid-transcriber-storage-v3',
+      name: 'hybrid-transcriber-storage-v4',
       partialize: (state) => ({
         config: state.config,
         dictionary: state.dictionary.filter((d) => d.scope !== 'session'),

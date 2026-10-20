@@ -1,13 +1,29 @@
 // src/components/sidebar/SpeakerSyncPanel.tsx
 import React, { useState } from 'react';
-import { Users, Merge, CheckCircle2, Sliders, Sparkles, Info } from 'lucide-react';
+import {
+  Users,
+  Merge,
+  CheckCircle2,
+  Sliders,
+  Sparkles,
+  Info,
+  Cpu,
+  Globe2,
+} from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
+import {
+  CompliantOnnxSpeakerModel,
+  DiarizationClusterMethod,
+  DiarizationEngineMode,
+  MeetingLanguageHint,
+} from '../../types';
 import * as phoneticModule from '../../utils/phoneticMatcher';
 
 export const SpeakerSyncPanel: React.FC = () => {
   const {
     config,
     updateConfig,
+    updateDiarizationConfig,
     speakers,
     segments,
     renameSpeaker,
@@ -21,6 +37,14 @@ export const SpeakerSyncPanel: React.FC = () => {
   const [nameInput, setNameInput] = useState('');
   const [mergeSourceId, setMergeSourceId] = useState<string>('');
   const [mergeTargetId, setMergeTargetId] = useState<string>('');
+
+  const diarCfg = config.diarizationConfig || {
+    engineMode: 'mode_b_advanced_dsp',
+    clusterMethod: 'spectral_cosine',
+    executionBackend: 'wasm',
+    onnxModelFilename: 'nemo_en_titanet_small.int8.onnx',
+    languageHint: 'auto_multilingual',
+  };
 
   const speakerList = Object.values(speakers);
   const hasMultipleSpeakers = speakerList.length >= 2;
@@ -89,9 +113,9 @@ export const SpeakerSyncPanel: React.FC = () => {
       <div className="flex items-center justify-between border-b border-slate-100 pb-2">
         <div className="flex items-center gap-1.5">
           <Users className="w-4 h-4 text-blue-600" />
-          <h3 className="font-semibold text-slate-800 text-sm">與會語者管理</h3>
+          <h3 className="font-semibold text-slate-800 text-sm">與會語者與分離策略</h3>
           <span
-            title="系統會自動依男女音高與音色區分發言者，並控制在您設定的人數上限內"
+            title="支援三階段可插拔聲紋引擎：可自由切換經典 32維 MFCC、進階 42維去內容耦合 DSP，以及 100% 本地自託管之 NeMo TitaNet / WeSpeaker ONNX 深度聲紋模型"
             className="text-slate-400 hover:text-slate-600 cursor-help"
           >
             <Info className="w-3.5 h-3.5" />
@@ -102,7 +126,109 @@ export const SpeakerSyncPanel: React.FC = () => {
         </span>
       </div>
 
-      {/* 會議人數設定 */}
+      {/* 可插拔語者分離引擎策略與多語系設定 */}
+      <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200/80 space-y-2 text-xs">
+        <div className="flex items-center justify-between gap-1">
+          <span className="text-slate-600 font-medium flex items-center gap-1 shrink-0">
+            <Cpu className="w-3.5 h-3.5 text-indigo-600" />
+            分離策略:
+          </span>
+          <select
+            value={diarCfg.engineMode}
+            onChange={(e) =>
+              updateDiarizationConfig({
+                engineMode: e.target.value as DiarizationEngineMode,
+              })
+            }
+            className="bg-white border border-slate-200 rounded px-1.5 py-1 text-[11px] font-semibold text-slate-800 flex-1 truncate focus:outline-none"
+          >
+            <option value="mode_b_advanced_dsp">
+              Mode B：進階純 DSP (42維 CMVN+F3/F4) ✨
+            </option>
+            <option value="mode_a_classic">
+              Mode A：經典極速 (32維 MFCC+硬性乒乓)
+            </option>
+            <option value="mode_c_onnx_neural">
+              Mode C：本地 ONNX 深度模型 (NeMo/WeSpeaker)
+            </option>
+          </select>
+        </div>
+
+        {/* Mode C 專屬：選擇合規自託管模型與隔離執行後端 */}
+        {diarCfg.engineMode === 'mode_c_onnx_neural' && (
+          <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+            <select
+              value={diarCfg.onnxModelFilename}
+              onChange={(e) =>
+                updateDiarizationConfig({
+                  onnxModelFilename: e.target.value as CompliantOnnxSpeakerModel,
+                })
+              }
+              title="請將對應模型放置於 /public/models/ 目錄下"
+              className="bg-white border border-indigo-200 rounded px-1.5 py-1 text-[10px] text-indigo-900 truncate"
+            >
+              <option value="nemo_en_titanet_small.int8.onnx">
+                NeMo TitaNet-Small (INT8)
+              </option>
+              <option value="wespeaker_voxceleb_resnet34_int8.onnx">
+                WeSpeaker ResNet34 (INT8)
+              </option>
+            </select>
+            <select
+              value={diarCfg.executionBackend}
+              onChange={(e) =>
+                updateDiarizationConfig({
+                  executionBackend: e.target.value as 'wasm' | 'webgpu',
+                })
+              }
+              title="預設使用 WASM SIMD 隔離執行緒，避免與 ASR 搶奪 WebGPU VRAM"
+              className="bg-white border border-slate-200 rounded px-1.5 py-1 text-[10px] text-slate-700"
+            >
+              <option value="wasm">後端：WASM SIMD (不搶顯存)</option>
+              <option value="webgpu">後端：WebGPU 加速</option>
+            </select>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-1.5">
+          <div className="flex items-center justify-between bg-white px-2 py-1 rounded border border-slate-200">
+            <span className="text-[11px] text-slate-500">分群:</span>
+            <select
+              value={diarCfg.clusterMethod}
+              onChange={(e) =>
+                updateDiarizationConfig({
+                  clusterMethod: e.target.value as DiarizationClusterMethod,
+                })
+              }
+              className="text-[11px] font-medium text-slate-800 bg-transparent focus:outline-none"
+            >
+              <option value="spectral_cosine">譜聚類 (Spectral)</option>
+              <option value="ahc_cosine">階層凝聚 (AHC)</option>
+            </select>
+          </div>
+
+          <div className="flex items-center justify-between bg-white px-2 py-1 rounded border border-slate-200">
+            <Globe2 className="w-3 h-3 text-slate-400 shrink-0 mr-1" />
+            <select
+              value={diarCfg.languageHint}
+              onChange={(e) =>
+                updateDiarizationConfig({
+                  languageHint: e.target.value as MeetingLanguageHint,
+                })
+              }
+              title="支援中/英/日跨語系中心化與日語相槌(はい/なるほど)、英語附和詞保護"
+              className="text-[11px] font-medium text-slate-800 bg-transparent focus:outline-none w-full"
+            >
+              <option value="auto_multilingual">中/英/日自動混用</option>
+              <option value="zh">華語/台語會議</option>
+              <option value="ja">日本語會議 (相槌保護)</option>
+              <option value="en">English Meeting</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* 會議人數範圍設定 */}
       <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200/80 space-y-2">
         <div className="flex items-center justify-between">
           <span className="text-xs font-medium text-slate-700 flex items-center gap-1">
@@ -157,11 +283,19 @@ export const SpeakerSyncPanel: React.FC = () => {
         ) : (
           speakerList.map((sp) => {
             const isEditing = editingId === sp.id;
-            const f0Val = sp.centroid?.[0] ? Math.round(sp.centroid[0]) : null;
+            const f0Val = sp.f0Hz
+              ? Math.round(sp.f0Hz)
+              : sp.centroid?.[0]
+              ? Math.round(sp.centroid[0])
+              : null;
             return (
               <div
                 key={sp.id}
-                title={f0Val ? `聲紋特徵基準：約 ${f0Val}Hz` : undefined}
+                title={
+                  f0Val
+                    ? `聲紋特徵基準：約 ${f0Val}Hz (${sp.featureMode || 'DSP'})`
+                    : undefined
+                }
                 className="flex items-center justify-between p-2 rounded-lg border border-slate-100 hover:border-slate-200 bg-slate-50/50"
               >
                 <div className="flex items-center gap-2 min-w-0 flex-1">

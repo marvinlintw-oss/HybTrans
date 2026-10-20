@@ -3,6 +3,7 @@ import { useCallback, useRef, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import {
   CorrectionPatchItem,
+  FineDiarizationTurn,
   Segment,
   Speaker,
   TriLevelContextPayload,
@@ -17,6 +18,7 @@ import {
   TARGET_SAMPLE_RATE,
 } from '../utils/audioProcessor';
 import {
+  applySentenceLevelLocalCorrection,
   buildTriLevelContextPayload,
   evolveRollingMeetingSummary,
   executeBoundedQuotaRelisten,
@@ -178,13 +180,14 @@ export function usePipelineScheduler() {
   const buildFallbackTurns = (
     chunkStartSec: number,
     chunkEndSec: number
-  ): Array<{ start: number; end: number; speakerId: string }> => {
-    const turns: Array<{ start: number; end: number; speakerId: string }> = [];
+  ): FineDiarizationTurn[] => {
+    const turns: FineDiarizationTurn[] = [];
     for (let t = chunkStartSec; t < chunkEndSec; t += 20) {
       turns.push({
         start: t,
         end: Math.min(chunkEndSec, t + 20),
         speakerId: 'Speaker_01',
+        f0Hz: 155,
       });
     }
     return turns;
@@ -199,7 +202,7 @@ export function usePipelineScheduler() {
     maxSpeakers: number,
     existingSpeakers: Speaker[]
   ): Promise<{
-    turns: Array<{ start: number; end: number; speakerId: string }>;
+    turns: FineDiarizationTurn[];
     asrWindows: Array<{ start: number; end: number }>;
     updatedSpeakers: Speaker[];
   }> => {
@@ -211,7 +214,8 @@ export function usePipelineScheduler() {
       activeDiarWorkerRef.current = worker;
 
       let settled = false;
-      const fallback = () => {
+      const fallback = (reason: string) => {
+        console.warn(`⚠️ [Diarization Fallback 觸發]: ${reason}`);
         const fb = buildFallbackTurns(chunkStartSec, chunkEndSec);
         return {
           turns: fb,
@@ -220,23 +224,43 @@ export function usePipelineScheduler() {
         };
       };
 
-      const timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        worker.terminate();
-        activeDiarWorkerRef.current = null;
-        resolve(fallback());
-      }, 20000);
+      // 【關鍵修復】改為可隨進度自動重置的活躍看門狗計時器 (每次收到進度續命 90 秒)，
+      // 徹底根治先前 25 秒時間一到就把正在跑的語者分離強制斬首並退回 Speaker_01 的問題！
+      let watchdogId: ReturnType<typeof setTimeout> | null = null;
+      const resetWatchdog = () => {
+        if (watchdogId) clearTimeout(watchdogId);
+        watchdogId = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          worker.terminate();
+          activeDiarWorkerRef.current = null;
+          resolve(fallback('Worker 超過 90 秒無進度回應'));
+        }, 90000);
+      };
+      resetWatchdog();
 
       worker.onmessage = (e) => {
         if (settled) return;
         const msg = e.data;
+
+        if (msg.type === 'DIARIZE_PROGRESS') {
+          resetWatchdog();
+          const subProgress = 12 + Math.round(((msg.progress || 0) / 100) * 18);
+          useAppStore.getState().updateChunkState(chunkIndex, {
+            stage: 'diarizing',
+            progress: subProgress,
+            detailText: msg.detailText || '聲紋特徵提取中...',
+          });
+          return;
+        }
+
         if (msg.type === 'DIARIZE_SUCCESS' || msg.type === 'RESULT') {
           settled = true;
-          clearTimeout(timeoutId);
+          if (watchdogId) clearTimeout(watchdogId);
           worker.terminate();
           activeDiarWorkerRef.current = null;
-          const turns = msg.turns || msg.data?.turns || [];
+          const turns: FineDiarizationTurn[] =
+            msg.turns || msg.data?.turns || [];
           const asrWindows =
             Array.isArray(msg.asrWindows) && msg.asrWindows.length > 0
               ? msg.asrWindows
@@ -249,30 +273,32 @@ export function usePipelineScheduler() {
           resolve(
             turns.length > 0
               ? { turns, asrWindows, updatedSpeakers }
-              : fallback()
+              : fallback('Turns 為空陣列')
           );
         } else if (msg.type === 'DIARIZE_ERROR' || msg.type === 'ERROR') {
           settled = true;
-          clearTimeout(timeoutId);
+          if (watchdogId) clearTimeout(watchdogId);
           worker.terminate();
           activeDiarWorkerRef.current = null;
-          resolve(fallback());
+          resolve(fallback(msg.error || 'Worker 回報錯誤'));
         }
       };
 
-      worker.onerror = () => {
+      worker.onerror = (err) => {
         if (settled) return;
         settled = true;
-        clearTimeout(timeoutId);
+        if (watchdogId) clearTimeout(watchdogId);
         worker.terminate();
         activeDiarWorkerRef.current = null;
-        resolve(fallback());
+        resolve(fallback(err.message || 'Worker 執行期異常'));
       };
 
       const cleanSpeakers: Speaker[] = JSON.parse(
         JSON.stringify(existingSpeakers)
       );
       const copySamples = new Float32Array(samples);
+      const diarizationConfig =
+        useAppStore.getState().config.diarizationConfig;
 
       worker.postMessage(
         {
@@ -284,6 +310,7 @@ export function usePipelineScheduler() {
           minSpeakers,
           maxSpeakers,
           existingSpeakers: cleanSpeakers,
+          diarizationConfig,
         },
         [copySamples.buffer]
       );
@@ -312,6 +339,13 @@ export function usePipelineScheduler() {
 
           const currentConfig = useAppStore.getState().config;
           const chunkMeta = useAppStore.getState().chunks[cIdx];
+          const modeLabel =
+            currentConfig.diarizationConfig?.engineMode === 'mode_a_classic'
+              ? 'Mode A 經典極速'
+              : currentConfig.diarizationConfig?.engineMode ===
+                'mode_c_onnx_neural'
+              ? 'Mode C 本地 ONNX'
+              : 'Mode B 進階 DSP';
 
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'preprocessing',
@@ -331,8 +365,8 @@ export function usePipelineScheduler() {
 
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'diarizing',
-            progress: 25,
-            detailText: `FFT 梅爾頻譜與 20維 MFCC 深度聲紋分析中 (${currentConfig.minSpeakers}~${currentConfig.maxSpeakers} 人)...`,
+            progress: 15,
+            detailText: `${modeLabel} 聲紋分析與聚類中 (${currentConfig.minSpeakers}~${currentConfig.maxSpeakers} 人)...`,
           });
 
           const existingSpeakers = Object.values(
@@ -356,7 +390,7 @@ export function usePipelineScheduler() {
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'transcribing',
             progress: 35,
-            detailText: `準備轉寫 (共 ${asrWindows.length} 個長語境視窗)...`,
+            detailText: `已識別 ${updatedSpeakers.length} 位語者，準備轉寫 (共 ${asrWindows.length} 個語境視窗)...`,
           });
 
           const useCloudAsr =
@@ -467,7 +501,7 @@ export function usePipelineScheduler() {
             useAppStore.getState().updateChunkState(cIdx, {
               stage: 'transcribing',
               progress: winProgress,
-              detailText: `25秒語境轉寫與子句聲紋對齊 (${wIdx + 1}/${asrWindows.length})`,
+              detailText: `語境轉寫與多語系子句聲紋對齊 (${wIdx + 1}/${asrWindows.length})`,
             });
 
             let windowSegments: Segment[] = [];
@@ -508,6 +542,9 @@ export function usePipelineScheduler() {
                   );
             } else if (asrWorker) {
               const activeWorker = asrWorker;
+              const languageHint =
+                currentConfig.diarizationConfig?.languageHint || 'zh';
+
               windowSegments = await new Promise<Segment[]>(
                 (resolve, reject) => {
                   const handleAsrMsg = (e: MessageEvent) => {
@@ -550,6 +587,7 @@ export function usePipelineScheduler() {
                     chunkIndex: cIdx,
                     windowIndex: wIdx,
                     modelName: currentConfig.localAsrModel,
+                    languageHint,
                     acousticThreshold: currentConfig.acousticThreshold,
                   });
                 }
@@ -559,9 +597,18 @@ export function usePipelineScheduler() {
             if (globalAbortFlag) break;
 
             if (windowSegments.length > 0) {
-              useAppStore.getState().appendSegments(windowSegments);
-              pendingWindowSegments.push(...windowSegments);
-              const addedChars = windowSegments.reduce(
+              const latestDict = useAppStore.getState().dictionary;
+              const quickTerms = latestDict.map((d) => d.term);
+              const { updatedSegments: instantCorrected } =
+                applySentenceLevelLocalCorrection(
+                  windowSegments,
+                  quickTerms,
+                  latestDict
+                );
+              useAppStore.getState().appendSegments(instantCorrected);
+              pendingWindowSegments.push(...instantCorrected);
+
+              const addedChars = instantCorrected.reduce(
                 (acc, s) =>
                   acc + s.words.reduce((wAcc, w) => wAcc + w.text.length, 0),
                 0
@@ -651,7 +698,6 @@ export function usePipelineScheduler() {
             },
           });
 
-          // ── Stage 4: 全場連貫性回溯精修 ──
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'correcting',
             progress: 96,
