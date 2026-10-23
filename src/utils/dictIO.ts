@@ -1,285 +1,327 @@
 // src/utils/dictIO.ts
-import * as OpenCC from 'opencc-js';
 import { DictCategory, DictEntry, DictScope } from '../types';
-
-const toTwp = OpenCC.Converter({ from: 'cn', to: 'twp' });
-
-export const DEFAULT_PUBLIC_DICTIONARY: DictEntry[] = [
-  {
-    id: 'pub_default_1',
-    term: '國發會',
-    category: 'jargon',
-    scope: 'public',
-    aliases: ['國法會', '過發會'],
-  },
-  {
-    id: 'pub_default_2',
-    term: '地方創生',
-    category: 'project',
-    scope: 'public',
-    aliases: ['地方創身', '地方創聲'],
-  },
-  {
-    id: 'pub_default_3',
-    term: '青年培力工作站',
-    category: 'project',
-    scope: 'public',
-    aliases: ['青年賠力工作站', '青年陪力工作站', '青培站'],
-  },
-  {
-    id: 'pub_default_4',
-    term: '利害關係人',
-    category: 'jargon',
-    scope: 'public',
-    aliases: ['厲害關係人'],
-  },
-  {
-    id: 'pub_default_5',
-    term: '國土區域離島發展處',
-    category: 'jargon',
-    scope: 'public',
-    aliases: ['國土處'],
-  },
-];
+import { getBuiltinTaiwanMeetingDictionary } from '../data/taiwanMeetingDictionary';
 
 /**
- * 將使用者貼上的 Google Sheet 共編網址轉換為可直接 Fetch 的 CSV Export URL
+ * 預設公共詞庫：直接載入獨立維護之《台灣商業、政府與學術會議內建大詞典》
  */
-export function buildGoogleSheetCsvUrl(rawUrl: string): string | null {
-  const trimmed = rawUrl.trim();
-  if (!trimmed) return null;
+export const DEFAULT_PUBLIC_DICTIONARY: DictEntry[] =
+  getBuiltinTaiwanMeetingDictionary();
 
-  // 若已經是發佈到網路的 output=csv 或是 export?format=csv 連結
-  if (trimmed.includes('output=csv') || trimmed.includes('format=csv')) {
-    return trimmed;
-  }
-
-  // 擷取 /spreadsheets/d/{ID}
-  const match = trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-  if (!match || !match[1]) return null;
-
-  const sheetId = match[1];
-  const gidMatch = trimmed.match(/[#&?]gid=([0-9]+)/);
-  const gid = gidMatch && gidMatch[1] ? gidMatch[1] : '0';
-
-  return `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${gid}`;
+function safeTrim(val: unknown): string {
+  if (typeof val === 'string') return val.trim();
+  if (val === null || val === undefined) return '';
+  return String(val).trim();
 }
 
 /**
- * 解析單行 CSV (處理雙引號包覆之逗號)
+ * 合併現有詞庫與新匯入詞條（若遇到相同 term + scope，自動合併其同音別名 aliases）
  */
-function parseCsvRow(line: string): string[] {
-  const cols: string[] = [];
-  let cur = '';
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        cur += '"';
-        i++;
-      } else {
-        inQuotes = !inQuotes;
-      }
-    } else if (ch === ',' && !inQuotes) {
-      cols.push(cur.trim());
-      cur = '';
-    } else {
-      cur += ch;
-    }
-  }
-  cols.push(cur.trim());
-  return cols;
-}
-
-/**
- * 從 Google Sheet 共編連結同步詞庫 (歸入 'public' 公共字典)
- * 支援欄位：A欄=正確詞彙, B欄=常見同音錯字(選填), C欄=分類(選填)
- */
-export async function syncDictionaryFromGoogleSheet(sheetUrl: string): Promise<DictEntry[]> {
-  const csvUrl = buildGoogleSheetCsvUrl(sheetUrl);
-  if (!csvUrl) {
-    throw new Error('請貼上有效的 Google 試算表網址 (https://docs.google.com/spreadsheets/d/...)');
-  }
-
-  const res = await fetch(csvUrl, { cache: 'no-store' });
-  if (!res.ok) {
-    throw new Error('無法讀取 Google 試算表，請確認試算表右上角「共用」已設為「知道連結的任何人皆可檢視」。');
-  }
-
-  const csvText = await res.text();
-  if (csvText.trim().startsWith('<!DOCTYPE html') || csvText.includes('<html')) {
-    throw new Error('試算表權限未公開，請將 Google Sheet 共用權限設為「知道連結的任何人皆可檢視」。');
-  }
-
-  const lines = csvText
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  const entries: DictEntry[] = [];
-  const headerKeywords = ['詞彙', '正確詞', '名稱', 'term', 'word', '專有名詞'];
-
-  lines.forEach((line, idx) => {
-    const cols = parseCsvRow(line);
-    const colA = (cols[0] || '').trim();
-    const colB = (cols[1] || '').trim();
-    const colC = (cols[2] || '').trim().toLowerCase();
-
-    if (!colA) return;
-    // 自動略過第一列標題列
-    if (idx === 0 && headerKeywords.some((kw) => colA.toLowerCase().includes(kw))) {
-      return;
-    }
-
-    const cleanTerm = toTwp(colA);
-    const aliases = colB
-      ? colB
-          .split(/[,，、/;\s]+/)
-          .map((s) => toTwp(s.trim()))
-          .filter((s) => s && s !== cleanTerm)
-      : undefined;
-
-    let category: DictCategory = 'jargon';
-    if (colC.includes('person') || colC.includes('人') || colC.includes('職稱')) {
-      category = 'person';
-    } else if (colC.includes('project') || colC.includes('計畫') || colC.includes('專案')) {
-      category = 'project';
-    }
-
-    entries.push({
-      id: `gsheet_pub_${idx}_${cleanTerm}`,
-      term: cleanTerm,
-      category,
-      scope: 'public',
-      aliases: aliases && aliases.length > 0 ? aliases : undefined,
-    });
-  });
-
-  return entries;
-}
-
-export async function fetchRemotePublicDictionary(): Promise<DictEntry[]> {
-  try {
-    const res = await fetch('./public-dictionary.json', { cache: 'no-store' });
-    if (!res.ok) return DEFAULT_PUBLIC_DICTIONARY;
-    const rawList = await res.json();
-    const parsed = normalizeImportedDictArray(rawList, 'public');
-    return mergeDictLists(DEFAULT_PUBLIC_DICTIONARY, parsed);
-  } catch {
-    return DEFAULT_PUBLIC_DICTIONARY;
-  }
-}
-
-export function normalizeImportedDictArray(
-  rawData: unknown,
-  fallbackScope: DictScope = 'personal'
+export function mergeDictLists(
+  existing: DictEntry[] = [],
+  incoming: DictEntry[] = []
 ): DictEntry[] {
-  if (!Array.isArray(rawData)) {
-    throw new Error('字典檔案格式錯誤：根節點必須為 JSON Array。');
-  }
-
-  const validCategories: DictCategory[] = ['person', 'project', 'jargon'];
-  const validScopes: DictScope[] = ['public', 'personal', 'session', 'global'];
-  const results: DictEntry[] = [];
-
-  rawData.forEach((item, idx) => {
-    if (!item || typeof item !== 'object') return;
-    const rec = item as Record<string, unknown>;
-    const rawTerm = typeof rec.term === 'string' ? rec.term.trim() : '';
-    if (!rawTerm) return;
-
-    const category: DictCategory = validCategories.includes(rec.category as DictCategory)
-      ? (rec.category as DictCategory)
-      : 'jargon';
-
-    const rawScope = rec.scope as DictScope;
-    const scope: DictScope = validScopes.includes(rawScope)
-      ? rawScope === 'global'
-        ? 'public'
-        : rawScope
-      : fallbackScope;
-
-    const aliases = Array.isArray(rec.aliases)
-      ? rec.aliases
-          .map((a) => (typeof a === 'string' ? toTwp(a.trim()) : ''))
-          .filter(Boolean)
-      : undefined;
-
-    results.push({
-      id: typeof rec.id === 'string' && rec.id ? rec.id : `dict_${scope}_${Date.now()}_${idx}`,
-      term: toTwp(rawTerm),
-      category,
-      scope,
-      aliases: aliases && aliases.length > 0 ? aliases : undefined,
-    });
-  });
-
-  return results;
-}
-
-export function mergeDictLists(baseList: DictEntry[], incomingList: DictEntry[]): DictEntry[] {
   const map = new Map<string, DictEntry>();
 
-  for (const item of baseList) {
-    const normalizedScope = item.scope === 'global' ? 'public' : item.scope;
-    const key = `${normalizedScope}::${item.term}`;
-    map.set(key, { ...item, scope: normalizedScope });
+  const safeExisting = Array.isArray(existing) ? existing : [];
+  const safeIncoming = Array.isArray(incoming) ? incoming : [];
+
+  for (const item of safeExisting) {
+    if (!item) continue;
+    const cleanTerm = safeTrim(item.term);
+    if (!cleanTerm) continue;
+    const scope: DictScope = item.scope || 'public';
+    const key = `${scope}::${cleanTerm}`;
+    map.set(key, {
+      ...item,
+      term: cleanTerm,
+      scope,
+      aliases: Array.isArray(item.aliases)
+        ? Array.from(new Set(item.aliases.map((a) => safeTrim(a)).filter(Boolean)))
+        : [],
+    });
   }
 
-  for (const item of incomingList) {
-    const normalizedScope = item.scope === 'global' ? 'public' : item.scope;
-    const key = `${normalizedScope}::${item.term}`;
-    const existing = map.get(key);
-    if (existing) {
+  for (const item of safeIncoming) {
+    if (!item) continue;
+    const cleanTerm = safeTrim(item.term);
+    if (!cleanTerm) continue;
+    const scope: DictScope = item.scope || 'personal';
+    const key = `${scope}::${cleanTerm}`;
+    const prev = map.get(key);
+    const incomingAliases = Array.isArray(item.aliases)
+      ? item.aliases.map((a) => safeTrim(a)).filter((a) => a && a !== cleanTerm)
+      : [];
+
+    if (prev) {
       const mergedAliases = Array.from(
-        new Set([...(existing.aliases || []), ...(item.aliases || [])])
-      );
+        new Set([...(prev.aliases || []), ...incomingAliases])
+      ).filter((a) => a && a !== cleanTerm);
       map.set(key, {
-        ...existing,
-        category: item.category || existing.category,
-        aliases: mergedAliases.length > 0 ? mergedAliases : undefined,
+        ...prev,
+        category: item.category || prev.category,
+        aliases: mergedAliases,
       });
     } else {
-      map.set(key, { ...item, scope: normalizedScope });
+      map.set(key, {
+        ...item,
+        id: safeTrim(item.id) || `dict_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        term: cleanTerm,
+        category: item.category || 'jargon',
+        scope,
+        aliases: incomingAliases,
+      });
     }
   }
 
   return Array.from(map.values());
 }
 
-export function exportDictionaryToJsonFile(
-  entries: DictEntry[],
-  scopeFilter: 'public' | 'personal' | 'all'
-): void {
+/**
+ * 匯出指定範圍或全部字典為 JSON 字串
+ */
+export function exportDictionaryToJson(
+  entries: DictEntry[] = [],
+  scopeFilter?: DictScope | 'all'
+): string {
+  const safeEntries = Array.isArray(entries) ? entries : [];
   const filtered =
-    scopeFilter === 'all'
-      ? entries
-      : entries.filter((e) => (e.scope === 'global' ? 'public' : e.scope) === scopeFilter);
-
-  const jsonStr = JSON.stringify(filtered, null, 2);
-  const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-
-  const a = document.createElement('a');
-  const dateTag = new Date().toISOString().slice(0, 10);
-  a.href = url;
-  a.download =
-    scopeFilter === 'public'
-      ? 'public-dictionary.json'
-      : `hybrid-transcriber-${scopeFilter}-dict-${dateTag}.json`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+    !scopeFilter || scopeFilter === 'all'
+      ? safeEntries
+      : safeEntries.filter((e) => e && e.scope === scopeFilter);
+  return JSON.stringify(filtered, null, 2);
 }
 
+/**
+ * 解析使用者上傳或遠端載入之 JSON / CSV / TXT 詞庫文字（具備完整空值防呆）
+ */
+export function parseImportedDictionaryText(
+  rawContent: unknown,
+  defaultScope: DictScope = 'personal'
+): DictEntry[] {
+  if (Array.isArray(rawContent)) {
+    return rawContent
+      .map((raw, idx) => {
+        if (!raw || typeof raw !== 'object') return null;
+        const r = raw as Record<string, unknown>;
+        const term = safeTrim(r.term || r.name || r.word);
+        if (!term) return null;
+        const category: DictCategory =
+          r.category === 'person' || r.category === 'project' || r.category === 'jargon'
+            ? r.category
+            : 'jargon';
+        const scope: DictScope =
+          r.scope === 'public' ||
+          r.scope === 'personal' ||
+          r.scope === 'session' ||
+          r.scope === 'global'
+            ? r.scope
+            : defaultScope;
+        const aliases = Array.isArray(r.aliases)
+          ? r.aliases.map((a) => safeTrim(a)).filter((a) => a && a !== term)
+          : typeof r.aliases === 'string'
+          ? r.aliases
+              .split(/[|｜/、,，]/)
+              .map((a) => safeTrim(a))
+              .filter((a) => a && a !== term)
+          : [];
+        return {
+          id: safeTrim(r.id) || `imp_${Date.now()}_${idx}`,
+          term,
+          category,
+          scope,
+          aliases,
+        } as DictEntry;
+      })
+      .filter((item): item is DictEntry => item !== null);
+  }
+
+  const trimmed = safeTrim(rawContent);
+  if (!trimmed) return [];
+
+  // 1. 嘗試解析 JSON
+  if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const arr = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.entries)
+        ? parsed.entries
+        : Array.isArray(parsed?.dictionary)
+        ? parsed.dictionary
+        : [parsed];
+      return parseImportedDictionaryText(arr, defaultScope);
+    } catch {
+      // fallback to line-by-line parsing
+    }
+  }
+
+  // 2. 支援 CSV / 純文字格式：每行「正詞,別名1|別名2,分類」
+  const lines = trimmed.split(/\r?\n/);
+  const entries: DictEntry[] = [];
+  lines.forEach((line, idx) => {
+    const clean = safeTrim(line);
+    if (!clean || clean.startsWith('#')) return;
+    const parts = clean
+      .split(/[,，\t]/)
+      .map((p) => safeTrim(p.replace(/^["']|["']$/g, '')));
+    const term = parts[0];
+    if (!term) return;
+    // 略過常見 CSV 標題列
+    if (
+      idx === 0 &&
+      /^(term|正詞|詞彙|專有名詞|名稱|關鍵字|標準詞)$/i.test(term)
+    ) {
+      return;
+    }
+
+    const aliases = parts[1]
+      ? parts[1]
+          .split(/[|｜/、;；]/)
+          .map((a) => safeTrim(a))
+          .filter((a) => a && a !== term)
+      : [];
+    const catRaw = safeTrim(parts[2]).toLowerCase();
+    const category: DictCategory =
+      catRaw === 'person' || catRaw.includes('人') || catRaw.includes('機關')
+        ? 'person'
+        : catRaw === 'project' || catRaw.includes('案') || catRaw.includes('計畫')
+        ? 'project'
+        : 'jargon';
+
+    entries.push({
+      id: `txt_${Date.now()}_${idx}`,
+      term,
+      category,
+      scope: defaultScope,
+      aliases,
+    });
+  });
+
+  return entries;
+}
+
+/**
+ * 解析使用者上傳之 JSON / CSV / TXT 字典檔案 (相容 File、Blob 或純文字字串)
+ */
 export async function parseDictionaryJsonFile(
-  file: File,
-  targetScope: 'public' | 'personal'
+  fileOrText: File | Blob | string | null | undefined,
+  defaultScope: DictScope = 'personal'
 ): Promise<DictEntry[]> {
-  const text = await file.text();
-  const raw = JSON.parse(text);
-  return normalizeImportedDictArray(raw, targetScope);
+  if (!fileOrText) return [];
+  if (typeof fileOrText === 'string') {
+    return parseImportedDictionaryText(fileOrText, defaultScope);
+  }
+  if (typeof fileOrText.text === 'function') {
+    const rawText = await fileOrText.text();
+    return parseImportedDictionaryText(rawText, defaultScope);
+  }
+  return [];
+}
+
+/**
+ * 將指定範圍之字典匯出並觸發瀏覽器下載 JSON 檔案 (同時回傳 JSON 字串)
+ */
+export function exportDictionaryToJsonFile(
+  entries: DictEntry[] = [],
+  scopeFilter: DictScope | 'all' = 'all',
+  filename?: string
+): string {
+  const safeScope = safeTrim(scopeFilter) || 'all';
+  const resolvedFilename =
+    safeTrim(filename) || `hybtrans_dictionary_${safeScope}.json`;
+  const jsonStr = exportDictionaryToJson(
+    entries,
+    (safeScope as DictScope | 'all') || 'all'
+  );
+
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    try {
+      const blob = new Blob([jsonStr], {
+        type: 'application/json;charset=utf-8',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = resolvedFilename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch {
+      // 若在非 DOM 環境呼叫則僅回傳字串
+    }
+  }
+  return jsonStr;
+}
+
+/**
+ * 相容別名：與 exportDictionaryToJsonFile 相同功能
+ */
+export const exportDictionaryAsJson = exportDictionaryToJsonFile;
+
+/**
+ * 從公開的 Google Sheet 網址或遠端 CSV/JSON 端點同步詞庫（具備完整空值防呆）
+ */
+export async function syncDictionaryFromGoogleSheet(
+  sheetUrl?: string | null,
+  targetScope: DictScope = 'public'
+): Promise<DictEntry[]> {
+  const trimmedUrl = safeTrim(sheetUrl);
+  // 若使用者未輸入網址或傳入 undefined，直接回傳內建台灣會議大詞典而不崩潰
+  if (!trimmedUrl) {
+    return getBuiltinTaiwanMeetingDictionary().map((item) => ({
+      ...item,
+      scope: targetScope,
+    }));
+  }
+
+  let fetchUrl = trimmedUrl;
+  const sheetIdMatch = trimmedUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (sheetIdMatch && sheetIdMatch[1]) {
+    const spreadsheetId = sheetIdMatch[1];
+    const gidMatch = trimmedUrl.match(/[#&?]gid=([0-9]+)/);
+    const gidParam = gidMatch && gidMatch[1] ? `&gid=${gidMatch[1]}` : '';
+    fetchUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv${gidParam}`;
+  }
+
+  const response = await fetch(fetchUrl, { cache: 'no-cache' });
+  if (!response.ok) {
+    throw new Error(
+      `無法讀取遠端詞庫 (${response.status})，請確認連結有效且已開啟公開檢視權限`
+    );
+  }
+
+  const rawText = await response.text();
+  const parsed = parseImportedDictionaryText(rawText, targetScope);
+  return parsed.length > 0 ? parsed : getBuiltinTaiwanMeetingDictionary();
+}
+
+/**
+ * 載入或更新公共詞庫（相容無參數呼叫、遠端 URL 或本地預設台灣會議大詞典）
+ */
+export async function fetchRemotePublicDictionary(
+  remoteUrl?: string | null,
+  targetScope: DictScope = 'public'
+): Promise<DictEntry[]> {
+  const cleanUrl = safeTrim(remoteUrl);
+  if (!cleanUrl) {
+    return getBuiltinTaiwanMeetingDictionary().map((item) => ({
+      ...item,
+      scope: targetScope,
+    }));
+  }
+
+  try {
+    return await syncDictionaryFromGoogleSheet(cleanUrl, targetScope);
+  } catch (err) {
+    console.warn(
+      '⚠️ [Dictionary] 遠端詞庫讀取失敗，自動採用內建台灣會議大詞典:',
+      err
+    );
+    return getBuiltinTaiwanMeetingDictionary().map((item) => ({
+      ...item,
+      scope: targetScope,
+    }));
+  }
 }

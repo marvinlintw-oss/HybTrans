@@ -1,7 +1,13 @@
 // src/workers/localAsr.worker.ts
 import { env, pipeline } from '@huggingface/transformers';
 import * as OpenCC from 'opencc-js';
-import { FineDiarizationTurn, LocalAsrModel, Segment, WordSpan } from '../types';
+import {
+  FineDiarizationTurn,
+  LocalAsrModel,
+  Segment,
+  VirtualTrackMapItem,
+  WordSpan,
+} from '../types';
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
@@ -26,8 +32,38 @@ let loadedModelKey: string | null = null;
 let maxReportedProgress = 0;
 const fileProgressMap = new Map<string, { loaded: number; total: number }>();
 
+/**
+ * 探測當前瀏覽器與顯卡是否支援 WebGPU 及 `shader-f16` (fp16) 擴充功能。
+ * 避免在不支援 fp16 的顯卡上強行指定 `dtype: { encoder_model: 'fp16' }` 導致崩潰。
+ */
+async function probeWebGpuCapabilities(): Promise<{
+  hasWebGpu: boolean;
+  supportsFp16: boolean;
+}> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const gpu = (navigator as unknown as { gpu?: any }).gpu;
+    if (!gpu || typeof gpu.requestAdapter !== 'function') {
+      return { hasWebGpu: false, supportsFp16: false };
+    }
+    const adapter = await gpu.requestAdapter();
+    if (!adapter) {
+      return { hasWebGpu: false, supportsFp16: false };
+    }
+    const supportsFp16 = Boolean(
+      adapter.features &&
+        typeof adapter.features.has === 'function' &&
+        adapter.features.has('shader-f16')
+    );
+    return { hasWebGpu: true, supportsFp16 };
+  } catch {
+    return { hasWebGpu: false, supportsFp16: false };
+  }
+}
+
 async function ensureAsrPipeline(modelName: LocalAsrModel) {
-  const modelId = MODEL_ID_MAP[modelName] || MODEL_ID_MAP['Whisper-Large-v3-Turbo'];
+  const modelId =
+    MODEL_ID_MAP[modelName] || MODEL_ID_MAP['Whisper-Large-v3-Turbo'];
   if (asrInstance && loadedModelKey === modelId) return asrInstance;
 
   if (asrInstance && typeof asrInstance.dispose === 'function') {
@@ -45,66 +81,119 @@ async function ensureAsrPipeline(modelName: LocalAsrModel) {
     type: 'ASR_DOWNLOAD_PROGRESS',
     active: true,
     modelName,
-    fileName: '準備載入語音辨識引擎...',
+    fileName: '正在檢測 GPU 精度支援並準備載入語音模型...',
     progress: 5,
   });
 
-  asrInstance = await pipeline('automatic-speech-recognition', modelId, {
-    device: 'webgpu',
-    dtype: {
-      encoder_model: 'fp16',
-      decoder_model_merged: 'q4',
-    },
-    progress_callback: (info: {
-      status?: string;
-      file?: string;
-      loaded?: number;
-      total?: number;
-      progress?: number;
-    }) => {
-      const fileName = info.file || '';
-      if (!fileName.endsWith('.onnx')) return;
+  const progressCallback = (info: {
+    status?: string;
+    file?: string;
+    loaded?: number;
+    total?: number;
+    progress?: number;
+  }) => {
+    const fileName = info.file || '';
+    if (!fileName.endsWith('.onnx')) return;
 
-      if (info.status === 'progress' || info.status === 'download') {
-        if (
-          typeof info.loaded === 'number' &&
-          typeof info.total === 'number' &&
-          info.total > 0
-        ) {
-          fileProgressMap.set(fileName, {
-            loaded: info.loaded,
-            total: info.total,
-          });
-          let sumLoaded = 0;
-          let sumTotal = 0;
-          for (const item of fileProgressMap.values()) {
-            sumLoaded += item.loaded;
-            sumTotal += item.total;
-          }
-          const combinedPct =
-            sumTotal > 0 ? Math.round((sumLoaded / sumTotal) * 100) : 20;
-          maxReportedProgress = Math.max(
-            maxReportedProgress,
-            Math.min(99, combinedPct)
-          );
-        } else if (typeof info.progress === 'number') {
-          maxReportedProgress = Math.max(
-            maxReportedProgress,
-            Math.min(99, Math.round(info.progress))
-          );
+    if (info.status === 'progress' || info.status === 'download') {
+      if (
+        typeof info.loaded === 'number' &&
+        typeof info.total === 'number' &&
+        info.total > 0
+      ) {
+        fileProgressMap.set(fileName, {
+          loaded: info.loaded,
+          total: info.total,
+        });
+        let sumLoaded = 0;
+        let sumTotal = 0;
+        const entries = Array.from(fileProgressMap.values());
+        for (let i = 0; i < entries.length; i++) {
+          sumLoaded += entries[i].loaded;
+          sumTotal += entries[i].total;
         }
+        const combinedPct =
+          sumTotal > 0 ? Math.round((sumLoaded / sumTotal) * 100) : 20;
+        maxReportedProgress = Math.max(
+          maxReportedProgress,
+          Math.min(99, combinedPct)
+        );
+      } else if (typeof info.progress === 'number') {
+        maxReportedProgress = Math.max(
+          maxReportedProgress,
+          Math.min(99, Math.round(info.progress))
+        );
+      }
 
-        const shortFile = fileName.split('/').pop() || fileName;
-        self.postMessage({
-          type: 'ASR_DOWNLOAD_PROGRESS',
-          active: true,
-          modelName,
-          fileName: shortFile,
-          progress: maxReportedProgress,
+      const shortFile = fileName.split('/').pop() || fileName;
+      self.postMessage({
+        type: 'ASR_DOWNLOAD_PROGRESS',
+        active: true,
+        modelName,
+        fileName: shortFile,
+        progress: maxReportedProgress,
+      });
+    }
+  };
+
+  const { hasWebGpu, supportsFp16 } = await probeWebGpuCapabilities();
+
+  try {
+    if (hasWebGpu && supportsFp16) {
+      asrInstance = await pipeline('automatic-speech-recognition', modelId, {
+        device: 'webgpu',
+        dtype: {
+          encoder_model: 'fp16',
+          decoder_model_merged: 'q4',
+        },
+        progress_callback: progressCallback,
+      });
+    } else if (hasWebGpu) {
+      console.info(
+        'ℹ️ [LocalASR] 偵測到顯卡不支援 shader-f16，自動採用 WebGPU fp32 + q4 相容模式'
+      );
+      asrInstance = await pipeline('automatic-speech-recognition', modelId, {
+        device: 'webgpu',
+        dtype: {
+          encoder_model: 'fp32',
+          decoder_model_merged: 'q4',
+        },
+        progress_callback: progressCallback,
+      });
+    } else {
+      throw new Error('WebGPU unavailable, fallback to WASM');
+    }
+  } catch (firstErr) {
+    console.warn(
+      '⚠️ [LocalASR] WebGPU 初始化自動切換至相容精度模式 (fp32 / WASM):',
+      firstErr
+    );
+    fileProgressMap.clear();
+    try {
+      if (hasWebGpu) {
+        asrInstance = await pipeline('automatic-speech-recognition', modelId, {
+          device: 'webgpu',
+          dtype: {
+            encoder_model: 'fp32',
+            decoder_model_merged: 'q4',
+          },
+          progress_callback: progressCallback,
+        });
+      } else {
+        asrInstance = await pipeline('automatic-speech-recognition', modelId, {
+          device: 'wasm',
+          dtype: 'q8',
+          progress_callback: progressCallback,
         });
       }
-    },
-  });
+    } catch {
+      asrInstance = await pipeline('automatic-speech-recognition', modelId, {
+        device: 'wasm',
+        dtype: 'q8',
+        progress_callback: progressCallback,
+      });
+    }
+  }
 
   self.postMessage({
     type: 'ASR_DOWNLOAD_PROGRESS',
@@ -118,9 +207,6 @@ async function ensureAsrPipeline(modelName: LocalAsrModel) {
   return asrInstance;
 }
 
-/**
- * 支援中、英、日混用 (Code-Switching) 之通用標點與疊字正規化引擎
- */
 function restoreMultilingualPunctuation(rawInput: string): string {
   const hasKana = /[\u3040-\u30ff]/.test(rawInput);
   let text = hasKana ? rawInput.trim() : toTwp(rawInput.trim());
@@ -128,7 +214,10 @@ function restoreMultilingualPunctuation(rawInput: string): string {
 
   text = text.replace(/([\u4e00-\u9fa5])\1{2,}/g, '$1');
   text = text.replace(/([\u4e00-\u9fa5]{2,6})\1{2,}/g, '$1');
-  text = text.replace(/^(字幕|請不吝點讚|訂閱轉發|謝謝觀看|Amara\.org).*$/gi, '');
+  text = text.replace(
+    /^(字幕|請不吝點讚|訂閱轉發|謝謝觀看|Amara\.org).*$/gi,
+    ''
+  );
 
   const cjkRatio =
     (text.match(/[\u3040-\u9fa5]/g)?.length || 0) / Math.max(1, text.length);
@@ -145,7 +234,10 @@ function restoreMultilingualPunctuation(rawInput: string): string {
     /^(不是|沒有|對|好|那|另外|不過|其實|老實說|基本上|はい|ええ|いや|なるほど)(?=[，。？！]?[^\u3000-\u303f\uff00-\uffefa-zA-Z要])/,
     '$1，'
   );
-  text = text.replace(/^(對對對|沒有沒有|不用不用)(?=[^\u3000-\u303f\uff00-\uffef])/, '$1，');
+  text = text.replace(
+    /^(對對對|沒有沒有|不用不用)(?=[^\u3000-\u303f\uff00-\uffef])/,
+    '$1，'
+  );
 
   text = text.replace(
     /([\u4e00-\u9fa5A-Za-z0-9]{4,})(但是|可是|因為|所以|如果說|不然的話|否則|那如果|而且|然後|ですが|けれども|しかし|ただ)/g,
@@ -162,7 +254,10 @@ function restoreMultilingualPunctuation(rawInput: string): string {
     '$1？'
   );
   text = text.replace(/(嗎|呢)[。，？?]*$/g, '$1？');
-  text = text.replace(/(不知道啊|太遠了|太久了|超亂的)[。，！!]*$/g, '$1！');
+  text = text.replace(
+    /(不知道啊|太遠了|太久了|超亂的)[。，！!]*$/g,
+    '$1！'
+  );
 
   text = text
     .replace(/[？?]{2,}/g, '？')
@@ -172,7 +267,11 @@ function restoreMultilingualPunctuation(rawInput: string): string {
     .replace(/[，、]{2,}/g, '，')
     .replace(/，([。？！])/g, '$1');
 
-  if (text.length >= 2 && cjkRatio >= 0.25 && !/[，。？！、；：.?!]$/.test(text)) {
+  if (
+    text.length >= 2 &&
+    cjkRatio >= 0.25 &&
+    !/[，。？！、；：.?!]$/.test(text)
+  ) {
     text += '。';
   }
   return text;
@@ -209,9 +308,207 @@ function buildWordSpans(
   });
 }
 
-// ============================================================================
-// 【問題 4 & 5】原子語意單元 (Atomic Clauses) 拆解 + SCD-Viterbi 動態規劃對齊
-// ============================================================================
+/**
+ * 【Piecewise Linear Time Unwarping：虛擬音軌時間軸無縫還原演算法】
+ * 當送入 Whisper 的是「語者 A 的第 1 段 + 0.35s 靜音隔板 + 語者 A 的第 2 段...」：
+ * 1. 將 Whisper 輸出之每個 Chunk / 子句根據其虛擬時間區間 `[vStart, vEnd]` 對準 `timeMap` 中重疊最大之真實發聲區段。
+ * 2. 若單一 Whisper Chunk 橫跨了 `0.35s` 靜音隔板（即同時覆蓋兩個不連續的 `VirtualTrackMapItem`），
+ *    自動在隔板位置將文字依標點或時間比例切開，分別映射回各自真實的會議時間區段 `[realStartSec, realEndSec]`！
+ */
+function unwarpVirtualTrackChunksToSegments(
+  rawChunks: Array<{ text: string; timestamp?: [number, number | null] }>,
+  timeMap: VirtualTrackMapItem[],
+  speakerId: string,
+  chunkIndex: number,
+  batchIndex: number,
+  acousticThreshold: number
+): Segment[] {
+  if (timeMap.length === 0 || rawChunks.length === 0) return [];
+
+  const totalVirtualSec = timeMap[timeMap.length - 1].virtualEndSec;
+  const unwarpedUnits: Array<{
+    text: string;
+    realStart: number;
+    realEnd: number;
+    speakerId: string;
+    runnerUpSpeakerId: string;
+    confidence: number;
+    acousticMargin: number;
+  }> = [];
+
+  for (let i = 0; i < rawChunks.length; i++) {
+    const ch = rawChunks[i];
+    const cleanText = restoreMultilingualPunctuation(ch.text || '');
+    if (!cleanText) continue;
+
+    const vStart =
+      typeof ch.timestamp?.[0] === 'number' ? ch.timestamp[0] : 0;
+    const vEnd =
+      typeof ch.timestamp?.[1] === 'number' && ch.timestamp[1] !== null
+        ? ch.timestamp[1]
+        : Math.min(totalVirtualSec, vStart + 3.5);
+
+    const overlappingItems = timeMap.filter(
+      (item) =>
+        Math.min(vEnd, item.virtualEndSec) -
+          Math.max(vStart, item.virtualStartSec) >
+        0.08
+    );
+
+    if (overlappingItems.length === 0) {
+      const vCenter = 0.5 * (vStart + vEnd);
+      let nearest = timeMap[0];
+      let minDist = Infinity;
+      for (const item of timeMap) {
+        const itemCenter = 0.5 * (item.virtualStartSec + item.virtualEndSec);
+        const d = Math.abs(vCenter - itemCenter);
+        if (d < minDist) {
+          minDist = d;
+          nearest = item;
+        }
+      }
+      overlappingItems.push(nearest);
+    }
+
+    if (overlappingItems.length === 1) {
+      const item = overlappingItems[0];
+      const vSpan = Math.max(0.15, item.virtualEndSec - item.virtualStartSec);
+      const rSpan = Math.max(0.15, item.realEndSec - item.realStartSec);
+
+      const clampedVStart = Math.max(
+        item.virtualStartSec,
+        Math.min(item.virtualEndSec - 0.1, vStart)
+      );
+      const clampedVEnd = Math.max(
+        clampedVStart + 0.15,
+        Math.min(item.virtualEndSec, vEnd)
+      );
+
+      const relRatioStart = (clampedVStart - item.virtualStartSec) / vSpan;
+      const relRatioEnd = (clampedVEnd - item.virtualStartSec) / vSpan;
+
+      const realStart = Number(
+        (item.realStartSec + relRatioStart * rSpan).toFixed(2)
+      );
+      const realEnd = Number(
+        Math.max(
+          realStart + 0.2,
+          item.realStartSec + relRatioEnd * rSpan
+        ).toFixed(2)
+      );
+
+      unwarpedUnits.push({
+        text: cleanText,
+        realStart,
+        realEnd,
+        speakerId: item.speakerId || speakerId,
+        runnerUpSpeakerId:
+          item.runnerUpSpeakerId || item.speakerId || speakerId,
+        confidence: item.speakerConfidence,
+        acousticMargin: item.speakerMargin,
+      });
+    } else {
+      const clauses = cleanText
+        .split(/(?<=[，。？！、；,.?!])/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      if (clauses.length >= overlappingItems.length) {
+        let cCursor = 0;
+        for (let k = 0; k < overlappingItems.length; k++) {
+          const item = overlappingItems[k];
+          const takeCount =
+            k === overlappingItems.length - 1
+              ? clauses.length - cCursor
+              : Math.max(
+                  1,
+                  Math.round(clauses.length / overlappingItems.length)
+                );
+          const subText = restoreMultilingualPunctuation(
+            clauses.slice(cCursor, cCursor + takeCount).join('')
+          );
+          cCursor += takeCount;
+          if (!subText) continue;
+
+          unwarpedUnits.push({
+            text: subText,
+            realStart: item.realStartSec,
+            realEnd: item.realEndSec,
+            speakerId: item.speakerId || speakerId,
+            runnerUpSpeakerId:
+              item.runnerUpSpeakerId || item.speakerId || speakerId,
+            confidence: item.speakerConfidence,
+            acousticMargin: item.speakerMargin,
+          });
+        }
+      } else {
+        let bestItem = overlappingItems[0];
+        let maxOv = -1;
+        for (const item of overlappingItems) {
+          const ov =
+            Math.min(vEnd, item.virtualEndSec) -
+            Math.max(vStart, item.virtualStartSec);
+          if (ov > maxOv) {
+            maxOv = ov;
+            bestItem = item;
+          }
+        }
+        unwarpedUnits.push({
+          text: cleanText,
+          realStart: bestItem.realStartSec,
+          realEnd: bestItem.realEndSec,
+          speakerId: bestItem.speakerId || speakerId,
+          runnerUpSpeakerId:
+            bestItem.runnerUpSpeakerId || bestItem.speakerId || speakerId,
+          confidence: bestItem.speakerConfidence,
+          acousticMargin: bestItem.speakerMargin,
+        });
+      }
+    }
+  }
+
+  const mergedUnits: typeof unwarpedUnits = [];
+  for (const u of unwarpedUnits) {
+    const prev = mergedUnits[mergedUnits.length - 1];
+    if (
+      prev &&
+      prev.speakerId === u.speakerId &&
+      u.realStart >= prev.realEnd - 0.2 &&
+      u.realStart - prev.realEnd <= 1.8 &&
+      prev.text.length + u.text.length <= 240
+    ) {
+      const needsComma = !/[，。？！、；：,.?!]$/.test(prev.text);
+      prev.text = (needsComma ? `${prev.text}，` : prev.text) + u.text;
+      prev.realEnd = Math.max(prev.realEnd, u.realEnd);
+      prev.acousticMargin = Math.max(prev.acousticMargin, u.acousticMargin);
+    } else {
+      mergedUnits.push({ ...u });
+    }
+  }
+
+  return mergedUnits.map((m, idx) => {
+    const segId = `seg_c${chunkIndex}_tb${batchIndex}_s${idx}`;
+    return {
+      id: segId,
+      chunkIndex,
+      speakerId: m.speakerId,
+      runnerUpSpeakerId: m.runnerUpSpeakerId,
+      acousticMargin: m.acousticMargin,
+      start: m.realStart,
+      end: m.realEnd,
+      words: buildWordSpans(
+        m.text,
+        segId,
+        m.realStart,
+        m.realEnd,
+        m.confidence,
+        acousticThreshold
+      ),
+      isCorrected: false,
+      relistenCount: 0,
+    };
+  });
+}
 
 interface AtomicTokenUnit {
   text: string;
@@ -226,34 +523,79 @@ interface AtomicTokenUnit {
   boundaryScdRight?: number;
 }
 
-/**
- * 將 Whisper 輸出之 Chunks 拆解為具備精確時間區間之最小語意單元序列 W = {w_1, ..., w_L}
- */
 function decomposeChunksIntoAtomicUnits(
   rawChunks: Array<{ text: string; timestamp?: [number, number | null] }>,
   windowStartSec: number,
-  windowEndSec: number
+  windowEndSec: number,
+  fineTurns: FineDiarizationTurn[]
 ): AtomicTokenUnit[] {
   const units: AtomicTokenUnit[] = [];
+
+  const acousticSplitAnchors: Array<{ time: number; strength: number }> = [];
+  const windowTurns = fineTurns.filter(
+    (ft) => ft.end > windowStartSec && ft.start < windowEndSec
+  );
+
+  for (let i = 0; i < windowTurns.length; i++) {
+    const cur = windowTurns[i];
+    const prev = i > 0 ? windowTurns[i - 1] : null;
+    const isSpeakerSwitch = prev && prev.speakerId !== cur.speakerId;
+    const pauseGap = prev ? Math.max(0, cur.start - prev.end) : 0;
+    const scdLeft = cur.boundaryScdLeft || 0;
+
+    if (isSpeakerSwitch || pauseGap >= 0.12 || scdLeft >= 0.16) {
+      const strength =
+        (isSpeakerSwitch ? 0.5 : 0.0) +
+        Math.min(0.4, pauseGap) +
+        scdLeft * 0.8;
+      acousticSplitAnchors.push({ time: cur.start, strength });
+    }
+    if ((cur.boundaryScdRight || 0) >= 0.18) {
+      acousticSplitAnchors.push({
+        time: cur.end,
+        strength: (cur.boundaryScdRight || 0) * 0.8,
+      });
+    }
+  }
+
+  const speechMinStart =
+    windowTurns.length > 0 ? windowTurns[0].start : windowStartSec;
+  const speechMaxEnd =
+    windowTurns.length > 0
+      ? windowTurns[windowTurns.length - 1].end
+      : windowEndSec;
 
   for (let i = 0; i < rawChunks.length; i++) {
     const ch = rawChunks[i];
     const rawText = (ch.text || '').trim();
     if (!rawText) continue;
 
-    const relStart = typeof ch.timestamp?.[0] === 'number' ? ch.timestamp[0] : 0;
+    const relStart =
+      typeof ch.timestamp?.[0] === 'number' ? ch.timestamp[0] : 0;
     const relEnd =
       typeof ch.timestamp?.[1] === 'number' && ch.timestamp[1] !== null
         ? ch.timestamp[1]
         : Math.min(windowEndSec - windowStartSec, relStart + 3.8);
 
-    const gStart = Number((windowStartSec + relStart).toFixed(2));
-    const gEnd = Number(Math.max(gStart + 0.35, windowStartSec + relEnd).toFixed(2));
+    let gStart = Number((windowStartSec + relStart).toFixed(2));
+    let gEnd = Number(
+      Math.max(gStart + 0.35, windowStartSec + relEnd).toFixed(2)
+    );
+
+    if (i === 0 && Math.abs(gStart - speechMinStart) <= 0.6) {
+      gStart = Number(Math.max(windowStartSec, speechMinStart).toFixed(2));
+    }
+    if (
+      i === rawChunks.length - 1 &&
+      gEnd > speechMaxEnd &&
+      gEnd - speechMaxEnd <= 1.2
+    ) {
+      gEnd = Number(Math.max(gStart + 0.35, speechMaxEnd).toFixed(2));
+    }
 
     const prePunct = restoreMultilingualPunctuation(rawText);
     if (!prePunct) continue;
 
-    // 在句號、問號、感嘆號、逗號及明確轉折連詞處切分為最小子句單元，供 Viterbi 逐點決策
     const marked = prePunct
       .replace(/([。？！?!])/g, '$1|')
       .replace(
@@ -263,7 +605,9 @@ function decomposeChunksIntoAtomicUnits(
 
     const subStrings = marked
       .split('|')
-      .flatMap((part) => (part.length >= 14 ? part.split(/(?<=[，、,])/) : [part]))
+      .flatMap((part) =>
+        part.length >= 14 ? part.split(/(?<=[，、,])/) : [part]
+      )
       .map((s) => s.trim())
       .filter((s) => s.length > 0 && !/^[，。？！、,.?!]+$/.test(s));
 
@@ -274,18 +618,51 @@ function decomposeChunksIntoAtomicUnits(
       subStrings.reduce((acc, s) => acc + s.length, 0)
     );
     const spanDur = Math.max(0.3, gEnd - gStart);
-    let cursor = 0;
 
-    for (const sub of subStrings) {
-      const uStart = Number((gStart + (cursor / totalChars) * spanDur).toFixed(2));
-      cursor += sub.length;
-      const uEnd = Number(
-        Math.max(uStart + 0.2, gStart + (cursor / totalChars) * spanDur).toFixed(2)
+    const boundaries = new Float64Array(subStrings.length + 1);
+    boundaries[0] = gStart;
+    boundaries[subStrings.length] = gEnd;
+
+    let cursor = 0;
+    for (let k = 0; k < subStrings.length - 1; k++) {
+      cursor += subStrings[k].length;
+      const rawSplit = gStart + (cursor / totalChars) * spanDur;
+      const prevBound = boundaries[k];
+      const maxAllowed = gEnd - (subStrings.length - 1 - k) * 0.18;
+      const minAllowed = prevBound + 0.18;
+
+      const isPragmaticTurnBoundary =
+        MULTILINGUAL_QUESTION_END_REGEX.test(subStrings[k]) ||
+        MULTILINGUAL_BACKCHANNEL_REGEX.test(subStrings[k + 1]);
+      const snapRadius = isPragmaticTurnBoundary ? 0.65 : 0.45;
+
+      let snappedSplit = rawSplit;
+      let bestScore = -1.0;
+
+      for (const anchor of acousticSplitAnchors) {
+        if (anchor.time < minAllowed || anchor.time > maxAllowed) continue;
+        const dist = Math.abs(anchor.time - rawSplit);
+        if (dist <= snapRadius) {
+          const score = anchor.strength - dist * 0.6;
+          if (score > bestScore) {
+            bestScore = score;
+            snappedSplit = anchor.time;
+          }
+        }
+      }
+
+      boundaries[k + 1] = Number(
+        Math.max(minAllowed, Math.min(maxAllowed, snappedSplit)).toFixed(2)
       );
+    }
+
+    for (let k = 0; k < subStrings.length; k++) {
+      const uStart = boundaries[k];
+      const uEnd = Math.max(uStart + 0.18, boundaries[k + 1]);
       units.push({
-        text: restoreMultilingualPunctuation(sub),
-        start: uStart,
-        end: uEnd,
+        text: restoreMultilingualPunctuation(subStrings[k]),
+        start: Number(uStart.toFixed(2)),
+        end: Number(uEnd.toFixed(2)),
         center: Number((0.5 * (uStart + uEnd)).toFixed(2)),
       });
     }
@@ -294,22 +671,16 @@ function decomposeChunksIntoAtomicUnits(
   return units;
 }
 
-/**
- * 【Deep Research 問題 4 核心實作】
- * 執行 SCD 波峰導引之 Viterbi 動態規劃對齊：
- * - 發射成本：\Phi_emit(l, k) = -ln( exp(\gamma * S(l, k)) / \sum_j exp(\gamma * S(l, j)) ), \gamma = 12.0
- * - 轉移成本：\Psi_trans(l, k' -> k) = \Lambda_base * exp(-\alpha_scd * d_SCD(t_l^start)) * \beta_ling(w_{l-1}, w_l)
- *   其中 \Lambda_base = 4.5, \alpha_scd = 3.2, \beta_ling \in {0.25, 0.55, 1.00}
- * - 步驟 4 後處理：以 \Delta M(B, A) >= 0.14 或 (\Delta M(B, A) >= 0.06 且雙峰 P_scd >= 0.55) 保護短促附和詞
- */
 function alignUnitsWithScdViterbiAndPragmatics(
   units: AtomicTokenUnit[],
-  fineTurns: FineDiarizationTurn[]
+  fineTurns: FineDiarizationTurn[],
+  backchannelMarginThreshold = 0.12,
+  pingPongMaxDurSec = 1.5,
+  engineMode = 'mode_0_heritage_classic'
 ): AtomicTokenUnit[] {
   const L = units.length;
   if (L === 0 || fineTurns.length === 0) return units;
 
-  // 收集本視窗所有活躍之語者集合 G = {1, ..., G}
   const speakerSet = new Set<string>();
   for (const ft of fineTurns) {
     if (ft.speakerId) speakerSet.add(ft.speakerId);
@@ -329,7 +700,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
     }));
   }
 
-  // 查詢任一時間點 t 附近之最大聲紋跳變度 d_SCD(t)
   const getLocalScd = (t: number, radius = 0.35): number => {
     let maxVal = 0.0;
     for (const ft of fineTurns) {
@@ -343,7 +713,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
     return maxVal;
   };
 
-  // 計算第 l 個單元對每位候選語者 g 的聲學親和力分數 S_comp(l, g)
   const unitSpeakerScores: Float64Array[] = new Array(L);
 
   for (let l = 0; l < L; l++) {
@@ -352,8 +721,8 @@ function alignUnitsWithScdViterbiAndPragmatics(
     let weightSum = 0.0;
 
     for (const ft of fineTurns) {
-      const ovStart = Math.max(u.start - 0.15, ft.start);
-      const ovEnd = Math.min(u.end + 0.15, ft.end);
+      const ovStart = Math.max(u.start - 0.12, ft.start);
+      const ovEnd = Math.min(u.end + 0.12, ft.end);
       if (ovEnd > ovStart) {
         const w = ovEnd - ovStart;
         weightSum += w;
@@ -379,11 +748,13 @@ function alignUnitsWithScdViterbiAndPragmatics(
         scores[g] = (scores[g] - 0.35) / weightSum;
       }
     } else {
-      // 若落在微小空隙，找時間中心最近的 fineTurn
       let nearest = fineTurns[0];
       let minGap = Infinity;
       for (const ft of fineTurns) {
-        const gap = Math.min(Math.abs(u.center - ft.start), Math.abs(u.center - ft.end));
+        const gap = Math.min(
+          Math.abs(u.center - ft.start),
+          Math.abs(u.center - ft.end)
+        );
         if (gap < minGap) {
           minGap = gap;
           nearest = ft;
@@ -408,13 +779,17 @@ function alignUnitsWithScdViterbiAndPragmatics(
     u.boundaryScdRight = getLocalScd(u.end, 0.28);
   }
 
-  // ── 步驟 2 & 3：Viterbi 動態規劃矩陣求解 ──
   const dp = new Float64Array(L * G).fill(Infinity);
   const backptr = new Int32Array(L * G).fill(0);
 
-  const gamma = 12.0;      // Softmax 溫度係數
-  const lambdaBase = 4.5;  // 基礎轉移懲罰 \Lambda_base
-  const alphaScd = 3.2;    // SCD 跳變衰減率 \alpha_scd
+  const gamma = 13.5;
+  const lambdaBase =
+    engineMode === 'mode_0_heritage_classic'
+      ? 2.1
+      : engineMode === 'mode_a_classic'
+      ? 4.2
+      : 3.1;
+  const alphaScd = 3.5;
 
   for (let l = 0; l < L; l++) {
     const u = units[l];
@@ -441,7 +816,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
         const pauseGap = Math.max(0.0, u.start - prevU.end);
         const boundaryScd = u.boundaryScdLeft || 0.0;
 
-        // 計算語言學與停頓調節因子 \beta_ling(w_{l-1}, w_l)
         let lingFactor = 1.0;
         if (/[。？！?!.]$/.test(prevU.text) || pauseGap >= 0.35) {
           lingFactor = 0.25;
@@ -468,7 +842,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
     }
   }
 
-  // 回溯全局最優語者路徑 \hat{z}_{1:L}
   const assignedIdx = new Int32Array(L);
   let bestLastG = 0;
   let minFinalCost = Infinity;
@@ -483,7 +856,9 @@ function alignUnitsWithScdViterbiAndPragmatics(
     assignedIdx[l - 1] = backptr[l * G + assignedIdx[l]];
   }
 
-  // ── 步驟 4：具備邊際與雙峰保護的智慧型後處理 (保護 0.4s~1.5s 真實附和詞) ──
+  const dualPeakMarginReq = Number(
+    (backchannelMarginThreshold * 0.45).toFixed(3)
+  );
   let idx = 0;
   while (idx < L) {
     let endIdx = idx;
@@ -492,12 +867,11 @@ function alignUnitsWithScdViterbiAndPragmatics(
     }
     const turnDur = units[endIdx].end - units[idx].start;
 
-    // 檢查夾在同語者 A 中間的短區間 B (A -> B -> A, 且 B < 1.5s)
     if (
       idx > 0 &&
       endIdx < L - 1 &&
       assignedIdx[idx - 1] === assignedIdx[endIdx + 1] &&
-      turnDur < 1.5
+      turnDur < pingPongMaxDurSec
     ) {
       const spkA = assignedIdx[idx - 1];
       const spkB = assignedIdx[idx];
@@ -510,13 +884,14 @@ function alignUnitsWithScdViterbiAndPragmatics(
       }
       const avgMarginBA = marginSum / (endIdx - idx + 1);
       const dualScdPeakSum =
-        (units[idx].boundaryScdLeft || 0) + (units[endIdx].boundaryScdRight || 0);
-      const isLexicalBackchannel = MULTILINGUAL_BACKCHANNEL_REGEX.test(combinedText);
+        (units[idx].boundaryScdLeft || 0) +
+        (units[endIdx].boundaryScdRight || 0);
+      const isLexicalBackchannel =
+        MULTILINGUAL_BACKCHANNEL_REGEX.test(combinedText);
 
-      // 報告步驟 4 保護公式：\Delta M(B, A) >= 0.14 或 (\Delta M(B, A) >= 0.06 且雙峰 >= 0.55) 或命中附和詞庫
       const isTrueBackchannel =
-        avgMarginBA >= 0.14 ||
-        (avgMarginBA >= 0.06 && dualScdPeakSum >= 0.55) ||
+        avgMarginBA >= backchannelMarginThreshold ||
+        (avgMarginBA >= dualPeakMarginReq && dualScdPeakSum >= 0.5) ||
         isLexicalBackchannel;
 
       if (!isTrueBackchannel) {
@@ -528,7 +903,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
     idx = endIdx + 1;
   }
 
-  // 寫回每個單元的 Top-1、Top-2 與聲學邊際 M(u_m)
   for (let l = 0; l < L; l++) {
     const g1 = assignedIdx[l];
     const scores = unitSpeakerScores[l];
@@ -548,7 +922,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
     units[l].acousticMargin = Number(margin.toFixed(3));
   }
 
-  // ── 步驟 5：套用 DiarizationLM 對話語用學法則 (問答對互斥律 & 反詰分離律) ──
   for (let l = 1; l < L; l++) {
     const prev = units[l - 1];
     const curr = units[l];
@@ -558,7 +931,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
     const prevIsQuestion = MULTILINGUAL_QUESTION_END_REGEX.test(prev.text);
     const currIsShortAnswer = MULTILINGUAL_BACKCHANNEL_REGEX.test(curr.text);
 
-    // 【法則一：問答對互斥律】疑問句後緊接之直接確認/否決回答，必屬不同語者
     if (
       prevIsQuestion &&
       currIsShortAnswer &&
@@ -573,7 +945,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
       continue;
     }
 
-    // 【法則三：句首反詰轉折分離律】對非 LOCKED 之反詰問句且具備邊界 SCD 跳變，切換至次佳語者
     const isRebuttalQuestion =
       /^(可是|不是[，]?|不過|しかし|ただ|but\s)/i.test(curr.text) &&
       MULTILINGUAL_QUESTION_END_REGEX.test(curr.text);
@@ -592,9 +963,6 @@ function alignUnitsWithScdViterbiAndPragmatics(
   return units;
 }
 
-/**
- * 將完成 Viterbi 與語用學裁決之單元序列合併為段落 Segment[] (上限 260 字)
- */
 function consolidateUnitsIntoSegments(
   units: AtomicTokenUnit[],
   chunkIndex: number,
@@ -608,13 +976,16 @@ function consolidateUnitsIntoSegments(
     if (
       prev &&
       prev.speakerId === item.speakerId &&
-      item.start - prev.end <= 4.5 &&
+      item.start - prev.end <= 3.2 &&
       prev.text.length + item.text.length <= 260
     ) {
-      const prevClean = prev.text.replace(/[。.]$/, '，');
-      prev.text = restoreMultilingualPunctuation(prevClean + item.text);
+      const needsComma = !/[，。？！、；：,.?!]$/.test(prev.text);
+      prev.text = (needsComma ? `${prev.text}，` : prev.text) + item.text;
       prev.end = item.end;
-      prev.confidence = Math.max(prev.confidence || 0.85, item.confidence || 0.85);
+      prev.confidence = Math.max(
+        prev.confidence || 0.85,
+        item.confidence || 0.85
+      );
       prev.acousticMargin = Math.max(
         prev.acousticMargin || 0.1,
         item.acousticMargin || 0.1
@@ -666,6 +1037,98 @@ self.onmessage = async (event: MessageEvent) => {
     return;
   }
 
+  /**
+   * 【核心升級】語者專屬虛擬音軌拼接轉寫模式 (TRANSCRIBE_SPEAKER_TRACK_BATCH)
+   */
+  if (data.type === 'TRANSCRIBE_SPEAKER_TRACK_BATCH') {
+    const {
+      stitchedSamples,
+      timeMap,
+      speakerId,
+      chunkIndex,
+      batchIndex,
+      modelName,
+      languageHint = 'zh',
+      acousticThreshold = 0.72,
+    } = data as {
+      stitchedSamples: Float32Array;
+      timeMap: VirtualTrackMapItem[];
+      speakerId: string;
+      chunkIndex: number;
+      batchIndex: number;
+      modelName: LocalAsrModel;
+      languageHint?: string;
+      acousticThreshold?: number;
+    };
+
+    try {
+      const transcriber = await ensureAsrPipeline(modelName);
+      const audioInput =
+        stitchedSamples instanceof Float32Array
+          ? stitchedSamples
+          : new Float32Array(stitchedSamples);
+
+      if (audioInput.length < 1600 || !timeMap || timeMap.length === 0) {
+        self.postMessage({
+          type: 'SPEAKER_BATCH_TRANSCRIBED',
+          segments: [],
+          batchIndex,
+        });
+        return;
+      }
+
+      const resolvedWhisperLang =
+        languageHint === 'en'
+          ? 'english'
+          : languageHint === 'ja'
+          ? 'japanese'
+          : 'chinese';
+
+      const output = await transcriber(audioInput, {
+        language: resolvedWhisperLang,
+        task: 'transcribe',
+        return_timestamps: true,
+        chunk_length_s: 30,
+        stride_length_s: 5,
+      });
+
+      const totalVSec = timeMap[timeMap.length - 1].virtualEndSec;
+      const rawChunks: Array<{
+        text: string;
+        timestamp?: [number, number | null];
+      }> =
+        output && Array.isArray(output.chunks) && output.chunks.length > 0
+          ? output.chunks
+          : [
+              {
+                text: typeof output?.text === 'string' ? output.text : '',
+                timestamp: [0, totalVSec],
+              },
+            ];
+
+      const unwarpedSegments = unwarpVirtualTrackChunksToSegments(
+        rawChunks,
+        timeMap,
+        speakerId,
+        chunkIndex,
+        batchIndex,
+        acousticThreshold
+      );
+
+      self.postMessage({
+        type: 'SPEAKER_BATCH_TRANSCRIBED',
+        segments: unwarpedSegments,
+        batchIndex,
+      });
+    } catch (err) {
+      self.postMessage({
+        type: 'ASR_ERROR',
+        error: (err as Error).message || '語者虛擬音軌轉寫發生錯誤',
+      });
+    }
+    return;
+  }
+
   if (data.type === 'TRANSCRIBE_WINDOW_AND_ALIGN') {
     const {
       windowSamples,
@@ -677,6 +1140,9 @@ self.onmessage = async (event: MessageEvent) => {
       modelName,
       languageHint = 'zh',
       acousticThreshold = 0.72,
+      backchannelMarginThreshold = 0.12,
+      pingPongMaxDurSec = 1.5,
+      engineMode = 'mode_0_heritage_classic',
     } = data as {
       windowSamples: Float32Array;
       windowStartSec: number;
@@ -687,6 +1153,10 @@ self.onmessage = async (event: MessageEvent) => {
       modelName: LocalAsrModel;
       languageHint?: string;
       acousticThreshold?: number;
+      asrBeamSize?: number;
+      backchannelMarginThreshold?: number;
+      pingPongMaxDurSec?: number;
+      engineMode?: string;
     };
 
     try {
@@ -736,11 +1206,15 @@ self.onmessage = async (event: MessageEvent) => {
       const atomicUnits = decomposeChunksIntoAtomicUnits(
         rawChunks,
         windowStartSec,
-        windowEndSec
+        windowEndSec,
+        fineTurns
       );
       const alignedUnits = alignUnitsWithScdViterbiAndPragmatics(
         atomicUnits,
-        fineTurns
+        fineTurns,
+        backchannelMarginThreshold,
+        pingPongMaxDurSec,
+        engineMode
       );
       const finalSegments = consolidateUnitsIntoSegments(
         alignedUnits,
@@ -774,6 +1248,7 @@ self.onmessage = async (event: MessageEvent) => {
       targetSegment: Segment;
       modelName: LocalAsrModel;
       languageHint?: string;
+      promptHint?: string;
     };
 
     try {
@@ -790,21 +1265,27 @@ self.onmessage = async (event: MessageEvent) => {
           ? 'japanese'
           : 'chinese';
 
+      // 針對已經過 enhanceSubSegmentAudioForRelisten (+12dB 弱音補償 + 2.8kHz 咬字增強 + 0.86x WSOLA 慢速展開) 的音訊，
+      // 採用高解析度步長進行重聽解碼，抓出突然變小聲或太短促的漏字
       const output = await transcriber(audioInput, {
         language: resolvedWhisperLang,
         task: 'transcribe',
         return_timestamps: true,
-        chunk_length_s: 30,
-        stride_length_s: 5,
+        chunk_length_s: 20,
+        stride_length_s: 3,
       });
 
       const rawText = Array.isArray(output?.chunks)
-        ? output.chunks.map((c: { text?: string }) => c.text || '').join('，')
+        ? output.chunks
+            .map((c: { text?: string }) => (c.text || '').trim())
+            .filter(Boolean)
+            .join('，')
         : typeof output?.text === 'string'
         ? output.text
         : '';
 
       const cleanText = restoreMultilingualPunctuation(rawText);
+      // 對齊回原目標段落之真實會議時間區間 [targetSegment.start, targetSegment.end]
       const newWords = cleanText
         ? buildWordSpans(
             cleanText,
@@ -815,7 +1296,7 @@ self.onmessage = async (event: MessageEvent) => {
           ).map((w) => ({
             ...w,
             status: 'auto_corrected' as const,
-            reason: '經偏移邊界截檔重聽與全局語境交叉校準',
+            reason: '經微觀弱音放大(+12dB)與慢速展開重聽補漏字校準',
           }))
         : null;
 

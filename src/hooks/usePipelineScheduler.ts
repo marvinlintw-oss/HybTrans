@@ -1,12 +1,14 @@
 // src/hooks/usePipelineScheduler.ts
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import {
   CorrectionPatchItem,
   FineDiarizationTurn,
   Segment,
   Speaker,
+  SpeakerTrackBatch,
   TriLevelContextPayload,
+  VirtualTrackMapItem,
   WordSpan,
 } from '../types';
 import {
@@ -40,19 +42,160 @@ function setGlobalProcessing(val: boolean) {
   listeners.forEach((fn) => fn(val));
 }
 
+/**
+ * 根據語者虛擬音軌映射表 `timeMap`，從當前 5 分鐘巨集區塊的原始無損波形中抽取該語者的所有發聲片段，
+ * 並在片段與片段之間插入 `0.35s` 零值靜音隔板（附帶 10ms 線性淡入淡出防爆音），組裝成純淨同語者音訊！
+ */
+function stitchVirtualSpeakerTrackSamples(
+  chunkSamples: Float32Array,
+  chunkStartGlobalSec: number,
+  batch: SpeakerTrackBatch,
+  sampleRate = TARGET_SAMPLE_RATE
+): Float32Array {
+  const spacerSamplesCount = Math.round(batch.spacerDurationSec * sampleRate);
+  const fadeSamples = Math.min(160, Math.floor(spacerSamplesCount / 4)); // 10ms 微淡入淡出
+
+  const slices: Float32Array[] = [];
+  let totalLength = 0;
+
+  for (let i = 0; i < batch.timeMap.length; i++) {
+    const item = batch.timeMap[i];
+    const startIdx = Math.max(
+      0,
+      Math.floor((item.realStartSec - chunkStartGlobalSec) * sampleRate)
+    );
+    const endIdx = Math.min(
+      chunkSamples.length,
+      Math.ceil((item.realEndSec - chunkStartGlobalSec) * sampleRate)
+    );
+    const segLen = Math.max(0, endIdx - startIdx);
+    const sub = new Float32Array(segLen);
+    if (segLen > 0) {
+      sub.set(chunkSamples.subarray(startIdx, endIdx));
+      for (let f = 0; f < Math.min(fadeSamples, Math.floor(segLen / 2)); f++) {
+        const gain = f / fadeSamples;
+        sub[f] *= gain;
+        sub[segLen - 1 - f] *= gain;
+      }
+    }
+    slices.push(sub);
+    totalLength += segLen;
+    if (i < batch.timeMap.length - 1) {
+      totalLength += spacerSamplesCount;
+    }
+  }
+
+  const stitched = new Float32Array(totalLength);
+  let offset = 0;
+  for (let i = 0; i < slices.length; i++) {
+    stitched.set(slices[i], offset);
+    offset += slices[i].length;
+    if (i < slices.length - 1) {
+      offset += spacerSamplesCount; // 中間維持 0.0 靜音隔板
+    }
+  }
+
+  return stitched;
+}
+
+/**
+ * 當雲端 BYOK 模式 (Groq / Gemini) 搭配「語者虛擬音軌拼接」時，將雲端回傳之相對時間區段還原回原始會議時間軸
+ */
+function unwarpCloudSegmentsFromVirtualTrack(
+  cloudSegs: Segment[],
+  timeMap: VirtualTrackMapItem[],
+  speakerId: string
+): Segment[] {
+  if (timeMap.length === 0 || cloudSegs.length === 0) return cloudSegs;
+
+  return cloudSegs.map((seg) => {
+    const vStart = seg.start;
+    const vEnd = seg.end;
+    const vCenter = 0.5 * (vStart + vEnd);
+
+    let bestItem = timeMap[0];
+    let bestOverlap = -1;
+    for (const item of timeMap) {
+      const ov =
+        Math.min(vEnd, item.virtualEndSec) -
+        Math.max(vStart, item.virtualStartSec);
+      if (ov > bestOverlap) {
+        bestOverlap = ov;
+        bestItem = item;
+      }
+    }
+    if (bestOverlap <= 0) {
+      let minDist = Infinity;
+      for (const item of timeMap) {
+        const c = 0.5 * (item.virtualStartSec + item.virtualEndSec);
+        if (Math.abs(vCenter - c) < minDist) {
+          minDist = Math.abs(vCenter - c);
+          bestItem = item;
+        }
+      }
+    }
+
+    const vSpan = Math.max(
+      0.15,
+      bestItem.virtualEndSec - bestItem.virtualStartSec
+    );
+    const rSpan = Math.max(0.15, bestItem.realEndSec - bestItem.realStartSec);
+    const clampedVStart = Math.max(
+      bestItem.virtualStartSec,
+      Math.min(bestItem.virtualEndSec - 0.1, vStart)
+    );
+    const clampedVEnd = Math.max(
+      clampedVStart + 0.15,
+      Math.min(bestItem.virtualEndSec, vEnd)
+    );
+
+    const realStart = Number(
+      (
+        bestItem.realStartSec +
+        ((clampedVStart - bestItem.virtualStartSec) / vSpan) * rSpan
+      ).toFixed(2)
+    );
+    const realEnd = Number(
+      Math.max(
+        realStart + 0.2,
+        bestItem.realStartSec +
+          ((clampedVEnd - bestItem.virtualStartSec) / vSpan) * rSpan
+      ).toFixed(2)
+    );
+
+    const dur = Math.max(0.2, realEnd - realStart);
+    const step = dur / Math.max(1, seg.words.length);
+
+    return {
+      ...seg,
+      speakerId: bestItem.speakerId || speakerId,
+      runnerUpSpeakerId:
+        bestItem.runnerUpSpeakerId || bestItem.speakerId || speakerId,
+      acousticMargin: bestItem.speakerMargin,
+      start: realStart,
+      end: realEnd,
+      words: seg.words.map((w, idx) => ({
+        ...w,
+        start: Number((realStart + idx * step).toFixed(2)),
+        end: Number((realStart + (idx + 1) * step).toFixed(2)),
+      })),
+    };
+  });
+}
+
 export function usePipelineScheduler() {
   const [isProcessing, setIsProcessing] = useState(globalIsProcessing);
   const coResidentAsrWorkerRef = useRef<Worker | null>(null);
   const coResidentLlmWorkerRef = useRef<Worker | null>(null);
   const activeDiarWorkerRef = useRef<Worker | null>(null);
 
-  useState(() => {
+  useEffect(() => {
     const handler = (val: boolean) => setIsProcessing(val);
     listeners.add(handler);
     return () => {
       listeners.delete(handler);
     };
-  });
+  }, []);
 
   const terminateAllWorkers = useCallback(() => {
     if (activeDiarWorkerRef.current) {
@@ -72,6 +215,16 @@ export function usePipelineScheduler() {
       progress: 0,
       fileName: '',
     });
+  }, []);
+
+  const ensureLocalLlmWorker = useCallback((): Worker => {
+    if (!coResidentLlmWorkerRef.current) {
+      coResidentLlmWorkerRef.current = new Worker(
+        new URL('../workers/localLlm.worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+    }
+    return coResidentLlmWorkerRef.current;
   }, []);
 
   const stopPipeline = useCallback(() => {
@@ -139,7 +292,6 @@ export function usePipelineScheduler() {
     []
   );
 
-  /** 手動或自動觸發「用全場後文與摘要回頭重順前文」 */
   const triggerRetroactivePass = useCallback(async () => {
     const state = useAppStore.getState();
     if (state.segments.length === 0) return 0;
@@ -182,10 +334,10 @@ export function usePipelineScheduler() {
     chunkEndSec: number
   ): FineDiarizationTurn[] => {
     const turns: FineDiarizationTurn[] = [];
-    for (let t = chunkStartSec; t < chunkEndSec; t += 20) {
+    for (let t = chunkStartSec; t < chunkEndSec; t += 15) {
       turns.push({
         start: t,
-        end: Math.min(chunkEndSec, t + 20),
+        end: Math.min(chunkEndSec, t + 15),
         speakerId: 'Speaker_01',
         f0Hz: 155,
       });
@@ -204,6 +356,7 @@ export function usePipelineScheduler() {
   ): Promise<{
     turns: FineDiarizationTurn[];
     asrWindows: Array<{ start: number; end: number }>;
+    speakerTrackBatches: SpeakerTrackBatch[];
     updatedSpeakers: Speaker[];
   }> => {
     return new Promise((resolve) => {
@@ -220,12 +373,11 @@ export function usePipelineScheduler() {
         return {
           turns: fb,
           asrWindows: fb.map((t) => ({ start: t.start, end: t.end })),
+          speakerTrackBatches: [],
           updatedSpeakers: existingSpeakers,
         };
       };
 
-      // 【關鍵修復】改為可隨進度自動重置的活躍看門狗計時器 (每次收到進度續命 90 秒)，
-      // 徹底根治先前 25 秒時間一到就把正在跑的語者分離強制斬首並退回 Speaker_01 的問題！
       let watchdogId: ReturnType<typeof setTimeout> | null = null;
       const resetWatchdog = () => {
         if (watchdogId) clearTimeout(watchdogId);
@@ -268,11 +420,16 @@ export function usePipelineScheduler() {
                   start: t.start,
                   end: t.end,
                 }));
+          const speakerTrackBatches: SpeakerTrackBatch[] = Array.isArray(
+            msg.speakerTrackBatches
+          )
+            ? msg.speakerTrackBatches
+            : [];
           const updatedSpeakers =
             msg.updatedSpeakers || msg.data?.speakers || existingSpeakers;
           resolve(
             turns.length > 0
-              ? { turns, asrWindows, updatedSpeakers }
+              ? { turns, asrWindows, speakerTrackBatches, updatedSpeakers }
               : fallback('Turns 為空陣列')
           );
         } else if (msg.type === 'DIARIZE_ERROR' || msg.type === 'ERROR') {
@@ -339,13 +496,21 @@ export function usePipelineScheduler() {
 
           const currentConfig = useAppStore.getState().config;
           const chunkMeta = useAppStore.getState().chunks[cIdx];
+          const engineMode =
+            currentConfig.diarizationConfig?.engineMode ||
+            'mode_0_heritage_classic';
+          const useVirtualTrackStitching =
+            currentConfig.diarizationConfig
+              ?.enableVirtualSpeakerTrackStitching ?? true;
+
           const modeLabel =
-            currentConfig.diarizationConfig?.engineMode === 'mode_a_classic'
-              ? 'Mode A 經典極速'
-              : currentConfig.diarizationConfig?.engineMode ===
-                'mode_c_onnx_neural'
-              ? 'Mode C 本地 ONNX'
-              : 'Mode B 進階 DSP';
+            engineMode === 'mode_0_heritage_classic'
+              ? 'Mode 0 初代經典穩健引擎'
+              : engineMode === 'mode_a_classic'
+              ? 'Mode A 純 DSP 極速'
+              : engineMode === 'mode_c_onnx_neural'
+              ? 'Mode C WeSpeaker ONNX 雙尺度'
+              : 'Mode B 雙流形譜聚類';
 
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'preprocessing',
@@ -366,32 +531,30 @@ export function usePipelineScheduler() {
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'diarizing',
             progress: 15,
-            detailText: `${modeLabel} 聲紋分析與聚類中 (${currentConfig.minSpeakers}~${currentConfig.maxSpeakers} 人)...`,
+            detailText: `${modeLabel} 黃金長句定錨與聲紋分離中 (${currentConfig.minSpeakers}~${currentConfig.maxSpeakers} 人)...`,
           });
 
           const existingSpeakers = Object.values(
             useAppStore.getState().speakers
           );
-          const { turns: fineTurns, asrWindows, updatedSpeakers } =
-            await runDiarizationStage(
-              chunkSamples,
-              cIdx,
-              chunkMeta.startTime,
-              chunkMeta.endTime,
-              currentConfig.minSpeakers,
-              currentConfig.maxSpeakers,
-              existingSpeakers
-            );
+          const {
+            turns: fineTurns,
+            asrWindows,
+            speakerTrackBatches,
+            updatedSpeakers,
+          } = await runDiarizationStage(
+            chunkSamples,
+            cIdx,
+            chunkMeta.startTime,
+            chunkMeta.endTime,
+            currentConfig.minSpeakers,
+            currentConfig.maxSpeakers,
+            existingSpeakers
+          );
 
           if (globalAbortFlag) break;
 
           useAppStore.getState().upsertSpeakers(updatedSpeakers);
-
-          useAppStore.getState().updateChunkState(cIdx, {
-            stage: 'transcribing',
-            progress: 35,
-            detailText: `已識別 ${updatedSpeakers.length} 位語者，準備轉寫 (共 ${asrWindows.length} 個語境視窗)...`,
-          });
 
           const useCloudAsr =
             currentConfig.mode === 'byok_cloud' &&
@@ -409,6 +572,13 @@ export function usePipelineScheduler() {
               );
             }
             asrWorker = coResidentAsrWorkerRef.current;
+          }
+
+          if (
+            currentConfig.keepModelsCoResident &&
+            !currentConfig.geminiApiKey.trim()
+          ) {
+            ensureLocalLlmWorker();
           }
 
           let pendingWindowSegments: Segment[] = [];
@@ -437,9 +607,18 @@ export function usePipelineScheduler() {
             const priorSegments =
               firstIdx > 0 ? latestState.segments.slice(0, firstIdx) : [];
 
+            const pendingIdSet = new Set(
+              pendingWindowSegments.map((s) => s.id)
+            );
+            const currentTargetSegments = latestState.segments.filter((s) =>
+              pendingIdSet.has(s.id)
+            );
+
             const payload = buildTriLevelContextPayload(
               priorSegments,
-              pendingWindowSegments,
+              currentTargetSegments.length > 0
+                ? currentTargetSegments
+                : pendingWindowSegments,
               latestState.speakers,
               latestState.dictionary,
               latestState.docContextSummary,
@@ -476,155 +655,350 @@ export function usePipelineScheduler() {
             pendingWindowChars = 0;
           };
 
-          for (let wIdx = 0; wIdx < asrWindows.length; wIdx++) {
-            if (globalAbortFlag) break;
-            const win = asrWindows[wIdx];
-
-            const relStartSample = Math.max(
-              0,
-              Math.floor(
-                (win.start - chunkMeta.startTime) * TARGET_SAMPLE_RATE
-              )
-            );
-            const relEndSample = Math.min(
-              chunkSamples.length,
-              Math.ceil((win.end - chunkMeta.startTime) * TARGET_SAMPLE_RATE)
-            );
-            const winSamples = chunkSamples.slice(
-              relStartSample,
-              relEndSample
-            );
-
-            const winProgress =
-              35 +
-              Math.round(((wIdx + 1) / Math.max(1, asrWindows.length)) * 45);
+          // ==================================================================
+          // 分支 A：【升級版】語者專屬虛擬音軌拼接轉寫 (Virtual Speaker-Track Stitching)
+          // ==================================================================
+          if (useVirtualTrackStitching && speakerTrackBatches.length > 0) {
             useAppStore.getState().updateChunkState(cIdx, {
               stage: 'transcribing',
-              progress: winProgress,
-              detailText: `語境轉寫與多語系子句聲紋對齊 (${wIdx + 1}/${asrWindows.length})`,
+              progress: 35,
+              detailText: `已建立 ${updatedSpeakers.length} 位語者專屬虛擬音軌 (共 ${speakerTrackBatches.length} 個純淨批次)，開始分軌轉寫...`,
             });
 
-            let windowSegments: Segment[] = [];
-
-            if (useCloudAsr) {
-              const turnWav = encodeFloat32ToWav(
-                winSamples,
+            for (let bIdx = 0; bIdx < speakerTrackBatches.length; bIdx++) {
+              if (globalAbortFlag) break;
+              const batch = speakerTrackBatches[bIdx];
+              const stitchedSamples = stitchVirtualSpeakerTrackSamples(
+                chunkSamples,
+                chunkMeta.startTime,
+                batch,
                 TARGET_SAMPLE_RATE
               );
-              const hotwords = useAppStore
-                .getState()
-                .dictionary.map((d) => d.term)
-                .slice(0, 30)
-                .join('、');
-              const primarySp =
-                fineTurns.find(
-                  (ft) => ft.end > win.start && ft.start < win.end
-                )?.speakerId || 'Speaker_01';
 
-              windowSegments = currentConfig.groqApiKey.trim()
-                ? await transcribeWithGroq(
-                    turnWav,
-                    currentConfig.groqApiKey.trim(),
-                    hotwords,
-                    win.start,
-                    primarySp,
-                    cIdx,
-                    currentConfig.acousticThreshold
-                  )
-                : await transcribeWithGeminiAudio(
-                    turnWav,
-                    currentConfig.geminiApiKey.trim(),
-                    hotwords,
-                    win.start,
-                    primarySp,
-                    cIdx,
-                    currentConfig.acousticThreshold
+              const spName =
+                useAppStore.getState().speakers[batch.speakerId]?.name ||
+                batch.speakerId;
+              const batchProgress =
+                35 +
+                Math.round(
+                  ((bIdx + 1) / Math.max(1, speakerTrackBatches.length)) * 45
+                );
+
+              useAppStore.getState().updateChunkState(cIdx, {
+                stage: 'transcribing',
+                progress: batchProgress,
+                detailText: `專屬音軌轉寫 [${spName}] (${bIdx + 1}/${speakerTrackBatches.length} 批次)...`,
+              });
+
+              let batchSegments: Segment[] = [];
+
+              if (useCloudAsr) {
+                const stitchedWav = encodeFloat32ToWav(
+                  stitchedSamples,
+                  TARGET_SAMPLE_RATE
+                );
+                const hotwords = useAppStore
+                  .getState()
+                  .dictionary.map((d) => d.term)
+                  .slice(0, 40)
+                  .join('、');
+
+                const rawCloudSegs = currentConfig.groqApiKey.trim()
+                  ? await transcribeWithGroq(
+                      stitchedWav,
+                      currentConfig.groqApiKey.trim(),
+                      hotwords,
+                      0,
+                      batch.speakerId,
+                      cIdx,
+                      currentConfig.acousticThreshold
+                    )
+                  : await transcribeWithGeminiAudio(
+                      stitchedWav,
+                      currentConfig.geminiApiKey.trim(),
+                      hotwords,
+                      0,
+                      batch.speakerId,
+                      cIdx,
+                      currentConfig.acousticThreshold
+                    );
+
+                batchSegments = unwarpCloudSegmentsFromVirtualTrack(
+                  rawCloudSegs,
+                  batch.timeMap,
+                  batch.speakerId
+                );
+              } else if (asrWorker) {
+                const activeWorker = asrWorker;
+                const languageHint =
+                  currentConfig.diarizationConfig?.languageHint || 'zh';
+
+                batchSegments = await new Promise<Segment[]>(
+                  (resolve, reject) => {
+                    const handleBatchMsg = (e: MessageEvent) => {
+                      if (globalAbortFlag) {
+                        activeWorker.removeEventListener(
+                          'message',
+                          handleBatchMsg
+                        );
+                        resolve([]);
+                        return;
+                      }
+                      if (e.data?.type === 'ASR_DOWNLOAD_PROGRESS') {
+                        useAppStore.getState().setModelDownload({
+                          active: Boolean(e.data.active),
+                          modelName:
+                            e.data.modelName || currentConfig.localAsrModel,
+                          fileName: e.data.fileName || '模型權重檔',
+                          progress: Number(e.data.progress) || 0,
+                        });
+                        return;
+                      }
+                      if (
+                        e.data?.type === 'SPEAKER_BATCH_TRANSCRIBED' &&
+                        e.data.batchIndex === bIdx
+                      ) {
+                        activeWorker.removeEventListener(
+                          'message',
+                          handleBatchMsg
+                        );
+                        resolve(e.data.segments || []);
+                      } else if (
+                        e.data?.type === 'ASR_ERROR' ||
+                        e.data?.type === 'ERROR'
+                      ) {
+                        activeWorker.removeEventListener(
+                          'message',
+                          handleBatchMsg
+                        );
+                        reject(new Error(e.data.error));
+                      }
+                    };
+                    activeWorker.addEventListener('message', handleBatchMsg);
+                    activeWorker.postMessage({
+                      type: 'TRANSCRIBE_SPEAKER_TRACK_BATCH',
+                      stitchedSamples,
+                      timeMap: batch.timeMap,
+                      speakerId: batch.speakerId,
+                      chunkIndex: cIdx,
+                      batchIndex: bIdx,
+                      modelName: currentConfig.localAsrModel,
+                      languageHint,
+                      acousticThreshold: currentConfig.acousticThreshold,
+                    });
+                  }
+                );
+              }
+
+              if (globalAbortFlag) break;
+
+              if (batchSegments.length > 0) {
+                const latestDict = useAppStore.getState().dictionary;
+                const quickTerms = latestDict.map((d) => d.term);
+                const { updatedSegments: instantCorrected } =
+                  applySentenceLevelLocalCorrection(
+                    batchSegments,
+                    quickTerms,
+                    latestDict
                   );
-            } else if (asrWorker) {
-              const activeWorker = asrWorker;
-              const languageHint =
-                currentConfig.diarizationConfig?.languageHint || 'zh';
+                useAppStore.getState().appendSegments(instantCorrected);
+                pendingWindowSegments.push(...instantCorrected);
 
-              windowSegments = await new Promise<Segment[]>(
-                (resolve, reject) => {
-                  const handleAsrMsg = (e: MessageEvent) => {
-                    if (globalAbortFlag) {
-                      activeWorker.removeEventListener('message', handleAsrMsg);
-                      resolve([]);
-                      return;
-                    }
-                    if (e.data?.type === 'ASR_DOWNLOAD_PROGRESS') {
-                      useAppStore.getState().setModelDownload({
-                        active: Boolean(e.data.active),
-                        modelName:
-                          e.data.modelName || currentConfig.localAsrModel,
-                        fileName: e.data.fileName || '模型權重檔',
-                        progress: Number(e.data.progress) || 0,
-                      });
-                      return;
-                    }
-                    if (
-                      e.data?.type === 'WINDOW_TRANSCRIBED' &&
-                      e.data.windowIndex === wIdx
-                    ) {
-                      activeWorker.removeEventListener('message', handleAsrMsg);
-                      resolve(e.data.segments || []);
-                    } else if (
-                      e.data?.type === 'ASR_ERROR' ||
-                      e.data?.type === 'ERROR'
-                    ) {
-                      activeWorker.removeEventListener('message', handleAsrMsg);
-                      reject(new Error(e.data.error));
-                    }
-                  };
-                  activeWorker.addEventListener('message', handleAsrMsg);
-                  activeWorker.postMessage({
-                    type: 'TRANSCRIBE_WINDOW_AND_ALIGN',
-                    windowSamples: winSamples,
-                    windowStartSec: win.start,
-                    windowEndSec: win.end,
-                    fineTurns,
-                    chunkIndex: cIdx,
-                    windowIndex: wIdx,
-                    modelName: currentConfig.localAsrModel,
-                    languageHint,
-                    acousticThreshold: currentConfig.acousticThreshold,
+                const addedChars = instantCorrected.reduce(
+                  (acc, s) =>
+                    acc + s.words.reduce((wAcc, w) => wAcc + w.text.length, 0),
+                  0
+                );
+                pendingWindowChars += addedChars;
+
+                if (
+                  pendingWindowChars >= (currentConfig.highAttentionChars || 300)
+                ) {
+                  useAppStore.getState().updateChunkState(cIdx, {
+                    stage: 'correcting',
+                    detailText: `三層關注度介入：修正近 ${pendingWindowChars} 字...`,
                   });
+                  await flushPendingWindowCorrection(
+                    currentConfig.keepModelsCoResident
+                      ? coResidentLlmWorkerRef.current
+                      : null
+                  );
                 }
-              );
+              }
             }
+          } else {
+            // ================================================================
+            // 分支 B：傳統混合音訊視窗轉寫 + 事後 Viterbi 對齊
+            // ================================================================
+            for (let wIdx = 0; wIdx < asrWindows.length; wIdx++) {
+              if (globalAbortFlag) break;
+              const win = asrWindows[wIdx];
 
-            if (globalAbortFlag) break;
-
-            if (windowSegments.length > 0) {
-              const latestDict = useAppStore.getState().dictionary;
-              const quickTerms = latestDict.map((d) => d.term);
-              const { updatedSegments: instantCorrected } =
-                applySentenceLevelLocalCorrection(
-                  windowSegments,
-                  quickTerms,
-                  latestDict
-                );
-              useAppStore.getState().appendSegments(instantCorrected);
-              pendingWindowSegments.push(...instantCorrected);
-
-              const addedChars = instantCorrected.reduce(
-                (acc, s) =>
-                  acc + s.words.reduce((wAcc, w) => wAcc + w.text.length, 0),
-                0
+              const relStartSample = Math.max(
+                0,
+                Math.floor(
+                  (win.start - chunkMeta.startTime) * TARGET_SAMPLE_RATE
+                )
               );
-              pendingWindowChars += addedChars;
+              const relEndSample = Math.min(
+                chunkSamples.length,
+                Math.ceil((win.end - chunkMeta.startTime) * TARGET_SAMPLE_RATE)
+              );
+              const winSamples = chunkSamples.slice(
+                relStartSample,
+                relEndSample
+              );
 
-              if (
-                pendingWindowChars >= (currentConfig.highAttentionChars || 300)
-              ) {
-                useAppStore.getState().updateChunkState(cIdx, {
-                  stage: 'correcting',
-                  detailText: `三層關注度介入：修正近 ${pendingWindowChars} 字...`,
-                });
-                await flushPendingWindowCorrection(
-                  coResidentLlmWorkerRef.current
+              const winProgress =
+                35 +
+                Math.round(((wIdx + 1) / Math.max(1, asrWindows.length)) * 45);
+              useAppStore.getState().updateChunkState(cIdx, {
+                stage: 'transcribing',
+                progress: winProgress,
+                detailText: `語境轉寫與多語系子句聲紋對齊 (${wIdx + 1}/${asrWindows.length})`,
+              });
+
+              let windowSegments: Segment[] = [];
+
+              if (useCloudAsr) {
+                const turnWav = encodeFloat32ToWav(
+                  winSamples,
+                  TARGET_SAMPLE_RATE
                 );
+                const hotwords = useAppStore
+                  .getState()
+                  .dictionary.map((d) => d.term)
+                  .slice(0, 40)
+                  .join('、');
+                const primarySp =
+                  fineTurns.find(
+                    (ft) => ft.end > win.start && ft.start < win.end
+                  )?.speakerId || 'Speaker_01';
+
+                windowSegments = currentConfig.groqApiKey.trim()
+                  ? await transcribeWithGroq(
+                      turnWav,
+                      currentConfig.groqApiKey.trim(),
+                      hotwords,
+                      win.start,
+                      primarySp,
+                      cIdx,
+                      currentConfig.acousticThreshold
+                    )
+                  : await transcribeWithGeminiAudio(
+                      turnWav,
+                      currentConfig.geminiApiKey.trim(),
+                      hotwords,
+                      win.start,
+                      primarySp,
+                      cIdx,
+                      currentConfig.acousticThreshold
+                    );
+              } else if (asrWorker) {
+                const activeWorker = asrWorker;
+                const languageHint =
+                  currentConfig.diarizationConfig?.languageHint || 'zh';
+
+                windowSegments = await new Promise<Segment[]>(
+                  (resolve, reject) => {
+                    const handleAsrMsg = (e: MessageEvent) => {
+                      if (globalAbortFlag) {
+                        activeWorker.removeEventListener(
+                          'message',
+                          handleAsrMsg
+                        );
+                        resolve([]);
+                        return;
+                      }
+                      if (e.data?.type === 'ASR_DOWNLOAD_PROGRESS') {
+                        useAppStore.getState().setModelDownload({
+                          active: Boolean(e.data.active),
+                          modelName:
+                            e.data.modelName || currentConfig.localAsrModel,
+                          fileName: e.data.fileName || '模型權重檔',
+                          progress: Number(e.data.progress) || 0,
+                        });
+                        return;
+                      }
+                      if (
+                        e.data?.type === 'WINDOW_TRANSCRIBED' &&
+                        e.data.windowIndex === wIdx
+                      ) {
+                        activeWorker.removeEventListener(
+                          'message',
+                          handleAsrMsg
+                        );
+                        resolve(e.data.segments || []);
+                      } else if (
+                        e.data?.type === 'ASR_ERROR' ||
+                        e.data?.type === 'ERROR'
+                      ) {
+                        activeWorker.removeEventListener(
+                          'message',
+                          handleAsrMsg
+                        );
+                        reject(new Error(e.data.error));
+                      }
+                    };
+                    activeWorker.addEventListener('message', handleAsrMsg);
+                    activeWorker.postMessage({
+                      type: 'TRANSCRIBE_WINDOW_AND_ALIGN',
+                      windowSamples: winSamples,
+                      windowStartSec: win.start,
+                      windowEndSec: win.end,
+                      fineTurns,
+                      chunkIndex: cIdx,
+                      windowIndex: wIdx,
+                      modelName: currentConfig.localAsrModel,
+                      languageHint,
+                      acousticThreshold: currentConfig.acousticThreshold,
+                      asrBeamSize: currentConfig.asrBeamSize,
+                      backchannelMarginThreshold:
+                        currentConfig.diarizationConfig
+                          ?.backchannelMarginThreshold ?? 0.12,
+                      pingPongMaxDurSec:
+                        currentConfig.diarizationConfig?.pingPongMaxDurSec ??
+                        1.6,
+                      engineMode,
+                    });
+                  }
+                );
+              }
+
+              if (globalAbortFlag) break;
+
+              if (windowSegments.length > 0) {
+                const latestDict = useAppStore.getState().dictionary;
+                const quickTerms = latestDict.map((d) => d.term);
+                const { updatedSegments: instantCorrected } =
+                  applySentenceLevelLocalCorrection(
+                    windowSegments,
+                    quickTerms,
+                    latestDict
+                  );
+                useAppStore.getState().appendSegments(instantCorrected);
+                pendingWindowSegments.push(...instantCorrected);
+
+                const addedChars = instantCorrected.reduce(
+                  (acc, s) =>
+                    acc + s.words.reduce((wAcc, w) => wAcc + w.text.length, 0),
+                  0
+                );
+                pendingWindowChars += addedChars;
+
+                if (
+                  pendingWindowChars >= (currentConfig.highAttentionChars || 300)
+                ) {
+                  useAppStore.getState().updateChunkState(cIdx, {
+                    stage: 'correcting',
+                    detailText: `三層關注度介入：修正近 ${pendingWindowChars} 字...`,
+                  });
+                  await flushPendingWindowCorrection(
+                    currentConfig.keepModelsCoResident
+                      ? coResidentLlmWorkerRef.current
+                      : null
+                  );
+                }
               }
             }
           }
@@ -637,7 +1011,11 @@ export function usePipelineScheduler() {
               progress: 84,
               detailText: `語境收尾校正與會議摘要更新中...`,
             });
-            await flushPendingWindowCorrection(coResidentLlmWorkerRef.current);
+            await flushPendingWindowCorrection(
+              currentConfig.keepModelsCoResident
+                ? coResidentLlmWorkerRef.current
+                : null
+            );
           }
 
           useAppStore.getState().updateChunkState(cIdx, {
@@ -688,6 +1066,8 @@ export function usePipelineScheduler() {
                       subSamples,
                       targetSegment: targetSeg,
                       modelName: currentConfig.localAsrModel,
+                      languageHint:
+                        currentConfig.diarizationConfig?.languageHint || 'zh',
                     });
                   })
               : undefined,
@@ -698,11 +1078,34 @@ export function usePipelineScheduler() {
             },
           });
 
+          if (
+            !currentConfig.keepModelsCoResident &&
+            asrWorker &&
+            !currentConfig.geminiApiKey.trim()
+          ) {
+            await new Promise<void>((resolve) => {
+              const t = setTimeout(() => resolve(), 3000);
+              const onUnload = (e: MessageEvent) => {
+                if (e.data?.type === 'UNLOAD_DONE') {
+                  clearTimeout(t);
+                  asrWorker!.removeEventListener('message', onUnload);
+                  resolve();
+                }
+              };
+              asrWorker!.addEventListener('message', onUnload);
+              asrWorker!.postMessage({ type: 'UNLOAD_MODEL' });
+            });
+          }
+
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'correcting',
             progress: 96,
-            detailText: `全局回溯精修：以最新後文詞彙與摘要回頭重順前文...`,
+            detailText: `全局回溯精修與 TPST 語者立場複查...`,
           });
+
+          const activeLlmForRetro = !currentConfig.geminiApiKey.trim()
+            ? ensureLocalLlmWorker()
+            : null;
 
           const finalState = useAppStore.getState();
           await runGlobalRetroactiveContextPass({
@@ -711,7 +1114,34 @@ export function usePipelineScheduler() {
             dictionary: finalState.dictionary,
             docContextSummary: finalState.docContextSummary,
             rollingMeetingSummary: finalState.rollingMeetingSummary,
+            runLocalLlmCorrection: activeLlmForRetro
+              ? (pl) =>
+                  invokeLocalLlmWorker(
+                    activeLlmForRetro,
+                    currentConfig.localLlmModel,
+                    pl
+                  )
+              : undefined,
           });
+
+          if (
+            !currentConfig.keepModelsCoResident &&
+            activeLlmForRetro &&
+            cIdx < chunks.length - 1
+          ) {
+            await new Promise<void>((resolve) => {
+              const t = setTimeout(() => resolve(), 3000);
+              const onUnload = (e: MessageEvent) => {
+                if (e.data?.type === 'LLM_UNLOAD_DONE') {
+                  clearTimeout(t);
+                  activeLlmForRetro.removeEventListener('message', onUnload);
+                  resolve();
+                }
+              };
+              activeLlmForRetro.addEventListener('message', onUnload);
+              activeLlmForRetro.postMessage({ type: 'UNLOAD_LLM' });
+            });
+          }
 
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'completed',
@@ -728,7 +1158,7 @@ export function usePipelineScheduler() {
         setGlobalProcessing(false);
       }
     },
-    [invokeLocalLlmWorker, terminateAllWorkers]
+    [ensureLocalLlmWorker, invokeLocalLlmWorker, terminateAllWorkers]
   );
 
   return {

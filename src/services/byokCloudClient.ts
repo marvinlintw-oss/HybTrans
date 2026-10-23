@@ -3,7 +3,11 @@ import * as OpenCC from 'opencc-js';
 import {
   CorrectionPatchItem,
   Segment,
+  SlotCorrectionOutputItem,
+  StructuredSlotGerResponse,
+  SuspectSlotItem,
   TriLevelContextPayload,
+  TurnSplitOutputItem,
   WordSpan,
 } from '../types';
 
@@ -19,9 +23,6 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-/**
- * 將純文字句子切分為 WordSpan[] 並線性插值對齊段落時間區間
- */
 function buildCloudWordSpans(
   cleanText: string,
   segId: string,
@@ -31,9 +32,9 @@ function buildCloudWordSpans(
   acousticThreshold = 0.72
 ): WordSpan[] {
   const tokens =
-    cleanText.match(/[\u4e00-\u9fa5]{1,2}|[a-zA-Z0-9]+|[^\s\u4e00-\u9fa5a-zA-Z0-9]/g) || [
-      cleanText,
-    ];
+    cleanText.match(
+      /[\u4e00-\u9fa5]{1,2}|[a-zA-Z0-9]+|[^\s\u4e00-\u9fa5a-zA-Z0-9]/g
+    ) || [cleanText];
   const dur = Math.max(0.2, endSec - startSec);
   const step = dur / Math.max(1, tokens.length);
 
@@ -51,9 +52,6 @@ function buildCloudWordSpans(
   });
 }
 
-/**
- * 【向下相容】使用 Groq Whisper API (whisper-large-v3-turbo) 進行高速音訊轉寫
- */
 export async function transcribeWithGroq(
   wavBuffer: ArrayBuffer,
   apiKey: string,
@@ -75,13 +73,16 @@ export async function transcribeWithGroq(
     formData.append('prompt', promptHint.slice(0, 220));
   }
 
-  const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey.trim()}`,
-    },
-    body: formData,
-  });
+  const response = await fetch(
+    'https://api.groq.com/openai/v1/audio/transcriptions',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey.trim()}`,
+      },
+      body: formData,
+    }
+  );
 
   if (!response.ok) {
     throw new Error(`Groq Whisper API 請求失敗 (${response.status})`);
@@ -90,7 +91,11 @@ export async function transcribeWithGroq(
   const data = await response.json();
   const rawSegments = Array.isArray(data?.segments) ? data.segments : [];
 
-  if (rawSegments.length === 0 && typeof data?.text === 'string' && data.text.trim()) {
+  if (
+    rawSegments.length === 0 &&
+    typeof data?.text === 'string' &&
+    data.text.trim()
+  ) {
     const cleanText = toTwp(data.text.trim());
     const segId = `groq_c${chunkIndex}_${Date.now()}`;
     const startSec = Number(timeOffsetSec.toFixed(2));
@@ -102,7 +107,14 @@ export async function transcribeWithGroq(
         speakerId,
         start: startSec,
         end: endSec,
-        words: buildCloudWordSpans(cleanText, segId, startSec, endSec, 0.9, acousticThreshold),
+        words: buildCloudWordSpans(
+          cleanText,
+          segId,
+          startSec,
+          endSec,
+          0.9,
+          acousticThreshold
+        ),
         isCorrected: false,
         relistenCount: 0,
       },
@@ -115,9 +127,16 @@ export async function transcribeWithGroq(
       if (!rawText) return null;
       const cleanText = toTwp(rawText);
       const segId = `groq_c${chunkIndex}_${Date.now()}_${idx}`;
-      const startSec = Number((timeOffsetSec + Number(s.start || 0)).toFixed(2));
-      const endSec = Number((timeOffsetSec + Number(s.end || Number(s.start || 0) + 2)).toFixed(2));
-      const avgLogprob = typeof s.avg_logprob === 'number' ? s.avg_logprob : -0.25;
+      const startSec = Number(
+        (timeOffsetSec + Number(s.start || 0)).toFixed(2)
+      );
+      const endSec = Number(
+        (
+          timeOffsetSec + Number(s.end || Number(s.start || 0) + 2)
+        ).toFixed(2)
+      );
+      const avgLogprob =
+        typeof s.avg_logprob === 'number' ? s.avg_logprob : -0.25;
       const conf = Math.min(0.98, Math.max(0.5, Math.exp(avgLogprob)));
 
       return {
@@ -126,7 +145,14 @@ export async function transcribeWithGroq(
         speakerId,
         start: startSec,
         end: endSec,
-        words: buildCloudWordSpans(cleanText, segId, startSec, endSec, conf, acousticThreshold),
+        words: buildCloudWordSpans(
+          cleanText,
+          segId,
+          startSec,
+          endSec,
+          conf,
+          acousticThreshold
+        ),
         isCorrected: false,
         relistenCount: 0,
       } as Segment;
@@ -134,9 +160,6 @@ export async function transcribeWithGroq(
     .filter((item: Segment | null): item is Segment => item !== null);
 }
 
-/**
- * 【向下相容】使用 Google Gemini 2.5 Flash 進行雲端音訊轉寫
- */
 export async function transcribeWithGeminiAudio(
   wavBuffer: ArrayBuffer,
   apiKey: string,
@@ -149,7 +172,6 @@ export async function transcribeWithGeminiAudio(
   if (!apiKey.trim()) return [];
 
   const base64Audio = arrayBufferToBase64(wavBuffer);
-  // 16kHz 16-bit Mono WAV 每秒為 32000 bytes
   const estDurationSec = Math.max(1.0, (wavBuffer.byteLength - 44) / 32000);
 
   const prompt = `請將這段台灣會議語音精準轉寫為台灣正體中文逐字稿。
@@ -182,7 +204,9 @@ export async function transcribeWithGeminiAudio(
   }
 
   const data = await response.json();
-  const rawText = (data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+  const rawText = (
+    data?.candidates?.[0]?.content?.parts?.[0]?.text || ''
+  ).trim();
   const cleanText = toTwp(rawText);
   if (!cleanText) return [];
 
@@ -197,7 +221,14 @@ export async function transcribeWithGeminiAudio(
       speakerId,
       start: startSec,
       end: endSec,
-      words: buildCloudWordSpans(cleanText, segId, startSec, endSec, 0.92, acousticThreshold),
+      words: buildCloudWordSpans(
+        cleanText,
+        segId,
+        startSec,
+        endSec,
+        0.92,
+        acousticThreshold
+      ),
       isCorrected: false,
       relistenCount: 0,
     },
@@ -205,7 +236,7 @@ export async function transcribeWithGeminiAudio(
 }
 
 /**
- * 【新版核心】使用 Gemini 2.5 Flash 進行三層關注度 (300字高 / 1200字中 / 前文低) 結構化校正
+ * 【問題二 2.3 核心升級】：使用 Gemini 2.5 Flash 執行免索引槽位填空協定 (Slot-Anchored GER) 與 LG-TPST 語用拆句
  */
 export async function correctWithGeminiTriLevel(
   apiKey: string,
@@ -213,34 +244,46 @@ export async function correctWithGeminiTriLevel(
 ): Promise<CorrectionPatchItem[]> {
   if (!apiKey || payload.highAttentionTargetSegments.length === 0) return [];
 
-  const targetJson = payload.highAttentionTargetSegments.map((seg) => ({
-    segmentId: seg.id,
-    speakerId: seg.speakerId,
-    words: seg.words.map((w, idx) => ({
-      i: idx,
-      t: w.text,
-      c: Number(w.confidence.toFixed(2)),
-    })),
-  }));
+  const targetSegments = payload.highAttentionTargetSegments;
+  const slotMap = new Map<string, SuspectSlotItem>();
+  if (Array.isArray(payload.suspectSlots)) {
+    for (const s of payload.suspectSlots) {
+      slotMap.set(s.slotId, s);
+    }
+  }
 
-  const prompt = `你是一位專精於台灣政府與學術會議的逐字稿校對專家。請根據以下「三層關注度語境」修正【高關注度目標區】內的同音錯字、專有名詞誤植與語意模糊詞彙：
+  const slottedTranscript =
+    payload.slottedPromptTranscript ||
+    targetSegments
+      .map((seg) => {
+        const dur = seg.end - seg.start;
+        const margin = seg.acousticMargin ?? 0.18;
+        const isLocked = margin >= 0.16 && dur >= 1.2;
+        const gateTag = isLocked
+          ? `[LOCKED | speaker=${seg.speakerId}]`
+          : `[REVIEW | top1=${seg.speakerId}, top2=${
+              seg.runnerUpSpeakerId || seg.speakerId
+            }]`;
+        return `[${seg.id}] ${gateTag} ${seg.words.map((w) => w.text).join('')}`;
+      })
+      .join('\n');
+
+  const prompt = `你是一位專精於台灣政商與學術會議的「免索引槽位校對與 LG-TPST 對話語用專家」。請根據以下「三層關注度語境」，針對【第 3 層：高關注度目標區】內的懷疑槽位 ⟪#S1: 原詞 | 候選: ...⟫ 與 [REVIEW] 段落執行校對：
 
 【第 1 層：低關注度全域記憶 (唯讀背景與熱詞庫)】
 - 會議簡報背景摘要：${payload.lowAttentionGlobalMemory.docSummary || '無'}
-- 累積實證熱詞與人名表：${payload.lowAttentionGlobalMemory.verifiedTerms.join('、') || '無'}
+- 全場高主權實體與熱詞表：${payload.lowAttentionGlobalMemory.verifiedTerms.join('、') || '無'}
 - 更早之前情提要：${payload.lowAttentionGlobalMemory.earlierTopicDigest || '無'}
 
 【第 2 層：中關注度前文語境 (前 ~1200 字唯讀對話錨點，禁止對此區輸出修改)】
 ${payload.mediumAttentionRollingText || '(此為會議開頭)'}
 
-【第 3 層：高關注度目標區 (近 ~300 字唯一可讀寫修正區，含詞索引 i 與聲學信心度 c)】
-${JSON.stringify(targetJson)}
+【第 3 層：高關注度目標區 (含 [LOCKED]/[REVIEW] 閘門與 ⟪#S1...⟫ 槽位標籤)】
+${slottedTranscript}
 
-請嚴格遵守以下規則並只輸出 JSON Array：
-1. 僅針對【第 3 層：高關注度目標區】中有錯字或同音誤植的詞輸出 Patch。
-2. 若能從上下文或熱詞庫確定正確詞彙，設定 status 為 "auto_corrected" 並填入 correctedText。
-3. 若該處發音模糊、有多種可能且無法單靠文字肯定，設定 status 為 "semantic_uncertain"、填入 2~3 個 candidates，並將 requireRelisten 設為 true 以便系統回頭截檔重聽。
-4. 全面使用台灣正體中文慣用詞。`;
+請嚴格輸出符合以下結構之 JSON Object（包含 slot_corrections 與 turn_splits 兩個陣列）：
+1. slot_corrections：針對每個 #S1~#S5 槽位，先填寫 brief_reason（15字內語境搭配理由），再決定 action ("KEEP_ORIGINAL" | "APPLY_HIGH_CONF" | "MARK_UNCERTAIN")、selected_text（僅填寫槽位替換後的詞彙本身，嚴禁包含槽位外的上下文！）與 uncertain_candidates。
+2. turn_splits：[LOCKED] 段落嚴禁變更語者；[REVIEW] 段落若出現「問答對卻同語者 (QA_SPEAKER_CHANGE)」或「短促附和插話 (BACKCHANNEL_INTERJECTION)」，請填寫 utterance_id、pragmatic_type、split_before_anchor（回答句開頭精確 2~4 個字）與 new_speaker_id。`;
 
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
@@ -264,21 +307,127 @@ ${JSON.stringify(targetJson)}
   }
 
   const data = await response.json();
-  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '[]';
-  const parsed = JSON.parse(rawText) as CorrectionPatchItem[];
+  const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  const parsed: Partial<StructuredSlotGerResponse> | CorrectionPatchItem[] =
+    JSON.parse(rawText);
 
-  return parsed.map((p) => ({
-    ...p,
-    correctedText: p.correctedText ? toTwp(p.correctedText) : undefined,
-    candidates: p.candidates?.map((c) => toTwp(c)),
-    reason: toTwp(p.reason || '語境推論修正'),
-  }));
+  const results: CorrectionPatchItem[] = [];
+
+  // 相容處理：若回傳為新版 { slot_corrections, turn_splits } 物件
+  if (!Array.isArray(parsed) && typeof parsed === 'object' && parsed !== null) {
+    const structuredObj = parsed as Partial<StructuredSlotGerResponse>;
+
+    if (Array.isArray(structuredObj.slot_corrections)) {
+      for (const sc of structuredObj.slot_corrections as SlotCorrectionOutputItem[]) {
+        const slot = slotMap.get(sc.slot_id);
+        if (!slot || sc.action === 'KEEP_ORIGINAL') continue;
+
+        const cleanSelected = toTwp((sc.selected_text || '').trim());
+        const cleanReason = toTwp(
+          sc.brief_reason || '雲端 Gemini 槽位語意推敲修正'
+        );
+        const cleanCands = Array.isArray(sc.uncertain_candidates)
+          ? sc.uncertain_candidates
+              .map((c: unknown) => toTwp(String(c).trim()))
+              .filter(Boolean)
+          : slot.candidates;
+
+        if (
+          sc.action === 'APPLY_HIGH_CONF' &&
+          cleanSelected &&
+          cleanSelected !== slot.originalText
+        ) {
+          results.push({
+            segmentId: slot.segmentId,
+            wordIndex: slot.startWordIdx,
+            endWordIndex: slot.endWordIdx,
+            originalText: slot.originalText,
+            status: 'auto_corrected',
+            correctedText: cleanSelected,
+            candidates: cleanCands,
+            reason: `[${sc.slot_id}] ${cleanReason}`,
+          });
+        } else if (sc.action === 'MARK_UNCERTAIN') {
+          results.push({
+            segmentId: slot.segmentId,
+            wordIndex: slot.startWordIdx,
+            endWordIndex: slot.endWordIdx,
+            originalText: slot.originalText,
+            status: 'semantic_uncertain',
+            candidates: cleanCands.length > 0 ? cleanCands : slot.candidates,
+            reason: `[${sc.slot_id}] ${cleanReason}`,
+          });
+        }
+      }
+    }
+
+    if (Array.isArray(structuredObj.turn_splits)) {
+      for (const ts of structuredObj.turn_splits as TurnSplitOutputItem[]) {
+        if (
+          !ts.utterance_id ||
+          ts.pragmatic_type === 'NO_SPLIT' ||
+          ts.pragmatic_type === 'RHETORICAL_SELF_ANSWER'
+        ) {
+          continue;
+        }
+        const targetSeg = targetSegments.find((s) => s.id === ts.utterance_id);
+        if (!targetSeg) continue;
+        const dur = targetSeg.end - targetSeg.start;
+        const margin = targetSeg.acousticMargin ?? 0.18;
+        const isLocked = margin >= 0.16 && dur >= 1.2;
+        if (isLocked) continue;
+
+        if (ts.new_speaker_id && ts.new_speaker_id !== targetSeg.speakerId) {
+          results.push({
+            segmentId: targetSeg.id,
+            wordIndex: -1,
+            originalText: targetSeg.speakerId,
+            status: 'auto_corrected',
+            newSpeakerId: ts.new_speaker_id.trim(),
+            splitBeforeAnchor: toTwp((ts.split_before_anchor || '').trim()),
+            reason: `LG-TPST 對話語用學語者轉移 (${ts.pragmatic_type})`,
+          });
+        }
+      }
+    }
+
+    return results;
+  }
+
+  // 向下相容舊版 Array 格式
+  if (Array.isArray(parsed)) {
+    for (const p of parsed) {
+      const targetSeg = targetSegments.find((s) => s.id === p.segmentId);
+      if (!targetSeg) continue;
+      if (p.newSpeakerId && p.newSpeakerId !== targetSeg.speakerId) {
+        const dur = targetSeg.end - targetSeg.start;
+        const margin = targetSeg.acousticMargin ?? 0.18;
+        if (!(margin >= 0.16 && dur >= 1.2)) {
+          results.push({
+            segmentId: p.segmentId,
+            wordIndex: -1,
+            originalText: targetSeg.speakerId,
+            status: 'auto_corrected',
+            newSpeakerId: p.newSpeakerId,
+            reason: toTwp(p.reason || 'LG-TPST 對話語用學語者轉移'),
+          });
+        }
+        continue;
+      }
+      if (typeof p.wordIndex === 'number' && p.wordIndex >= 0) {
+        results.push({
+          ...p,
+          correctedText: p.correctedText ? toTwp(p.correctedText) : undefined,
+          candidates: p.candidates?.map((c: string) => toTwp(c)),
+          reason: toTwp(p.reason || '語境推論修正'),
+        });
+      }
+    }
+  }
+
+  return results;
 }
 
-/**
- * 【新版核心：配額制截檔重聽】
- * 將擴充 ±padding 秒後的短音訊 WAV 連同前後文與候選詞直送 Gemini 2.5 Flash 重聽確認
- */
 export async function relistenSubSegmentWithGemini(
   apiKey: string,
   subWavBuffer: ArrayBuffer,
@@ -292,7 +441,9 @@ export async function relistenSubSegmentWithGemini(
   const originalSentence = targetSegment.words.map((w) => w.text).join('');
   const uncertainHints = targetSegment.words
     .filter((w) => w.status !== 'normal' || w.confidence < 0.75)
-    .map((w) => `「${w.text}」(候選: ${(w.candidates || []).join('/') || '未知'})`)
+    .map(
+      (w) => `「${w.text}」(候選: ${(w.candidates || []).join('/') || '未知'})`
+    )
     .join('、');
 
   const prompt = `請仔細聆聽這段截取自會議的短音訊（前後已包含緩衝邊界，請只針對核心語句進行重聽校準）。
@@ -326,13 +477,15 @@ export async function relistenSubSegmentWithGemini(
 
   if (!response.ok) return null;
   const data = await response.json();
-  const cleanText = toTwp((data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim());
+  const cleanText = toTwp(
+    (data?.candidates?.[0]?.content?.parts?.[0]?.text || '').trim()
+  );
   if (!cleanText) return null;
 
   const tokens =
-    cleanText.match(/[\u4e00-\u9fa5]{1,2}|[a-zA-Z0-9]+|[^\s\u4e00-\u9fa5a-zA-Z0-9]/g) || [
-      cleanText,
-    ];
+    cleanText.match(
+      /[\u4e00-\u9fa5]{1,2}|[a-zA-Z0-9]+|[^\s\u4e00-\u9fa5a-zA-Z0-9]/g
+    ) || [cleanText];
   const dur = Math.max(0.2, targetSegment.end - targetSegment.start);
   const step = dur / Math.max(1, tokens.length);
 

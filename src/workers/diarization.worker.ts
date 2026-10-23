@@ -1,8 +1,11 @@
 // src/workers/diarization.worker.ts
 import {
+  DiarizationClusterMethod,
   DiarizationConfig,
   FineDiarizationTurn,
   Speaker,
+  SpeakerTrackBatch,
+  VirtualTrackMapItem,
 } from '../types';
 
 const SPEAKER_PALETTE = [
@@ -36,7 +39,10 @@ function l2Normalize(vec: Float32Array | number[]): Float32Array {
   return out;
 }
 
-function cosineSimilarity(a: Float32Array | number[], b: Float32Array | number[]): number {
+function cosineSimilarity(
+  a: Float32Array | number[],
+  b: Float32Array | number[]
+): number {
   const len = Math.min(a.length, b.length);
   if (len === 0) return 0.0;
   let dot = 0.0;
@@ -104,14 +110,10 @@ function estimateMedianPitchHz(
   return pitches[Math.floor(pitches.length / 2)];
 }
 
-// ============================================================================
-// 1. Bit-Exact Kaldi 80-Dim Fbank (x32768 Int16 Scale + Per-Bin CMN)
-// ============================================================================
-
 export class KaldiFbankExtractor {
   private readonly sampleRate = 16000;
   private readonly frameLength = 400; // 25ms @ 16kHz
-  private readonly frameShift = 160;  // 10ms @ 16kHz
+  private readonly frameShift = 160; // 10ms @ 16kHz
   private readonly fftSize = 512;
   private readonly numMelBins = 80;
   private readonly preemph = 0.97;
@@ -131,7 +133,10 @@ export class KaldiFbankExtractor {
     return 1127.0 * Math.log(1.0 + hz / 700.0);
   }
 
-  private initKaldiMelFilterbank(lowFreq: number, highFreq: number): Float32Array[] {
+  private initKaldiMelFilterbank(
+    lowFreq: number,
+    highFreq: number
+  ): Float32Array[] {
     const numFftBins = this.fftSize / 2 + 1;
     const melLow = this.hzToMel(lowFreq);
     const melHigh = this.hzToMel(highFreq);
@@ -224,10 +229,54 @@ export class KaldiFbankExtractor {
     return { frames, frameRms, numFrames };
   }
 
+  public computeGlobalSpeechChannelProfile(
+    allFrames: Float32Array[],
+    frameRms: Float32Array,
+    vadThreshold: number
+  ): { globalChannelMean: Float32Array; globalChannelStd: Float32Array } {
+    const globalChannelMean = new Float32Array(this.numMelBins);
+    const globalChannelStd = new Float32Array(this.numMelBins).fill(1.0);
+    let activeCount = 0;
+
+    for (let t = 0; t < allFrames.length; t++) {
+      if (frameRms[t] >= vadThreshold) {
+        const frame = allFrames[t];
+        for (let b = 0; b < this.numMelBins; b++) {
+          globalChannelMean[b] += frame[b];
+        }
+        activeCount++;
+      }
+    }
+
+    if (activeCount === 0) return { globalChannelMean, globalChannelStd };
+    for (let b = 0; b < this.numMelBins; b++) {
+      globalChannelMean[b] /= activeCount;
+    }
+
+    for (let t = 0; t < allFrames.length; t++) {
+      if (frameRms[t] >= vadThreshold) {
+        const frame = allFrames[t];
+        for (let b = 0; b < this.numMelBins; b++) {
+          const diff = frame[b] - globalChannelMean[b];
+          globalChannelStd[b] += diff * diff;
+        }
+      }
+    }
+
+    for (let b = 0; b < this.numMelBins; b++) {
+      globalChannelStd[b] = Math.sqrt(
+        globalChannelStd[b] / Math.max(1, activeCount) + 1e-5
+      );
+    }
+
+    return { globalChannelMean, globalChannelStd };
+  }
+
   public sliceAndApplyCMN(
     allFrames: Float32Array[],
     startFrame: number,
-    endFrame: number
+    endFrame: number,
+    globalChannelMean?: Float32Array
   ): { cmnTensor: Float32Array; binMeans: Float32Array } {
     const T = Math.max(1, endFrame - startFrame);
     const cmnTensor = new Float32Array(T * this.numMelBins);
@@ -247,7 +296,11 @@ export class KaldiFbankExtractor {
       const frame = allFrames[startFrame + t];
       const rowOffset = t * this.numMelBins;
       for (let b = 0; b < this.numMelBins; b++) {
-        cmnTensor[rowOffset + b] = frame[b] - binMeans[b];
+        const refMean =
+          globalChannelMean && T < 220
+            ? 0.7 * globalChannelMean[b] + 0.3 * binMeans[b]
+            : binMeans[b];
+        cmnTensor[rowOffset + b] = frame[b] - refMean;
       }
     }
     return { cmnTensor, binMeans };
@@ -256,34 +309,54 @@ export class KaldiFbankExtractor {
   public computeFormantPreservingTstpEmbedding(
     cmnTensor: Float32Array,
     binMeans: Float32Array,
-    numFrames: number
+    numFrames: number,
+    globalChannelMean?: Float32Array,
+    globalChannelStd?: Float32Array,
+    f0Hz = 155,
+    enableDivergenceEnhance = true,
+    isHeritageClassicMode = false
   ): Float32Array {
     const dim = 64;
     const out = new Float32Array(dim);
     if (numFrames <= 0) return out;
 
-    let globalGain = 0.0;
-    for (let b = 0; b < 80; b++) globalGain += binMeans[b];
-    globalGain /= 80.0;
+    const cleanBinProfile = new Float32Array(80);
+    let segGain = 0.0;
+    for (let b = 0; b < 80; b++) {
+      const chRemoved = globalChannelMean
+        ? binMeans[b] - globalChannelMean[b]
+        : binMeans[b];
+      cleanBinProfile[b] = chRemoved;
+      segGain += chRemoved;
+    }
+    segGain /= 80.0;
 
     const normSpectralEnvelope = new Float32Array(80);
     for (let b = 0; b < 80; b++) {
-      normSpectralEnvelope[b] = binMeans[b] - globalGain;
+      let val = cleanBinProfile[b] - segGain;
+      if (enableDivergenceEnhance && globalChannelStd) {
+        const formantWeight = b >= 16 && b <= 64 ? 1.38 : 0.9;
+        val = (val / Math.max(0.35, globalChannelStd[b])) * formantWeight;
+      }
+      normSpectralEnvelope[b] = val;
     }
 
-    for (let k = 1; k <= 20; k++) {
+    for (let k = 1; k <= 24; k++) {
       let sum = 0.0;
       for (let b = 0; b < 80; b++) {
         sum +=
           normSpectralEnvelope[b] *
           Math.cos((Math.PI * k * (2 * b + 1)) / 160.0);
       }
-      out[k - 1] = sum * 0.12;
+      const lifter = 1.0 + 6.0 * Math.sin((Math.PI * k) / 24.0);
+      out[k - 1] = sum * 0.08 * lifter;
     }
 
     for (let i = 0; i < 24; i++) {
-      const b0 = 20 + i * 2;
-      out[20 + i] = (normSpectralEnvelope[b0] + normSpectralEnvelope[b0 + 1]) * 0.45;
+      const b0 = 12 + i * 2;
+      out[24 + i] =
+        (normSpectralEnvelope[b0] + normSpectralEnvelope[b0 + 1]) *
+        (isHeritageClassicMode ? 0.72 : 0.55);
     }
 
     const bandStd = new Float32Array(80);
@@ -303,16 +376,30 @@ export class KaldiFbankExtractor {
     for (let b = 0; b < 80; b++) stdMean += bandStd[b];
     stdMean /= 80.0;
 
-    for (let i = 0; i < 20; i++) {
-      const bStart = i * 4;
+    for (let i = 0; i < 12; i++) {
+      const bStart = 8 + i * 5;
       const avgStd =
         (bandStd[bStart] +
           bandStd[bStart + 1] +
           bandStd[bStart + 2] +
-          bandStd[bStart + 3]) *
-        0.25;
-      out[44 + i] = (avgStd - stdMean) * 0.85;
+          bandStd[bStart + 3] +
+          bandStd[bStart + 4]) *
+        0.2;
+      out[48 + i] =
+        (avgStd - stdMean) * (isHeritageClassicMode ? 0.55 : 0.75);
     }
+
+    const logF0Norm = (Math.log(Math.max(75, Math.min(340, f0Hz))) - 5.05) * 2.2;
+    let lowBandE = 0.0;
+    let highBandE = 0.0;
+    for (let b = 4; b < 28; b++) lowBandE += normSpectralEnvelope[b];
+    for (let b = 28; b < 68; b++) highBandE += normSpectralEnvelope[b];
+    const spectralTilt = (highBandE / 40.0 - lowBandE / 24.0) * 0.65;
+
+    out[60] = logF0Norm * (isHeritageClassicMode ? 1.15 : 0.85);
+    out[61] = spectralTilt;
+    out[62] = (normSpectralEnvelope[18] - normSpectralEnvelope[42]) * 0.6;
+    out[63] = (normSpectralEnvelope[26] - normSpectralEnvelope[54]) * 0.6;
 
     return l2Normalize(out);
   }
@@ -362,10 +449,6 @@ export class KaldiFbankExtractor {
     }
   }
 }
-
-// ============================================================================
-// 2. 純 TypeScript 未知人數自動調參譜聚類 (Auto-Tuning NME-SC)
-// ============================================================================
 
 export class AutoTuningSpectralClusterer {
   public static symmetricEigenDecomposition(
@@ -537,7 +620,7 @@ export class AutoTuningSpectralClusterer {
     const effectiveMinK = Math.max(2, minK);
     const effectiveMaxK = Math.max(
       effectiveMinK,
-      Math.min(maxK, Math.floor(N / 3))
+      Math.min(maxK, Math.floor(N / 2))
     );
     let bestK = effectiveMinK;
 
@@ -596,6 +679,69 @@ export class AutoTuningSpectralClusterer {
 
     const labels = this.sphericalKMeansPlusPlus(spectralEmbeddings, N, bestK);
     return { labels, optimalK: bestK, optimalP: bestP };
+  }
+
+  public static clusterManifoldAhcCosine(
+    affinityMatrix: Float64Array,
+    N: number,
+    minK = 1,
+    maxK = 4
+  ): { labels: Int32Array; optimalK: number } {
+    if (N <= 2 || maxK <= 1) {
+      return { labels: new Int32Array(N).fill(0), optimalK: 1 };
+    }
+    if (minK <= 1 && this.isSingleSpeakerManifold(affinityMatrix, N)) {
+      return { labels: new Int32Array(N).fill(0), optimalK: 1 };
+    }
+
+    const effectiveMinK = Math.max(2, minK);
+    const effectiveMaxK = Math.max(
+      effectiveMinK,
+      Math.min(maxK, Math.floor(N / 2))
+    );
+
+    const clusters: number[][] = Array.from({ length: N }, (_, idx) => [idx]);
+    const stopSimThreshold = 0.62;
+
+    while (clusters.length > effectiveMinK) {
+      let bestA = -1;
+      let bestB = -1;
+      let maxAvgSim = -Infinity;
+
+      for (let i = 0; i < clusters.length; i++) {
+        for (let j = i + 1; j < clusters.length; j++) {
+          let sumSim = 0.0;
+          const cA = clusters[i];
+          const cB = clusters[j];
+          for (let a = 0; a < cA.length; a++) {
+            const rowOff = cA[a] * N;
+            for (let b = 0; b < cB.length; b++) {
+              sumSim += affinityMatrix[rowOff + cB[b]];
+            }
+          }
+          const avgSim = sumSim / (cA.length * cB.length);
+          if (avgSim > maxAvgSim) {
+            maxAvgSim = avgSim;
+            bestA = i;
+            bestB = j;
+          }
+        }
+      }
+
+      if (bestA === -1 || bestB === -1) break;
+      if (clusters.length <= effectiveMaxK && maxAvgSim < stopSimThreshold) {
+        break;
+      }
+
+      clusters[bestA].push(...clusters[bestB]);
+      clusters.splice(bestB, 1);
+    }
+
+    const labels = new Int32Array(N);
+    clusters.forEach((members, cIdx) => {
+      for (const m of members) labels[m] = cIdx;
+    });
+    return { labels, optimalK: clusters.length };
   }
 
   private static isSingleSpeakerManifold(A: Float64Array, N: number): boolean {
@@ -763,10 +909,6 @@ export class AutoTuningSpectralClusterer {
   }
 }
 
-// ============================================================================
-// 3. WeSpeaker ONNX (ResNet34-LM) 載入與快取推理引擎
-// ============================================================================
-
 class WeSpeakerOnnxRunner {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private session: any = null;
@@ -778,17 +920,30 @@ class WeSpeakerOnnxRunner {
   constructor(private config: DiarizationConfig) {}
 
   public async init(): Promise<boolean> {
+    if (
+      this.config.engineMode === 'mode_0_heritage_classic' ||
+      this.config.engineMode === 'mode_a_classic' ||
+      this.config.engineMode === 'mode_b_advanced_dsp'
+    ) {
+      this.checked = true;
+      this.embeddingDim = 64;
+      return false;
+    }
+
     if (this.session) return true;
     if (this.checked) return false;
     this.checked = true;
 
     try {
-      const candidateFiles = [
-        this.config.onnxModelFilename || 'wespeaker_voxceleb_resnet34_int8.onnx',
-        'wespeaker_voxceleb_resnet34_int8.onnx',
-        'voxceleb_resnet34_LM.onnx',
-        'nemo_en_titanet_small.int8.onnx',
-      ];
+      const candidateFiles = Array.from(
+        new Set([
+          this.config.onnxModelFilename ||
+            'wespeaker_voxceleb_resnet34_int8.onnx',
+          'wespeaker_voxceleb_resnet34_int8.onnx',
+          'voxceleb_resnet34_LM.onnx',
+          'nemo_en_titanet_small.int8.onnx',
+        ])
+      );
 
       let modelBuffer: ArrayBuffer | null = null;
       let loadedFileName = '';
@@ -822,14 +977,11 @@ class WeSpeakerOnnxRunner {
             break;
           }
         } catch {
-          // next
+          // try next candidate
         }
       }
 
       if (!modelBuffer || modelBuffer.byteLength < 500000) {
-        console.info(
-          'ℹ️ [Diarization] 採用極速 64維共振峰保留型 Kaldi Fbank TSTP 引擎'
-        );
         return false;
       }
 
@@ -844,10 +996,29 @@ class WeSpeakerOnnxRunner {
         );
       }
 
-      this.session = await this.ortModule.InferenceSession.create(modelBuffer, {
-        executionProviders: ['wasm'],
-        graphOptimizationLevel: 'all',
-      });
+      // 即便使用者在 Mode C 選了 webgpu，若顯卡不支援 fp16 或初始化失敗，自動退回純 WASM SIMD
+      const preferredProviders =
+        this.config.executionBackend === 'webgpu'
+          ? ['webgpu', 'wasm']
+          : ['wasm'];
+
+      try {
+        this.session = await this.ortModule.InferenceSession.create(
+          modelBuffer,
+          {
+            executionProviders: preferredProviders,
+            graphOptimizationLevel: 'all',
+          }
+        );
+      } catch {
+        this.session = await this.ortModule.InferenceSession.create(
+          modelBuffer,
+          {
+            executionProviders: ['wasm'],
+            graphOptimizationLevel: 'all',
+          }
+        );
+      }
       this.embeddingDim = 256;
       console.info(
         `✅ [WeSpeaker ONNX] 成功載入本地模型 (${loadedFileName}, ${(
@@ -856,8 +1027,7 @@ class WeSpeakerOnnxRunner {
         ).toFixed(1)} MB)！`
       );
       return true;
-    } catch (e) {
-      console.warn('⚠️ [WeSpeaker ONNX] 切換至極速 TSTP 引擎:', e);
+    } catch {
       return false;
     }
   }
@@ -866,14 +1036,27 @@ class WeSpeakerOnnxRunner {
     cmnTensor: Float32Array,
     binMeans: Float32Array,
     numFrames: number,
-    fbankHelper: KaldiFbankExtractor
+    fbankHelper: KaldiFbankExtractor,
+    globalChannelMean?: Float32Array,
+    globalChannelStd?: Float32Array,
+    f0Hz = 155
   ): Promise<Float32Array> {
+    const enableEnhance =
+      this.config.enableAcousticDivergencePreproc ?? true;
+    const isHeritage =
+      this.config.engineMode === 'mode_0_heritage_classic';
+
     if (!this.session || !this.ortModule) {
       this.embeddingDim = 64;
       return fbankHelper.computeFormantPreservingTstpEmbedding(
         cmnTensor,
         binMeans,
-        numFrames
+        numFrames,
+        globalChannelMean,
+        globalChannelStd,
+        f0Hz,
+        enableEnhance,
+        isHeritage
       );
     }
 
@@ -921,21 +1104,22 @@ class WeSpeakerOnnxRunner {
         return l2Normalize(rawEmb);
       }
     } catch {
-      // fallback
+      // fallback to 64-dim TSTP
     }
 
     this.embeddingDim = 64;
     return fbankHelper.computeFormantPreservingTstpEmbedding(
       cmnTensor,
       binMeans,
-      numFrames
+      numFrames,
+      globalChannelMean,
+      globalChannelStd,
+      f0Hz,
+      enableEnhance,
+      isHeritage
     );
   }
 }
-
-// ============================================================================
-// 4. 主執行緒入口：極速微觀 SCD 切分 + 主幹段 ONNX/TSTP 提取 + 雙層流形 NME-SC
-// ============================================================================
 
 interface HomogeneousSegmentNode {
   startSec: number;
@@ -947,12 +1131,21 @@ interface HomogeneousSegmentNode {
   scdLeft: number;
   scdRight: number;
   embedding: Float32Array;
+  /** 是否為高純度長句錨點 (>= 1.55s)，僅長句參與聚類中心定錨 */
+  isAnchor: boolean;
 }
 
-function runManifoldCluster(
+/**
+ * 【升級重點 1：Anchor-First 長短句分流定錨聚類 + 餘弦對比銳化】
+ * 只拿流形內的「純淨長句 (Anchor Nodes)」計算親和力矩陣與分群，徹底排除 <1.5s 短句雜訊對群心的污染！
+ * 定出語者中心後，再將短句依聲紋餘弦相似度吸附至最近之語者群。
+ */
+function runAnchorFirstManifoldCluster(
   nodes: HomogeneousSegmentNode[],
   minManifoldK: number,
-  maxManifoldK: number
+  maxManifoldK: number,
+  clusterMethod: DiarizationClusterMethod,
+  enableGlobalMeanCentering: boolean
 ): { labels: Int32Array; k: number } {
   const N = nodes.length;
   if (N === 0) return { labels: new Int32Array(0), k: 0 };
@@ -960,45 +1153,246 @@ function runManifoldCluster(
     return { labels: new Int32Array(N).fill(0), k: 1 };
   }
 
-  const dim = nodes[0].embedding.length;
-  const meanVec = new Float32Array(dim);
-  for (const n of nodes) {
-    for (let d = 0; d < dim; d++) meanVec[d] += n.embedding[d];
+  let anchorIndices: number[] = [];
+  for (let i = 0; i < N; i++) {
+    if (nodes[i].isAnchor) anchorIndices.push(i);
   }
-  for (let d = 0; d < dim; d++) meanVec[d] /= N;
+  if (anchorIndices.length < Math.max(4, maxManifoldK * 2)) {
+    anchorIndices = [];
+    for (let i = 0; i < N; i++) {
+      if (nodes[i].endSec - nodes[i].startSec >= 0.95) {
+        anchorIndices.push(i);
+      }
+    }
+  }
+  if (anchorIndices.length < 3) {
+    anchorIndices = Array.from({ length: N }, (_, i) => i);
+  }
 
-  const centeredEmbeddings: Float32Array[] = nodes.map((n) => {
+  const anchorNodes = anchorIndices.map((idx) => nodes[idx]);
+  const M = anchorNodes.length;
+  const dim = nodes[0].embedding.length;
+
+  const meanVec = new Float32Array(dim);
+  if (enableGlobalMeanCentering) {
+    for (const an of anchorNodes) {
+      for (let d = 0; d < dim; d++) meanVec[d] += an.embedding[d];
+    }
+    for (let d = 0; d < dim; d++) meanVec[d] /= M;
+  }
+
+  const centerEmb = (emb: Float32Array): Float32Array => {
+    if (!enableGlobalMeanCentering) return emb;
     const c = new Float32Array(dim);
     for (let d = 0; d < dim; d++) {
-      c[d] = n.embedding[d] - meanVec[d] * 0.55;
+      c[d] = emb[d] - meanVec[d] * 0.5;
     }
     return l2Normalize(c);
-  });
+  };
 
-  const A = new Float64Array(N * N);
-  const betaTime = 0.08;
-  const sigmaTimeSq2 = 2.0 * 1.2 * 1.2;
+  const centeredAnchors = anchorNodes.map((an) => centerEmb(an.embedding));
 
-  for (let i = 0; i < N; i++) {
-    A[i * N + i] = 1.0;
-    for (let j = i + 1; j < N; j++) {
-      const cos = cosineSimilarity(centeredEmbeddings[i], centeredEmbeddings[j]);
-      const dt = nodes[i].centerSec - nodes[j].centerSec;
+  // 針對餘弦相似度進行非線性對比拉升 (Cosine Contrast Sharpening)，
+  // 拉大同性別不同語者間的距離，避免 Mode B / Mode C 把兩位同性別語者黏成同一群
+  const A = new Float64Array(M * M);
+  const betaTime = 0.05;
+  const sigmaTimeSq2 = 2.0 * 1.4 * 1.4;
+
+  for (let i = 0; i < M; i++) {
+    A[i * M + i] = 1.0;
+    for (let j = i + 1; j < M; j++) {
+      const rawCos = cosineSimilarity(centeredAnchors[i], centeredAnchors[j]);
+      const sharpenedCos =
+        rawCos > 0 ? Math.pow(rawCos, 1.35) : rawCos * 0.5;
+      const dt = anchorNodes[i].centerSec - anchorNodes[j].centerSec;
       const timeKernel = betaTime * Math.exp(-(dt * dt) / sigmaTimeSq2);
-      // 嚴格對應報告步驟 1 公式：A_ij = max(0, S_ij + \beta_time * exp(-\Delta t^2 / 2\sigma_t^2))
-      const sim = Math.max(0.0, Math.min(1.0, cos + timeKernel));
-      A[i * N + j] = sim;
-      A[j * N + i] = sim;
+      const sim = Math.max(0.0, Math.min(1.0, sharpenedCos + timeKernel));
+      A[i * M + j] = sim;
+      A[j * M + i] = sim;
     }
   }
 
-  const res = AutoTuningSpectralClusterer.clusterManifoldNmeSc(
-    A,
-    N,
-    minManifoldK,
-    maxManifoldK
+  const clusterRes =
+    clusterMethod === 'ahc_cosine'
+      ? AutoTuningSpectralClusterer.clusterManifoldAhcCosine(
+          A,
+          M,
+          minManifoldK,
+          maxManifoldK
+        )
+      : AutoTuningSpectralClusterer.clusterManifoldNmeSc(
+          A,
+          M,
+          minManifoldK,
+          maxManifoldK
+        );
+
+  const K = clusterRes.optimalK;
+  const anchorLabels = clusterRes.labels;
+
+  const clusterCentroids: Float32Array[] = Array.from(
+    { length: K },
+    () => new Float32Array(dim)
   );
-  return { labels: res.labels, k: res.optimalK };
+  for (let m = 0; m < M; m++) {
+    const cIdx = anchorLabels[m];
+    const w = Math.max(0.5, anchorNodes[m].endSec - anchorNodes[m].startSec);
+    const vec = centeredAnchors[m];
+    for (let d = 0; d < dim; d++) {
+      clusterCentroids[cIdx][d] += vec[d] * w;
+    }
+  }
+  for (let c = 0; c < K; c++) {
+    clusterCentroids[c] = l2Normalize(clusterCentroids[c]);
+  }
+
+  const fullLabels = new Int32Array(N);
+  const anchorIndexMap = new Map<number, number>();
+  anchorIndices.forEach((origIdx, mIdx) => {
+    anchorIndexMap.set(origIdx, anchorLabels[mIdx]);
+  });
+
+  for (let i = 0; i < N; i++) {
+    if (anchorIndexMap.has(i)) {
+      fullLabels[i] = anchorIndexMap.get(i)!;
+      continue;
+    }
+    const cVec = centerEmb(nodes[i].embedding);
+    let bestC = 0;
+    let bestScore = -Infinity;
+    for (let c = 0; c < K; c++) {
+      const sim = cosineSimilarity(cVec, clusterCentroids[c]);
+      if (sim > bestScore) {
+        bestScore = sim;
+        bestC = c;
+      }
+    }
+    fullLabels[i] = bestC;
+  }
+
+  return { labels: fullLabels, k: K };
+}
+
+/**
+ * 【升級重點 2：建構「語者專屬虛擬音軌批次 (SpeakerTrackBatch[])」】
+ * 將屬於同一位語者的連續或離散發言區間收集起來，每次湊滿約 12~20 秒純同語者語音（中間預留 0.35s 靜音隔板），
+ * 產出分段線性時間軸映射表 `VirtualTrackMapItem[]`。
+ */
+function buildVirtualSpeakerTrackBatches(
+  fineTurns: FineDiarizationTurn[],
+  chunkStartSec: number,
+  chunkEndSec: number
+): SpeakerTrackBatch[] {
+  if (fineTurns.length === 0) return [];
+
+  const mergedTurns: FineDiarizationTurn[] = [];
+  for (const t of fineTurns) {
+    const prev = mergedTurns[mergedTurns.length - 1];
+    if (
+      prev &&
+      prev.speakerId === t.speakerId &&
+      t.start - prev.end <= 0.28 &&
+      t.end - prev.start <= 12.0
+    ) {
+      prev.end = t.end;
+      prev.speakerConfidence = Math.max(
+        prev.speakerConfidence ?? 0.8,
+        t.speakerConfidence ?? 0.8
+      );
+      prev.speakerMargin = Math.max(
+        prev.speakerMargin ?? 0.12,
+        t.speakerMargin ?? 0.12
+      );
+      prev.boundaryScdRight = t.boundaryScdRight;
+    } else {
+      mergedTurns.push({ ...t });
+    }
+  }
+
+  const bySpeaker = new Map<string, FineDiarizationTurn[]>();
+  for (const t of mergedTurns) {
+    const list = bySpeaker.get(t.speakerId) || [];
+    list.push(t);
+    bySpeaker.set(t.speakerId, list);
+  }
+
+  const SPACER_SEC = 0.35;
+  const TARGET_BATCH_SPEECH_SEC = 16.5;
+  const MAX_SINGLE_TURN_SEC = 18.0;
+  const rawBatches: Omit<SpeakerTrackBatch, 'batchIndex'>[] = [];
+
+  const speakerEntries = Array.from(bySpeaker.entries());
+  for (let sIdx = 0; sIdx < speakerEntries.length; sIdx++) {
+    const [speakerId, turns] = speakerEntries[sIdx];
+    let currentMap: VirtualTrackMapItem[] = [];
+    let virtualCursorSec = 0.0;
+    let accumSpeechSec = 0.0;
+
+    const flushCurrentBatch = () => {
+      if (currentMap.length === 0) return;
+      rawBatches.push({
+        speakerId,
+        earliestRealStartSec: currentMap[0].realStartSec,
+        latestRealEndSec: currentMap[currentMap.length - 1].realEndSec,
+        totalVirtualDurationSec: Number(virtualCursorSec.toFixed(2)),
+        spacerDurationSec: SPACER_SEC,
+        timeMap: currentMap,
+      });
+      currentMap = [];
+      virtualCursorSec = 0.0;
+      accumSpeechSec = 0.0;
+    };
+
+    for (const turn of turns) {
+      const paddedRealStart = Number(
+        Math.max(chunkStartSec, turn.start - 0.06).toFixed(2)
+      );
+      const paddedRealEnd = Number(
+        Math.min(chunkEndSec, turn.end + 0.08).toFixed(2)
+      );
+      const dur = Math.max(0.2, paddedRealEnd - paddedRealStart);
+
+      if (
+        currentMap.length > 0 &&
+        (accumSpeechSec + dur > TARGET_BATCH_SPEECH_SEC ||
+          dur >= MAX_SINGLE_TURN_SEC)
+      ) {
+        flushCurrentBatch();
+      }
+
+      if (currentMap.length > 0) {
+        virtualCursorSec += SPACER_SEC;
+      }
+
+      const vStart = Number(virtualCursorSec.toFixed(2));
+      const vEnd = Number((virtualCursorSec + dur).toFixed(2));
+
+      currentMap.push({
+        virtualStartSec: vStart,
+        virtualEndSec: vEnd,
+        realStartSec: paddedRealStart,
+        realEndSec: paddedRealEnd,
+        speakerId: turn.speakerId,
+        runnerUpSpeakerId: turn.runnerUpSpeakerId || turn.speakerId,
+        speakerConfidence: turn.speakerConfidence ?? 0.85,
+        speakerMargin: turn.speakerMargin ?? 0.16,
+        boundaryScdLeft: turn.boundaryScdLeft ?? 0,
+        boundaryScdRight: turn.boundaryScdRight ?? 0,
+      });
+
+      virtualCursorSec = vEnd;
+      accumSpeechSec += dur;
+    }
+
+    flushCurrentBatch();
+  }
+
+  rawBatches.sort((a, b) => a.earliestRealStartSec - b.earliestRealStartSec);
+
+  return rawBatches.map((b, idx) => ({
+    ...b,
+    batchIndex: idx,
+  }));
 }
 
 self.onmessage = async (event: MessageEvent) => {
@@ -1023,23 +1417,34 @@ self.onmessage = async (event: MessageEvent) => {
     : [];
 
   const diarConfig: DiarizationConfig = {
-    engineMode: data.diarizationConfig?.engineMode || 'mode_b_advanced_dsp',
-    clusterMethod: data.diarizationConfig?.clusterMethod || 'spectral_cosine',
+    engineMode:
+      data.diarizationConfig?.engineMode || 'mode_0_heritage_classic',
+    clusterMethod: data.diarizationConfig?.clusterMethod || 'ahc_cosine',
     executionBackend: data.diarizationConfig?.executionBackend || 'wasm',
     onnxModelFilename:
       data.diarizationConfig?.onnxModelFilename ||
       'wespeaker_voxceleb_resnet34_int8.onnx',
     localWasmBasePath: data.diarizationConfig?.localWasmBasePath || './wasm/',
     localModelBasePath: data.diarizationConfig?.localModelBasePath || './models/',
-    yieldEveryNUnits: data.diarizationConfig?.yieldEveryNUnits ?? 14,
+    yieldEveryNUnits: Math.max(
+      4,
+      Number(data.diarizationConfig?.yieldEveryNUnits) || 14
+    ),
     enableGlobalMeanCentering:
       data.diarizationConfig?.enableGlobalMeanCentering ?? true,
     languageHint: data.diarizationConfig?.languageHint || 'zh',
     shortTurnConfidenceKeepThreshold:
-      data.diarizationConfig?.shortTurnConfidenceKeepThreshold ?? 0.68,
-    pingPongMaxDurSec: data.diarizationConfig?.pingPongMaxDurSec ?? 1.8,
+      data.diarizationConfig?.shortTurnConfidenceKeepThreshold ?? 0.66,
+    pingPongMaxDurSec: data.diarizationConfig?.pingPongMaxDurSec ?? 1.6,
     enablePauseAndSemanticWeighting:
       data.diarizationConfig?.enablePauseAndSemanticWeighting ?? true,
+    scdPeakThreshold: data.diarizationConfig?.scdPeakThreshold ?? 0.22,
+    backchannelMarginThreshold:
+      data.diarizationConfig?.backchannelMarginThreshold ?? 0.12,
+    enableAcousticDivergencePreproc:
+      data.diarizationConfig?.enableAcousticDivergencePreproc ?? true,
+    enableVirtualSpeakerTrackStitching:
+      data.diarizationConfig?.enableVirtualSpeakerTrackStitching ?? true,
   };
 
   if (!samples || samples.length === 0) {
@@ -1047,10 +1452,15 @@ self.onmessage = async (event: MessageEvent) => {
       type: 'DIARIZE_SUCCESS',
       turns: [],
       asrWindows: [],
+      speakerTrackBatches: [],
       updatedSpeakers: existingSpeakers,
     });
     return;
   }
+
+  const chunkEndSec = Number(
+    (chunkStartSec + samples.length / sampleRate).toFixed(2)
+  );
 
   try {
     const fbankExtractor = new KaldiFbankExtractor();
@@ -1071,6 +1481,7 @@ self.onmessage = async (event: MessageEvent) => {
         type: 'DIARIZE_SUCCESS',
         turns: [],
         asrWindows: [],
+        speakerTrackBatches: [],
         updatedSpeakers: existingSpeakers,
       });
       return;
@@ -1079,30 +1490,73 @@ self.onmessage = async (event: MessageEvent) => {
     const sortedRms = Array.from(frameRms).sort((a, b) => a - b);
     const noiseFloor = sortedRms[Math.floor(sortedRms.length * 0.18)] || 0.004;
     const vadThreshold = Math.max(0.008, noiseFloor * 2.0);
+    const scdPeakCutoff = diarConfig.scdPeakThreshold ?? 0.22;
+    const enableEnhance =
+      diarConfig.enableAcousticDivergencePreproc ?? true;
+    const isHeritageMode =
+      diarConfig.engineMode === 'mode_0_heritage_classic';
 
-    // ── Step 1: 極速計算 Scale-3 (0.8s 視窗, 0.2s 步長) 微觀聲紋跳變曲線 d_SCD(t) (僅需 ~15ms) ──
+    const { globalChannelMean, globalChannelStd } =
+      fbankExtractor.computeGlobalSpeechChannelProfile(
+        allFbankFrames,
+        frameRms,
+        vadThreshold
+      );
+
     const scdCurveF = new Float32Array(numFrames);
     for (let f = 80; f <= numFrames - 80; f += 20) {
       if (frameRms[f] < vadThreshold * 0.8) continue;
-      const leftSlice = fbankExtractor.sliceAndApplyCMN(allFbankFrames, f - 80, f);
-      const rightSlice = fbankExtractor.sliceAndApplyCMN(allFbankFrames, f, f + 80);
+      const leftSlice = fbankExtractor.sliceAndApplyCMN(
+        allFbankFrames,
+        f - 80,
+        f,
+        globalChannelMean
+      );
+      const rightSlice = fbankExtractor.sliceAndApplyCMN(
+        allFbankFrames,
+        f,
+        f + 80,
+        globalChannelMean
+      );
       const embL = fbankExtractor.computeFormantPreservingTstpEmbedding(
         leftSlice.cmnTensor,
         leftSlice.binMeans,
-        80
+        80,
+        globalChannelMean,
+        globalChannelStd,
+        155,
+        enableEnhance,
+        isHeritageMode
       );
       const embR = fbankExtractor.computeFormantPreservingTstpEmbedding(
         rightSlice.cmnTensor,
         rightSlice.binMeans,
-        80
+        80,
+        globalChannelMean,
+        globalChannelStd,
+        155,
+        enableEnhance,
+        isHeritageMode
       );
       const scdVal = Math.max(0.0, 1.0 - cosineSimilarity(embL, embR));
-      for (let k = Math.max(0, f - 10); k < Math.min(numFrames, f + 10); k++) {
+      for (
+        let k = Math.max(0, f - 10);
+        k < Math.min(numFrames, f + 10);
+        k++
+      ) {
         scdCurveF[k] = scdVal;
       }
     }
 
-    // ── Step 2: 結合 VAD 靜音與 SCD 波峰切出約 80~140 個同質語音段 (Homogeneous Sub-segments) ──
+    const maxSubLenFrames =
+      diarConfig.engineMode === 'mode_0_heritage_classic'
+        ? 250
+        : diarConfig.engineMode === 'mode_a_classic'
+        ? 380
+        : 310;
+    const minSilenceFramesToCut =
+      diarConfig.engineMode === 'mode_0_heritage_classic' ? 18 : 24;
+
     const rawSubBounds: Array<{ startF: number; endF: number }> = [];
     let inSpeech = false;
     let startF = 0;
@@ -1117,22 +1571,22 @@ self.onmessage = async (event: MessageEvent) => {
         silenceFrames = 0;
 
         const curLenF = f - startF;
-        // 若連續發聲超過 1.1s 且遇到顯著 SCD 換人波峰 (或超過 3.2s)，切分為獨立子段
         const isScdPeak =
-          curLenF >= 110 &&
-          scdCurveF[f] >= 0.24 &&
+          curLenF >= 85 &&
+          scdCurveF[f] >= scdPeakCutoff &&
           scdCurveF[f] >= (scdCurveF[Math.max(0, f - 20)] || 0) &&
-          scdCurveF[f] >= (scdCurveF[Math.min(numFrames - 1, f + 20)] || 0);
+          scdCurveF[f] >=
+            (scdCurveF[Math.min(numFrames - 1, f + 20)] || 0);
 
-        if (isScdPeak || curLenF >= 320) {
+        if (isScdPeak || curLenF >= maxSubLenFrames) {
           rawSubBounds.push({ startF, endF: f });
           startF = f;
         }
       } else if (inSpeech) {
         silenceFrames++;
-        if (silenceFrames >= 25) {
+        if (silenceFrames >= minSilenceFramesToCut) {
           const endF = f - silenceFrames + 1;
-          if (endF - startF >= 28) {
+          if (endF - startF >= 24) {
             rawSubBounds.push({ startF, endF });
           }
           inSpeech = false;
@@ -1140,18 +1594,20 @@ self.onmessage = async (event: MessageEvent) => {
         }
       }
     }
-    if (inSpeech && numFrames - startF >= 28) {
+    if (inSpeech && numFrames - startF >= 24) {
       rawSubBounds.push({ startF, endF: numFrames });
     }
 
-    // ── Step 3: 僅對這 ~100 個純淨語音段執行多尺度 (2.4s 宏觀 + 本身中觀) 聲紋提取 ──
     const segNodes: HomogeneousSegmentNode[] = [];
+    const yieldStep = Math.max(4, diarConfig.yieldEveryNUnits || 14);
+    const enableDualScaleOnnx =
+      diarConfig.engineMode === 'mode_c_onnx_neural';
 
     for (let idx = 0; idx < rawSubBounds.length; idx++) {
       const b = rawSubBounds[idx];
+      const durFrames = b.endF - b.startF;
       const centerF = Math.floor((b.startF + b.endF) / 2);
 
-      // Scale 1 (2.4s 宏觀上下文) 與 Scale 2 (當前語音段本身)
       const s1Start = Math.max(b.startF, centerF - 120);
       const s1End = Math.min(b.endF, centerF + 120);
 
@@ -1162,27 +1618,35 @@ self.onmessage = async (event: MessageEvent) => {
       const sliceSeg = fbankExtractor.sliceAndApplyCMN(
         allFbankFrames,
         b.startF,
-        b.endF
+        b.endF,
+        globalChannelMean
       );
       const embSeg = await onnxRunner.computeEmbedding(
         sliceSeg.cmnTensor,
         sliceSeg.binMeans,
-        b.endF - b.startF,
-        fbankExtractor
+        durFrames,
+        fbankExtractor,
+        globalChannelMean,
+        globalChannelStd,
+        f0Hz
       );
 
       let finalEmb = embSeg;
-      if (b.endF - b.startF > 180) {
+      if (enableDualScaleOnnx && durFrames > 180) {
         const sliceMacro = fbankExtractor.sliceAndApplyCMN(
           allFbankFrames,
           s1Start,
-          s1End
+          s1End,
+          globalChannelMean
         );
         const embMacro = await onnxRunner.computeEmbedding(
           sliceMacro.cmnTensor,
           sliceMacro.binMeans,
           s1End - s1Start,
-          fbankExtractor
+          fbankExtractor,
+          globalChannelMean,
+          globalChannelStd,
+          f0Hz
         );
         const fused = new Float32Array(embSeg.length);
         for (let d = 0; d < embSeg.length; d++) {
@@ -1190,6 +1654,8 @@ self.onmessage = async (event: MessageEvent) => {
         }
         finalEmb = l2Normalize(fused);
       }
+
+      const isAnchor = durFrames >= 155;
 
       segNodes.push({
         startSec: chunkStartSec + b.startF * 0.01,
@@ -1199,16 +1665,19 @@ self.onmessage = async (event: MessageEvent) => {
         endFrame: b.endF,
         f0Hz,
         scdLeft: Number((scdCurveF[b.startF] || 0).toFixed(3)),
-        scdRight: Number((scdCurveF[Math.min(numFrames - 1, b.endF)] || 0).toFixed(3)),
+        scdRight: Number(
+          (scdCurveF[Math.min(numFrames - 1, b.endF)] || 0).toFixed(3)
+        ),
         embedding: finalEmb,
+        isAnchor,
       });
 
-      if ((idx + 1) % 10 === 0 || idx === rawSubBounds.length - 1) {
+      if ((idx + 1) % yieldStep === 0 || idx === rawSubBounds.length - 1) {
         const pct = 15 + Math.round(((idx + 1) / rawSubBounds.length) * 70);
         self.postMessage({
           type: 'DIARIZE_PROGRESS',
           progress: pct,
-          detailText: `提取語音段深度聲紋 (${idx + 1}/${rawSubBounds.length} 段)...`,
+          detailText: `提取語音段聲紋與篩選黃金長句錨點 (${idx + 1}/${rawSubBounds.length} 段)...`,
         });
         await new Promise((r) => setTimeout(r, 2));
       }
@@ -1219,6 +1688,7 @@ self.onmessage = async (event: MessageEvent) => {
         type: 'DIARIZE_SUCCESS',
         turns: [],
         asrWindows: [],
+        speakerTrackBatches: [],
         updatedSpeakers: existingSpeakers,
       });
       return;
@@ -1226,11 +1696,10 @@ self.onmessage = async (event: MessageEvent) => {
 
     const embDim = segNodes[0].embedding.length;
 
-    // ── Step 4: 雙層流形獨立 NME-SC 聚類 (徹底消除 K=2 性別鴻溝陷阱) ──
     self.postMessage({
       type: 'DIARIZE_PROGRESS',
       progress: 90,
-      detailText: '執行雙層流形 Auto-Tuning NME-SC 譜聚類...',
+      detailText: `執行 Anchor-First 長短句分流定錨聚類...`,
     });
 
     const highManifoldNodes: HomogeneousSegmentNode[] = [];
@@ -1256,21 +1725,23 @@ self.onmessage = async (event: MessageEvent) => {
       highManifoldNodes.length >= 3 && lowManifoldNodes.length >= 3;
 
     if (hasBothManifolds) {
-      const highDur = highManifoldNodes.reduce(
-        (acc, n) => acc + (n.endSec - n.startSec),
-        0
-      );
-      const lowDur = lowManifoldNodes.reduce(
-        (acc, n) => acc + (n.endSec - n.startSec),
-        0
-      );
-      const minHighK = highDur >= 10 && highManifoldNodes.length >= 4 ? 2 : 1;
-      const minLowK = lowDur >= 10 && lowManifoldNodes.length >= 4 ? 2 : 1;
-      const maxHighK = Math.max(minHighK, Math.min(3, maxSpeakers - minLowK));
-      const maxLowK = Math.max(minLowK, Math.min(3, maxSpeakers - minHighK));
+      const maxHighK = Math.max(1, Math.min(5, maxSpeakers - 1));
+      const maxLowK = Math.max(1, Math.min(5, maxSpeakers - 1));
 
-      const highRes = runManifoldCluster(highManifoldNodes, minHighK, maxHighK);
-      const lowRes = runManifoldCluster(lowManifoldNodes, minLowK, maxLowK);
+      const highRes = runAnchorFirstManifoldCluster(
+        highManifoldNodes,
+        1,
+        maxHighK,
+        diarConfig.clusterMethod,
+        diarConfig.enableGlobalMeanCentering
+      );
+      const lowRes = runAnchorFirstManifoldCluster(
+        lowManifoldNodes,
+        1,
+        maxLowK,
+        diarConfig.clusterMethod,
+        diarConfig.enableGlobalMeanCentering
+      );
 
       for (let i = 0; i < highManifoldNodes.length; i++) {
         allLabels[highOrigIndices[i]] = highRes.labels[i];
@@ -1280,7 +1751,13 @@ self.onmessage = async (event: MessageEvent) => {
       }
       totalClusters = highRes.k + lowRes.k;
     } else {
-      const singleRes = runManifoldCluster(segNodes, minSpeakers, maxSpeakers);
+      const singleRes = runAnchorFirstManifoldCluster(
+        segNodes,
+        minSpeakers,
+        maxSpeakers,
+        diarConfig.clusterMethod,
+        diarConfig.enableGlobalMeanCentering
+      );
       for (let i = 0; i < N_obs; i++) {
         allLabels[i] = singleRes.labels[i];
       }
@@ -1311,25 +1788,45 @@ self.onmessage = async (event: MessageEvent) => {
 
       for (const oIdx of obsIdxList) {
         const node = segNodes[oIdx];
-        const w = Math.max(0.3, node.endSec - node.startSec);
-        durSum += w;
+        const dur = Math.max(0.3, node.endSec - node.startSec);
+        const anchorBoost = node.isAnchor ? 2.5 : 0.6;
+        const w = dur * anchorBoost;
+        durSum += dur;
         weightedF0 += node.f0Hz * w;
         for (let d = 0; d < embDim; d++) {
           meanVec[d] += node.embedding[d] * w;
         }
       }
 
+      const totalWeight = obsIdxList.reduce((acc, idx) => {
+        const n = segNodes[idx];
+        return (
+          acc + Math.max(0.3, n.endSec - n.startSec) * (n.isAnchor ? 2.5 : 0.6)
+        );
+      }, 0);
+
       const normCentroid = l2Normalize(meanVec);
       const scoredNodes = obsIdxList
+        .filter((idx) => segNodes[idx].isAnchor)
         .map((idx) => ({
           idx,
           sim: cosineSimilarity(segNodes[idx].embedding, normCentroid),
         }))
         .sort((a, b) => b.sim - a.sim);
 
+      const fallbackPool =
+        scoredNodes.length > 0
+          ? scoredNodes
+          : obsIdxList
+              .map((idx) => ({
+                idx,
+                sim: cosineSimilarity(segNodes[idx].embedding, normCentroid),
+              }))
+              .sort((a, b) => b.sim - a.sim);
+
       const exemplars: Float32Array[] = [];
-      const highPurityPool = scoredNodes
-        .slice(0, Math.max(1, Math.ceil(scoredNodes.length * 0.6)))
+      const highPurityPool = fallbackPool
+        .slice(0, Math.max(1, Math.ceil(fallbackPool.length * 0.6)))
         .map((item) => segNodes[item.idx].embedding);
 
       if (highPurityPool.length > 0) {
@@ -1358,7 +1855,7 @@ self.onmessage = async (event: MessageEvent) => {
         obsIndices: obsIdxList,
         centroid: normCentroid,
         exemplars,
-        f0Hz: durSum > 0 ? weightedF0 / durSum : 155,
+        f0Hz: totalWeight > 0 ? weightedF0 / totalWeight : 155,
         totalDurSec: durSum,
       });
     }
@@ -1367,7 +1864,7 @@ self.onmessage = async (event: MessageEvent) => {
       validLocalClusters.reduce((acc, c) => acc + c.totalDurSec, 0) || 1;
     while (validLocalClusters.length > minSpeakers) {
       const tinyIdx = validLocalClusters.findIndex(
-        (c) => c.totalDurSec / totalAllDur < 0.045
+        (c) => c.totalDurSec / totalAllDur < 0.04
       );
       if (tinyIdx === -1) break;
 
@@ -1468,6 +1965,7 @@ self.onmessage = async (event: MessageEvent) => {
           bestSp.embedding = Array.from(normMaster);
           bestSp.centroid = [newF0, ...Array.from(normMaster)];
           bestSp.accumulatedMass = oldMass + loc.totalDurSec;
+          bestSp.featureMode = diarConfig.engineMode;
           bestSp.anchorBank = [
             ...(bestSp.anchorBank || []).slice(0, 3),
             ...loc.exemplars.slice(0, 3).map((e) => Array.from(e)),
@@ -1491,6 +1989,7 @@ self.onmessage = async (event: MessageEvent) => {
           embedding: Array.from(loc.centroid),
           anchorBank: loc.exemplars.map((e) => Array.from(e)),
           accumulatedMass: loc.totalDurSec,
+          featureMode: diarConfig.engineMode,
           centroid: [loc.f0Hz, ...Array.from(loc.centroid)],
           mergedFrom: [],
         };
@@ -1504,7 +2003,9 @@ self.onmessage = async (event: MessageEvent) => {
       }
     }
 
+    const backchannelMarginReq = diarConfig.backchannelMarginThreshold ?? 0.12;
     const fineTimelineTurns: FineDiarizationTurn[] = [];
+    const activeEntries = Array.from(activeProfiles.entries());
 
     for (let i = 0; i < segNodes.length; i++) {
       const node = segNodes[i];
@@ -1515,7 +2016,8 @@ self.onmessage = async (event: MessageEvent) => {
       let s1 = -2.0;
       let s2 = -2.0;
 
-      for (const [spId, prof] of activeProfiles.entries()) {
+      for (let pIdx = 0; pIdx < activeEntries.length; pIdx++) {
+        const [spId, prof] = activeEntries[pIdx];
         const profIsHigh = prof.f0Hz >= 162;
         if (profIsHigh !== nodeIsHigh) continue;
 
@@ -1553,8 +2055,10 @@ self.onmessage = async (event: MessageEvent) => {
         boundaryScdLeft: node.scdLeft,
         boundaryScdRight: node.scdRight,
         isProtectedBackchannel:
-          margin >= 0.14 ||
-          (margin >= 0.06 && node.scdLeft + node.scdRight >= 0.45),
+          margin >= backchannelMarginReq ||
+          (margin >= backchannelMarginReq * 0.45 &&
+            node.scdLeft + node.scdRight >= 0.45),
+        isAnchorTurn: node.isAnchor,
       });
     }
 
@@ -1563,62 +2067,77 @@ self.onmessage = async (event: MessageEvent) => {
       const curr = fineTimelineTurns[i];
       const next = fineTimelineTurns[i + 1];
       const dur = curr.end - curr.start;
+      const dualScdPeak =
+        (curr.boundaryScdLeft || 0) + (curr.boundaryScdRight || 0);
 
       if (
         prev.speakerId === next.speakerId &&
         curr.speakerId !== prev.speakerId &&
-        dur < 1.5
+        dur < 0.35 &&
+        (curr.speakerMargin || 0) < 0.09 &&
+        dualScdPeak < 0.26
       ) {
-        const marginBA = curr.speakerMargin || 0.0;
-        const dualScdPeak =
-          (curr.boundaryScdLeft || 0) + (curr.boundaryScdRight || 0);
-        const isTrueBackchannel =
-          marginBA >= 0.14 || (marginBA >= 0.06 && dualScdPeak >= 0.45);
-
-        if (!isTrueBackchannel) {
-          curr.speakerId = prev.speakerId;
-        } else {
-          curr.isProtectedBackchannel = true;
-        }
+        curr.speakerId = prev.speakerId;
       }
     }
 
     const asrWindows: Array<{ start: number; end: number }> = [];
     let winStart = fineTimelineTurns[0].start;
     let lastEnd = fineTimelineTurns[0].end;
+    let lastSpk = fineTimelineTurns[0].speakerId;
 
     for (let i = 1; i < fineTimelineTurns.length; i++) {
       const cur = fineTimelineTurns[i];
       const gap = cur.start - lastEnd;
       const currentWinDur = lastEnd - winStart;
+      const isOpeningCalibration = cur.start - chunkStartSec <= 35.0;
+      const speakerSwitched = cur.speakerId !== lastSpk;
 
-      if (
-        (currentWinDur >= 18.0 && gap >= 0.3) ||
-        currentWinDur >= 25.0 ||
-        gap >= 2.2
-      ) {
+      const shouldCutOpening =
+        isOpeningCalibration &&
+        ((currentWinDur >= 7.5 &&
+          (gap >= 0.22 ||
+            (speakerSwitched && (cur.boundaryScdLeft || 0) >= scdPeakCutoff))) ||
+          currentWinDur >= 14.0);
+
+      const shouldCutSteady =
+        !isOpeningCalibration &&
+        ((currentWinDur >= 11.0 && gap >= 0.24 && speakerSwitched) ||
+          (currentWinDur >= 14.5 && gap >= 0.2) ||
+          currentWinDur >= 19.5 ||
+          gap >= 1.8);
+
+      if (shouldCutOpening || shouldCutSteady) {
         asrWindows.push({
-          start: Math.max(chunkStartSec, Number((winStart - 0.1).toFixed(2))),
-          end: Number((lastEnd + 0.15).toFixed(2)),
+          start: Math.max(chunkStartSec, Number((winStart - 0.08).toFixed(2))),
+          end: Number((lastEnd + 0.12).toFixed(2)),
         });
         winStart = cur.start;
       }
       lastEnd = cur.end;
+      lastSpk = cur.speakerId;
     }
 
     asrWindows.push({
-      start: Math.max(chunkStartSec, Number((winStart - 0.1).toFixed(2))),
-      end: Number((lastEnd + 0.15).toFixed(2)),
+      start: Math.max(chunkStartSec, Number((winStart - 0.08).toFixed(2))),
+      end: Number((lastEnd + 0.12).toFixed(2)),
     });
 
+    const speakerTrackBatches = buildVirtualSpeakerTrackBatches(
+      fineTimelineTurns,
+      chunkStartSec,
+      chunkEndSec
+    );
+
     console.info(
-      `🎯 [NME-SC 完成] 共識別 ${updatedSpeakers.length} 位語者，切出 ${fineTimelineTurns.length} 個聲紋區間`
+      `🎯 [Anchor-First + 虛擬音軌完成] 共識別 ${updatedSpeakers.length} 位語者，建立 ${speakerTrackBatches.length} 個同語者純淨拼接批次`
     );
 
     self.postMessage({
       type: 'DIARIZE_SUCCESS',
       turns: fineTimelineTurns,
       asrWindows,
+      speakerTrackBatches,
       updatedSpeakers,
     });
   } catch (err) {

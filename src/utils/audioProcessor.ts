@@ -35,7 +35,8 @@ export async function acquireKeepAwakeLock(): Promise<void> {
     if (!keepAliveAudioCtx) {
       const AudioCtxClass =
         window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        (window as unknown as { webkitAudioContext: typeof AudioContext })
+          .webkitAudioContext;
       keepAliveAudioCtx = new AudioCtxClass();
       const gain = keepAliveAudioCtx.createGain();
       gain.gain.value = 0.00001;
@@ -155,7 +156,11 @@ export async function extractAndPreprocessMacroChunk(
   chunkStartSec: number,
   chunkEndSec: number,
   totalDurationSec: number
-): Promise<{ samples: Float32Array; wavBuffer: ArrayBuffer; actualDurationSec: number }> {
+): Promise<{
+  samples: Float32Array;
+  wavBuffer: ArrayBuffer;
+  actualDurationSec: number;
+}> {
   if (chunkStartSec === 0) {
     await new Promise((r) => setTimeout(r, 120));
   }
@@ -169,7 +174,8 @@ export async function extractAndPreprocessMacroChunk(
 
   const AudioCtxClass =
     window.AudioContext ||
-    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    (window as unknown as { webkitAudioContext: typeof AudioContext })
+      .webkitAudioContext;
 
   if (isWav && totalDurationSec > 0 && file.size > 44) {
     const dataBytes = file.size - 44;
@@ -210,7 +216,9 @@ export async function extractAndPreprocessMacroChunk(
     const bytesPerSec = file.size / totalDurationSec;
     const startByte = Math.max(0, Math.floor(chunkStartSec * bytesPerSec));
     const endByte = Math.min(file.size, Math.ceil(chunkEndSec * bytesPerSec));
-    const rawSlice = new Uint8Array(await file.slice(startByte, endByte).arrayBuffer());
+    const rawSlice = new Uint8Array(
+      await file.slice(startByte, endByte).arrayBuffer()
+    );
     const alignedBuffer = alignMp3SyncHeader(rawSlice);
 
     const audioCtx = new AudioCtxClass({ sampleRate: TARGET_SAMPLE_RATE });
@@ -239,7 +247,10 @@ export async function extractAndPreprocessMacroChunk(
     await audioCtx.close();
   }
 
-  const startSample = Math.max(0, Math.floor(chunkStartSec * TARGET_SAMPLE_RATE));
+  const startSample = Math.max(
+    0,
+    Math.floor(chunkStartSec * TARGET_SAMPLE_RATE)
+  );
   const endSample = Math.min(
     decodedBuffer.length,
     Math.ceil(chunkEndSec * TARGET_SAMPLE_RATE)
@@ -255,7 +266,10 @@ export async function extractAndPreprocessMacroChunk(
     }
   }
 
-  const samples = await applyHighpassFilterOnArray(monoSlice, TARGET_SAMPLE_RATE);
+  const samples = await applyHighpassFilterOnArray(
+    monoSlice,
+    TARGET_SAMPLE_RATE
+  );
   const wavBuffer = encodeFloat32ToWav(samples, TARGET_SAMPLE_RATE);
 
   return {
@@ -265,8 +279,13 @@ export async function extractAndPreprocessMacroChunk(
   };
 }
 
-async function applyHighpassFilter16k(decoded: AudioBuffer): Promise<Float32Array> {
-  const frameCount = Math.max(1, Math.ceil(decoded.duration * TARGET_SAMPLE_RATE));
+async function applyHighpassFilter16k(
+  decoded: AudioBuffer
+): Promise<Float32Array> {
+  const frameCount = Math.max(
+    1,
+    Math.ceil(decoded.duration * TARGET_SAMPLE_RATE)
+  );
   const offlineCtx = new OfflineAudioContext(1, frameCount, TARGET_SAMPLE_RATE);
   const sourceNode = offlineCtx.createBufferSource();
   sourceNode.buffer = decoded;
@@ -309,6 +328,245 @@ async function applyHighpassFilterOnArray(
   return new Float32Array(rendered.getChannelData(0));
 }
 
+/**
+ * 雙二階峰值濾波器 (Biquad Peaking EQ)：針對 2.8kHz 唇齒音與 F2/F3 共振峰增強 +4.5dB，
+ * 讓模糊的平翹舌、鼻音與氣音子音在重聽時變得清晰銳利。
+ */
+function applyPresenceBoostBiquad(
+  samples: Float32Array,
+  sampleRate = TARGET_SAMPLE_RATE,
+  centerFreqHz = 2800,
+  gainDb = 4.5,
+  Q = 1.1
+): Float32Array {
+  const out = new Float32Array(samples.length);
+  const A = Math.pow(10, gainDb / 40);
+  const w0 = (2 * Math.PI * centerFreqHz) / sampleRate;
+  const cosW0 = Math.cos(w0);
+  const sinW0 = Math.sin(w0);
+  const alpha = sinW0 / (2 * Q);
+
+  const b0 = 1 + alpha * A;
+  const b1 = -2 * cosW0;
+  const b2 = 1 - alpha * A;
+  const a0 = 1 + alpha / A;
+  const a1 = -2 * cosW0;
+  const a2 = 1 - alpha / A;
+
+  const nb0 = b0 / a0;
+  const nb1 = b1 / a0;
+  const nb2 = b2 / a0;
+  const na1 = a1 / a0;
+  const na2 = a2 / a0;
+
+  let x1 = 0;
+  let x2 = 0;
+  let y1 = 0;
+  let y2 = 0;
+
+  for (let i = 0; i < samples.length; i++) {
+    const x0 = samples[i];
+    const y0 = nb0 * x0 + nb1 * x1 + nb2 * x2 - na1 * y1 - na2 * y2;
+    out[i] = y0;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
+  }
+  return out;
+}
+
+/**
+ * 波形相似度重疊相加演算法 (Pitch-Preserving WSOLA Time-Stretching)：
+ * 在不改變人聲基頻 (不變調) 的前提下，將語速放慢 (例如 stretchRatio = 1.18 對應 0.85x 語速)，
+ * 讓連音、搶話或太短促的漏字獲得更充裕的 Whisper 編碼幀數。
+ */
+function applyWsolaTimeStretch(
+  input: Float32Array,
+  stretchRatio = 1.18, // > 1.0 代表放慢展開
+  sampleRate = TARGET_SAMPLE_RATE
+): Float32Array {
+  if (Math.abs(stretchRatio - 1.0) < 0.03 || input.length < 1600) {
+    return input;
+  }
+
+  const winLen = Math.floor(sampleRate * 0.03); // 30ms 視窗 (480 samples)
+  const synHop = Math.floor(winLen / 2); // 15ms 合成步長 (240 samples)
+  const anaHop = Math.max(1, Math.round(synHop / stretchRatio)); // 分析步長
+  const searchRadius = Math.floor(sampleRate * 0.008); // ±8ms 最佳相位對齊搜尋半徑
+
+  const outLen = Math.ceil(input.length * stretchRatio) + winLen;
+  const output = new Float32Array(outLen);
+  const normWeight = new Float32Array(outLen);
+
+  const hann = new Float32Array(winLen);
+  for (let n = 0; n < winLen; n++) {
+    hann[n] = 0.5 * (1.0 - Math.cos((2.0 * Math.PI * n) / (winLen - 1)));
+  }
+
+  let anaPos = 0;
+  let synPos = 0;
+
+  // 第一個視窗直接寫入
+  for (let n = 0; n < winLen && n < input.length; n++) {
+    output[n] = input[n] * hann[n];
+    normWeight[n] = hann[n] * hann[n];
+  }
+
+  let prevBestAnaPos = 0;
+
+  while (
+    synPos + winLen < outLen &&
+    anaPos + anaHop + winLen + searchRadius < input.length
+  ) {
+    synPos += synHop;
+    const naturalNextAna = prevBestAnaPos + anaHop;
+    const targetCandidateCenter = Math.round(synPos / stretchRatio);
+
+    let bestOffset = 0;
+    let bestCorr = -Infinity;
+
+    // 在預期重疊區利用互相關 (Cross-Correlation) 尋找相位最連續的切點，徹底消除機械音
+    const overlapCheckLen = Math.min(120, synHop);
+    for (let delta = -searchRadius; delta <= searchRadius; delta += 2) {
+      const candPos = targetCandidateCenter + delta;
+      if (candPos < 0 || candPos + winLen >= input.length) continue;
+
+      let corr = 0.0;
+      for (let k = 0; k < overlapCheckLen; k += 2) {
+        const refVal =
+          naturalNextAna + k < input.length ? input[naturalNextAna + k] : 0;
+        corr += refVal * input[candPos + k];
+      }
+      if (corr > bestCorr) {
+        bestCorr = corr;
+        bestOffset = delta;
+      }
+    }
+
+    const chosenAnaPos = Math.max(
+      0,
+      Math.min(input.length - winLen, targetCandidateCenter + bestOffset)
+    );
+
+    for (let n = 0; n < winLen; n++) {
+      const w = hann[n];
+      output[synPos + n] += input[chosenAnaPos + n] * w;
+      normWeight[synPos + n] += w * w;
+    }
+
+    prevBestAnaPos = chosenAnaPos;
+    anaPos = chosenAnaPos;
+  }
+
+  const finalValidLen = Math.min(outLen, synPos + winLen);
+  const normalizedOut = new Float32Array(finalValidLen);
+  for (let i = 0; i < finalValidLen; i++) {
+    normalizedOut[i] =
+      normWeight[i] > 1e-4 ? output[i] / normWeight[i] : output[i];
+  }
+
+  return normalizedOut;
+}
+
+/**
+ * 【Issue 2 第 7 步核心：重聽專用無失真聲學正規化與清晰度強化器】
+ * 修正重點：
+ * 1. 預設停用會造成 Whisper 頻譜相位失真與幻覺的 WSOLA 時間拉伸 (enableTimeStretch = false) 及 50ms 劇烈起伏 AGC。
+ * 2. 改用「整段線性峰值正規化 (Utterance-Level Linear Peak Normalization) + 溫和尾音補償 + 2.8kHz 咬字增強 (+3.0dB)」，
+ *    確保 Whisper 接收到 100% 相位連續、自然清晰的人聲波形。
+ */
+export function enhanceSubSegmentAudioForRelisten(
+  chunkSamples: Float32Array,
+  chunkStartGlobalSec: number,
+  segmentStartGlobalSec: number,
+  segmentEndGlobalSec: number,
+  options?: {
+    paddingSec?: number;
+    enableTimeStretch?: boolean;
+    stretchRatio?: number;
+  }
+): {
+  subSamples: Float32Array;
+  subWavBuffer: ArrayBuffer;
+  paddedStartGlobalSec: number;
+  paddedEndGlobalSec: number;
+  timeStretchRatio: number;
+  hasQuietDropCompensated: boolean;
+} {
+  const paddingSec = options?.paddingSec ?? 0.85;
+  const baseSliced = sliceSubSegmentAudio(
+    chunkSamples,
+    chunkStartGlobalSec,
+    segmentStartGlobalSec,
+    segmentEndGlobalSec,
+    paddingSec
+  );
+
+  const raw = baseSliced.subSamples;
+  if (raw.length < 800) {
+    return {
+      ...baseSliced,
+      timeStretchRatio: 1.0,
+      hasQuietDropCompensated: false,
+    };
+  }
+
+  // ── 階段 1：整段線性音量正規化與柔和壓限（保持自然語音包絡，不產生呼吸泵浦雜訊） ──
+  let peakAbs = 0.0;
+  let sumSq = 0.0;
+  for (let i = 0; i < raw.length; i++) {
+    const a = Math.abs(raw[i]);
+    if (a > peakAbs) peakAbs = a;
+    sumSq += raw[i] * raw[i];
+  }
+  const rms = Math.sqrt(sumSq / raw.length);
+
+  // 若整段偏小聲 (rms < 0.06)，給予一致的線性放大（最高 2.6 倍），維持字與字之間的自然相對動態
+  const linearGain =
+    peakAbs > 1e-4 ? Math.min(2.6, Math.max(1.0, 0.78 / peakAbs)) : 1.0;
+  const hasQuietDropCompensated = linearGain >= 1.45 || rms < 0.045;
+
+  const normalizedSamples = new Float32Array(raw.length);
+  for (let i = 0; i < raw.length; i++) {
+    const v = raw[i] * linearGain;
+    normalizedSamples[i] = Math.max(-0.95, Math.min(0.95, v));
+  }
+
+  // ── 階段 2：溫和的 2.8kHz 唇齒音清晰度強化 (+2.8dB)，不扭曲母音共振峰 ──
+  const formantEnhanced = applyPresenceBoostBiquad(
+    normalizedSamples,
+    TARGET_SAMPLE_RATE,
+    2800,
+    2.8,
+    1.0
+  );
+
+  // 預設不啟用 WSOLA 變速，確保 Whisper 聲學特徵 100% 原汁原味
+  const shouldStretch = options?.enableTimeStretch === true;
+  const requestedRatio = shouldStretch ? options?.stretchRatio ?? 1.12 : 1.0;
+
+  const finalSamples =
+    requestedRatio > 1.03
+      ? applyWsolaTimeStretch(
+          formantEnhanced,
+          requestedRatio,
+          TARGET_SAMPLE_RATE
+        )
+      : formantEnhanced;
+
+  const subWavBuffer = encodeFloat32ToWav(finalSamples, TARGET_SAMPLE_RATE);
+
+  return {
+    subSamples: finalSamples,
+    subWavBuffer,
+    paddedStartGlobalSec: baseSliced.paddedStartGlobalSec,
+    paddedEndGlobalSec: baseSliced.paddedEndGlobalSec,
+    timeStretchRatio: requestedRatio,
+    hasQuietDropCompensated,
+  };
+}
+
 export function sliceSubSegmentAudio(
   chunkSamples: Float32Array,
   chunkStartGlobalSec: number,
@@ -336,7 +594,10 @@ export function sliceSubSegmentAudio(
     Math.min(relStartSec + 15.0, relEndSec)
   );
 
-  const startSampleIdx = Math.max(0, Math.floor(relStartSec * TARGET_SAMPLE_RATE));
+  const startSampleIdx = Math.max(
+    0,
+    Math.floor(relStartSec * TARGET_SAMPLE_RATE)
+  );
   const endSampleIdx = Math.min(
     chunkSamples.length,
     Math.ceil(safeEndSec * TARGET_SAMPLE_RATE)
