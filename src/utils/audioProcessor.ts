@@ -1,4 +1,5 @@
 // src/utils/audioProcessor.ts
+// 次世代零相位雙向巴特沃斯高通濾波 (Zero-Phase filtfilt) + VAD 閘控前瞻包絡響度正規化 + -1 dBFS 真實峰值限制器
 
 export const TARGET_SAMPLE_RATE = 16000;
 export const DEFAULT_CHUNK_DURATION_SEC = 300; // 5 分鐘微批次
@@ -151,6 +152,243 @@ function alignMp3SyncHeader(bytes: Uint8Array): ArrayBuffer {
   return copy.buffer as ArrayBuffer;
 }
 
+/**
+ * 【研究報告 5.1 核心】：85 Hz 零相位雙向二階巴特沃斯高通濾波 (Zero-Phase Forward-Backward Butterworth HPF, filtfilt)
+ * 先正向通過一次 85Hz 二階 Biquad 高通濾波器，再反轉陣列反向通過一次，
+ * 達成 -24 dB/octave 陡峭濾除空調與桌面低頻轟鳴，且相位延遲嚴格為 0，完美保護爆破音瞬態與共振峰相位！
+ */
+export function applyZeroPhaseButterworthHighpass(
+  input: Float32Array,
+  sampleRate = TARGET_SAMPLE_RATE,
+  cutoffHz = 85.0
+): Float32Array {
+  const N = input.length;
+  if (N < 16) return new Float32Array(input);
+
+  const w0 = (2.0 * Math.PI * cutoffHz) / sampleRate;
+  const cosW0 = Math.cos(w0);
+  const sinW0 = Math.sin(w0);
+  const alpha = sinW0 / Math.SQRT2; // Q = 1 / sqrt(2) = 0.7071 (Butterworth)
+
+  const a0 = 1.0 + alpha;
+  const b0 = (1.0 + cosW0) * 0.5 / a0;
+  const b1 = -(1.0 + cosW0) / a0;
+  const b2 = (1.0 + cosW0) * 0.5 / a0;
+  const a1 = (-2.0 * cosW0) / a0;
+  const a2 = (1.0 - alpha) / a0;
+
+  const forward = new Float32Array(N);
+
+  // 1. 正向濾波 (Forward Pass)
+  let x1 = input[0];
+  let x2 = input[0];
+  let y1 = 0.0;
+  let y2 = 0.0;
+  for (let i = 0; i < N; i++) {
+    const x0 = input[i];
+    const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    forward[i] = y0;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
+  }
+
+  // 2. 反向濾波 (Backward Pass) 消除所有頻率之相位偏移
+  const out = new Float32Array(N);
+  x1 = forward[N - 1];
+  x2 = forward[N - 1];
+  y1 = 0.0;
+  y2 = 0.0;
+  for (let i = N - 1; i >= 0; i--) {
+    const x0 = forward[i];
+    const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    out[i] = y0;
+    x2 = x1;
+    x1 = x0;
+    y2 = y1;
+    y1 = y0;
+  }
+
+  return out;
+}
+
+/**
+ * 【研究報告 5.1 核心】：VAD 閘控之零相位失真前瞻包絡響度正規化與 -1 dBFS 真實峰值限制器
+ * (VAD-Gated Look-Ahead Envelope Compression & True-Peak Limiter)
+ * - 解決遠端與會者小聲插話 (-38 dBFS) 被 Whisper 當成噪音吞字，同時防止靜音區放大空調底噪引發幻覺跳針。
+ * - 15ms 前瞻視窗 + 雙時間常數 (Attack 5ms / Release 120ms) + 3ms 前瞻 -1.0 dBFS (0.891) 峰值限制器。
+ */
+export function applyVadGatedLookAheadLoudnessNormalization(
+  samples: Float32Array,
+  sampleRate = TARGET_SAMPLE_RATE
+): Float32Array {
+  const N = samples.length;
+  if (N < 1600) return samples;
+
+  // 1. 以 20ms (320 samples) 為一幀計算局部 RMS 包絡與自適應底噪門檻
+  const frameLen = Math.floor(sampleRate * 0.02); // 320 samples (20ms)
+  const numFrames = Math.ceil(N / frameLen);
+  const frameRms = new Float32Array(numFrames);
+  const frameZeroCross = new Float32Array(numFrames);
+
+  for (let f = 0; f < numFrames; f++) {
+    const start = f * frameLen;
+    const end = Math.min(N, start + frameLen);
+    const count = Math.max(1, end - start);
+    let sumSq = 0.0;
+    let zc = 0;
+    for (let i = start; i < end; i++) {
+      const v = samples[i];
+      sumSq += v * v;
+      if (i > start && (samples[i] >= 0) !== (samples[i - 1] >= 0)) {
+        zc++;
+      }
+    }
+    frameRms[f] = Math.sqrt(sumSq / count);
+    frameZeroCross[f] = zc / count;
+  }
+
+  // 估計第 18 百分位數作為會議室空調底噪 (Noise Floor)
+  const sortedRms = Array.from(frameRms).sort((a, b) => a - b);
+  const noiseFloor = Math.max(
+    0.0008,
+    sortedRms[Math.floor(sortedRms.length * 0.18)] || 0.002
+  );
+
+  // 目標語音響度 -18 dBFS (約 RMS = 0.1259)，最大向上補償增益 +12 dB (3.98 倍)
+  const targetRms = 0.1259; // -18 dBFS
+  const maxLinearGain = 3.981; // +12 dB
+  const minSpeechRms = Math.max(0.004, noiseFloor * 2.1); // 約 -45 dBFS 以上且高於底噪 2.1 倍
+  const truePeakCeiling = 0.89125; // -1.0 dBFS
+
+  // 2. 計算每一幀之 VAD 語音機率估計 P_VAD(f) 與目標包絡增益 G_target(f)
+  const targetFrameGain = new Float32Array(numFrames).fill(1.0);
+
+  // 計算每幀之快速自相關諧波週期度 (Voiced Harmonicity)，區分真實人聲母音與翻紙/摩擦/碰撞雜音
+  const frameHarmonicity = new Float32Array(numFrames);
+  const minLag = Math.floor(sampleRate / 320); // 50 samples
+  const maxLag = Math.floor(sampleRate / 80);  // 200 samples
+  for (let f = 0; f < numFrames; f++) {
+    if (frameRms[f] < minSpeechRms * 0.8) continue;
+    const start = f * frameLen;
+    if (start + 400 > N) continue;
+    let maxCorr = 0.0;
+    for (let lag = minLag; lag <= maxLag; lag += 6) {
+      let sum = 0.0;
+      let nA = 0.0;
+      let nB = 0.0;
+      for (let i = 0; i < 200; i += 4) {
+        const a = samples[start + i];
+        const b = samples[start + i + lag];
+        sum += a * b;
+        nA += a * a;
+        nB += b * b;
+      }
+      const c = nA > 1e-8 && nB > 1e-8 ? sum / Math.sqrt(nA * nB) : 0.0;
+      if (c > maxCorr) maxCorr = c;
+    }
+    frameHarmonicity[f] = maxCorr;
+  }
+
+  for (let f = 0; f < numFrames; f++) {
+    // 結合前後 1 幀 (共 60ms) 進行微觀平滑，避免單幀爆破音誤判
+    const prevR = f > 0 ? frameRms[f - 1] : frameRms[f];
+    const nextR = f + 1 < numFrames ? frameRms[f + 1] : frameRms[f];
+    const localRms = Math.max(frameRms[f], 0.5 * (prevR + nextR));
+    const zcr = frameZeroCross[f];
+    const prevH = f > 0 ? frameHarmonicity[f - 1] : frameHarmonicity[f];
+    const nextH = f + 1 < numFrames ? frameHarmonicity[f + 1] : frameHarmonicity[f];
+    const localHarm = Math.max(frameHarmonicity[f], 0.5 * (prevH + nextH));
+
+    // 計算軟性語音機率 P_VAD \in [0, 1]：若缺乏聲帶諧波週期性 (localHarm < 0.45，如紙張摩擦或移動雜音)，強制壓低 P_VAD 禁止放大雜音！
+    const snrRatio = localRms / Math.max(1e-5, noiseFloor);
+    const isAperiodicFriction = (zcr > 0.42 && snrRatio < 3.5) || localHarm < 0.45;
+    const pVad = isAperiodicFriction
+      ? 0.05
+      : 1.0 / (1.0 + Math.exp(-2.2 * (snrRatio - 2.3)));
+
+    if (pVad < 0.35 || localRms < minSpeechRms) {
+      // 非語音靜音區：強制鎖定增益為 0 dB (1.0)，絕對不放大會議室底噪！
+      targetFrameGain[f] = 1.0;
+    } else if (localRms < targetRms) {
+      // 小聲插話區間 (-45 dBFS ~ -18 dBFS)：依壓縮比 2.5:1 計算溫和補償增益
+      const dbCurrent = 20.0 * Math.log10(Math.max(1e-5, localRms));
+      const dbTarget = -18.0;
+      const dbDeficit = Math.max(0.0, dbTarget - dbCurrent);
+      // 壓縮補償：提振 (1 - 1/2.5) = 60% 的響度落差，且受 P_VAD 軟閘控與 +12dB 上限保護
+      const boostDb = Math.min(12.0, dbDeficit * 0.6 * pVad);
+      targetFrameGain[f] = Math.min(
+        maxLinearGain,
+        Math.pow(10.0, boostDb / 20.0)
+      );
+    } else {
+      // 音量已充足 (> -18 dBFS)：維持 1.0 原音動態
+      targetFrameGain[f] = 1.0;
+    }
+  }
+
+  // 3. 15ms 前瞻視窗 (Look-Ahead 1 frame) + 非對稱攻擊/釋放平滑 (Attack 5ms / Release 120ms)
+  const smoothedFrameGain = new Float32Array(numFrames);
+  let currentGain = 1.0;
+  const alphaAttack = 0.65; // 快速反應以保護字頭子音
+  const alphaRelease = 0.14; // 緩慢釋放以保護句尾韻母不產生泵浦效應 (Pumping)
+
+  for (let f = 0; f < numFrames; f++) {
+    // 前瞻 1 幀 (20ms) 預先拉升字首增益
+    const lookAheadGain =
+      f + 1 < numFrames
+        ? Math.max(targetFrameGain[f], targetFrameGain[f + 1])
+        : targetFrameGain[f];
+
+    if (lookAheadGain > currentGain) {
+      currentGain =
+        alphaAttack * lookAheadGain + (1.0 - alphaAttack) * currentGain;
+    } else {
+      currentGain =
+        alphaRelease * lookAheadGain + (1.0 - alphaRelease) * currentGain;
+    }
+    smoothedFrameGain[f] = currentGain;
+  }
+
+  // 4. 逐樣本線性插值套用包絡增益 + 3ms (48 samples) 前瞻 -1.0 dBFS 真實峰值限制器 (True-Peak Limiter)
+  const out = new Float32Array(N);
+  const limiterLookAhead = Math.max(16, Math.floor(sampleRate * 0.003)); // 48 samples (3ms)
+
+  for (let i = 0; i < N; i++) {
+    const fIdx = Math.min(numFrames - 1, Math.floor(i / frameLen));
+    const nextFIdx = Math.min(numFrames - 1, fIdx + 1);
+    const frac = (i - fIdx * frameLen) / frameLen;
+    const interpGain =
+      smoothedFrameGain[fIdx] * (1.0 - frac) +
+      smoothedFrameGain[nextFIdx] * frac;
+    out[i] = samples[i] * interpGain;
+  }
+
+  // 3ms 前瞻防削波軟限幅 (True-Peak Limiter at -1.0 dBFS = 0.89125)
+  let limiterEnv = 1.0;
+  const limRelease = Math.exp(-1.0 / (sampleRate * 0.04)); // 40ms 恢復常數
+
+  for (let i = 0; i < N; i++) {
+    let windowPeak = 0.0;
+    const lookEnd = Math.min(N, i + limiterLookAhead);
+    for (let k = i; k < lookEnd; k += 2) {
+      const absV = Math.abs(out[k]);
+      if (absV > windowPeak) windowPeak = absV;
+    }
+    const neededGain =
+      windowPeak > truePeakCeiling ? truePeakCeiling / windowPeak : 1.0;
+    if (neededGain < limiterEnv) {
+      limiterEnv = neededGain;
+    } else {
+      limiterEnv = limRelease * limiterEnv + (1.0 - limRelease) * neededGain;
+    }
+    out[i] *= limiterEnv;
+  }
+
+  return out;
+}
+
 export async function extractAndPreprocessMacroChunk(
   file: File,
   chunkStartSec: number,
@@ -279,53 +517,68 @@ export async function extractAndPreprocessMacroChunk(
   };
 }
 
+/**
+ * 將 AudioBuffer 轉為 16kHz 單聲道後，依序執行：
+ * 1. 85Hz 零相位雙向巴特沃斯高通濾波 (`filtfilt`)
+ * 2. VAD 閘控前瞻包絡響度正規化與 -1 dBFS 真實峰值限制器
+ */
 async function applyHighpassFilter16k(
   decoded: AudioBuffer
 ): Promise<Float32Array> {
-  const frameCount = Math.max(
-    1,
-    Math.ceil(decoded.duration * TARGET_SAMPLE_RATE)
+  const numChannels = decoded.numberOfChannels;
+  const length = decoded.length;
+  const mono = new Float32Array(length);
+  for (let ch = 0; ch < numChannels; ch++) {
+    const chData = decoded.getChannelData(ch);
+    const invCh = 1.0 / numChannels;
+    for (let i = 0; i < length; i++) {
+      mono[i] += chData[i] * invCh;
+    }
+  }
+
+  let resampled = mono;
+  if (decoded.sampleRate !== TARGET_SAMPLE_RATE) {
+    const frameCount = Math.max(
+      1,
+      Math.ceil(decoded.duration * TARGET_SAMPLE_RATE)
+    );
+    const offlineCtx = new OfflineAudioContext(
+      1,
+      frameCount,
+      TARGET_SAMPLE_RATE
+    );
+    const sourceNode = offlineCtx.createBufferSource();
+    sourceNode.buffer = decoded;
+    sourceNode.connect(offlineCtx.destination);
+    sourceNode.start(0);
+    const rendered = await offlineCtx.startRendering();
+    resampled = new Float32Array(rendered.getChannelData(0));
+  }
+
+  const zeroPhaseFiltered = applyZeroPhaseButterworthHighpass(
+    resampled,
+    TARGET_SAMPLE_RATE,
+    85.0
   );
-  const offlineCtx = new OfflineAudioContext(1, frameCount, TARGET_SAMPLE_RATE);
-  const sourceNode = offlineCtx.createBufferSource();
-  sourceNode.buffer = decoded;
-
-  const highpass = offlineCtx.createBiquadFilter();
-  highpass.type = 'highpass';
-  highpass.frequency.value = 85;
-  highpass.Q.value = 0.707;
-
-  sourceNode.connect(highpass);
-  highpass.connect(offlineCtx.destination);
-  sourceNode.start(0);
-
-  const rendered = await offlineCtx.startRendering();
-  return new Float32Array(rendered.getChannelData(0));
+  return applyVadGatedLookAheadLoudnessNormalization(
+    zeroPhaseFiltered,
+    TARGET_SAMPLE_RATE
+  );
 }
 
 async function applyHighpassFilterOnArray(
   inputSamples: Float32Array,
   sampleRate: number
 ): Promise<Float32Array> {
-  const frameCount = Math.max(1, inputSamples.length);
-  const offlineCtx = new OfflineAudioContext(1, frameCount, sampleRate);
-  const buf = offlineCtx.createBuffer(1, frameCount, sampleRate);
-  buf.getChannelData(0).set(inputSamples);
-
-  const sourceNode = offlineCtx.createBufferSource();
-  sourceNode.buffer = buf;
-
-  const highpass = offlineCtx.createBiquadFilter();
-  highpass.type = 'highpass';
-  highpass.frequency.value = 85;
-  highpass.Q.value = 0.707;
-
-  sourceNode.connect(highpass);
-  highpass.connect(offlineCtx.destination);
-  sourceNode.start(0);
-
-  const rendered = await offlineCtx.startRendering();
-  return new Float32Array(rendered.getChannelData(0));
+  const zeroPhaseFiltered = applyZeroPhaseButterworthHighpass(
+    inputSamples,
+    sampleRate,
+    85.0
+  );
+  return applyVadGatedLookAheadLoudnessNormalization(
+    zeroPhaseFiltered,
+    sampleRate
+  );
 }
 
 /**
@@ -470,11 +723,9 @@ function applyWsolaTimeStretch(
 }
 
 /**
- * 【Issue 2 第 7 步核心：重聽專用無失真聲學正規化與清晰度強化器】
- * 修正重點：
- * 1. 預設停用會造成 Whisper 頻譜相位失真與幻覺的 WSOLA 時間拉伸 (enableTimeStretch = false) 及 50ms 劇烈起伏 AGC。
- * 2. 改用「整段線性峰值正規化 (Utterance-Level Linear Peak Normalization) + 溫和尾音補償 + 2.8kHz 咬字增強 (+3.0dB)」，
- *    確保 Whisper 接收到 100% 相位連續、自然清晰的人聲波形。
+ * 【重聽專用無失真聲學正規化與清晰度強化器】
+ * 預設停用會造成 Whisper 頻譜相位失真與幻覺的 WSOLA 時間拉伸 (enableTimeStretch = false)
+ * 改用「整段線性峰值正規化 (Utterance-Level Linear Peak Normalization) + 溫和尾音補償 + 2.8kHz 咬字增強 (+2.8dB)」
  */
 export function enhanceSubSegmentAudioForRelisten(
   chunkSamples: Float32Array,
@@ -512,7 +763,6 @@ export function enhanceSubSegmentAudioForRelisten(
     };
   }
 
-  // ── 階段 1：整段線性音量正規化與柔和壓限（保持自然語音包絡，不產生呼吸泵浦雜訊） ──
   let peakAbs = 0.0;
   let sumSq = 0.0;
   for (let i = 0; i < raw.length; i++) {
@@ -522,7 +772,6 @@ export function enhanceSubSegmentAudioForRelisten(
   }
   const rms = Math.sqrt(sumSq / raw.length);
 
-  // 若整段偏小聲 (rms < 0.06)，給予一致的線性放大（最高 2.6 倍），維持字與字之間的自然相對動態
   const linearGain =
     peakAbs > 1e-4 ? Math.min(2.6, Math.max(1.0, 0.78 / peakAbs)) : 1.0;
   const hasQuietDropCompensated = linearGain >= 1.45 || rms < 0.045;
@@ -530,10 +779,9 @@ export function enhanceSubSegmentAudioForRelisten(
   const normalizedSamples = new Float32Array(raw.length);
   for (let i = 0; i < raw.length; i++) {
     const v = raw[i] * linearGain;
-    normalizedSamples[i] = Math.max(-0.95, Math.min(0.95, v));
+    normalizedSamples[i] = Math.max(-0.891, Math.min(0.891, v));
   }
 
-  // ── 階段 2：溫和的 2.8kHz 唇齒音清晰度強化 (+2.8dB)，不扭曲母音共振峰 ──
   const formantEnhanced = applyPresenceBoostBiquad(
     normalizedSamples,
     TARGET_SAMPLE_RATE,
@@ -542,7 +790,6 @@ export function enhanceSubSegmentAudioForRelisten(
     1.0
   );
 
-  // 預設不啟用 WSOLA 變速，確保 Whisper 聲學特徵 100% 原汁原味
   const shouldStretch = options?.enableTimeStretch === true;
   const requestedRatio = shouldStretch ? options?.stretchRatio ?? 1.12 : 1.0;
 

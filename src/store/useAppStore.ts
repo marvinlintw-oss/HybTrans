@@ -1,4 +1,8 @@
 // src/store/useAppStore.ts
+// 升級與根因修正重點：
+// 1. [解決句子順序錯位與跨語者黏合]：在 smartConsolidateSegments 中嚴格檢查兩段落之間是否夾有其他語者的插話，且將合併間隙收緊至 <= 0.55 秒 (原本 2.8 秒會把前後不同輪次的發言跨越插話強行合併為一大段！)。
+// 2. [解決 localStorage 舊快取強制開啟「專屬音軌轉寫」問題]：將 Zustand persist 儲存鍵升級為 'hybrid-transcriber-storage-v7' 並加入自動遷移 (merge)，強制預設關閉 enableVirtualSpeakerTrackStitching，直接走 12~20s 靜音谷底視窗 + 字級 Viterbi 對齊！
+
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import {
@@ -23,9 +27,6 @@ import { TIER_PRESET_SPECS } from '../services/modelCacheManager';
 import { DEFAULT_PUBLIC_DICTIONARY, mergeDictLists } from '../utils/dictIO';
 import { toTaiwanFuzzyPhoneticSyllables } from '../utils/phoneticMatcher';
 
-/**
- * 【問題五 5.2 核心演算法】：不可變 Token 圖譜之雙向音韻-字面重疊自動消融與無縫替換演算法
- */
 export function applySeamlessSpanReplacement(
   utterance: UtteranceNode,
   targetSpanId: string,
@@ -53,7 +54,8 @@ export function applySeamlessSpanReplacement(
 
   const candChars = Array.from(candidate.text);
   const candPinyins =
-    candidate.pinyinSequence && candidate.pinyinSequence.length === candChars.length
+    candidate.pinyinSequence &&
+    candidate.pinyinSequence.length === candChars.length
       ? candidate.pinyinSequence
       : toTaiwanFuzzyPhoneticSyllables(candidate.text);
   const M = candChars.length;
@@ -63,7 +65,9 @@ export function applySeamlessSpanReplacement(
     char: string,
     pinyin: string
   ): boolean => {
-    return tok.char === char || (tok.pinyinKey !== '' && tok.pinyinKey === pinyin);
+    return (
+      tok.char === char || (tok.pinyinKey !== '' && tok.pinyinKey === pinyin)
+    );
   };
 
   let bestKL = 0;
@@ -197,9 +201,6 @@ export function applySeamlessSpanReplacement(
   };
 }
 
-/**
- * 將雙向音韻-字面重疊自動消融演算法直接套用於 Segment.words (WordSpan[])！
- */
 export function applySeamlessWordSpanReplacement(
   words: WordSpan[],
   startWordIdx: number,
@@ -387,7 +388,10 @@ export function applySeamlessWordSpanReplacement(
     originalText: preservedOriginal,
     start: newStartSec,
     end: newEndSec,
-    confidence: options?.status === 'auto_corrected' ? 0.96 : targetAnchorWord.confidence,
+    confidence:
+      options?.status === 'auto_corrected'
+        ? 0.96
+        : targetAnchorWord.confidence,
     status: options?.status ?? 'normal',
     reason: options?.reason ?? targetAnchorWord.reason,
     candidates: options?.candidates ?? targetAnchorWord.candidates,
@@ -411,7 +415,9 @@ export function applySeamlessWordSpanReplacement(
 }
 
 /**
- * 依原始會議絕對時間軸排序並安全合併同語者連續段落。
+ * 【根因修正 10】：依原始會議絕對時間軸排序並安全合併同語者緊鄰碎片。
+ * 1. 若兩段同語者發言中間存在任何其他語者之插話或重疊，絕對禁止跨越插話合併！
+ * 2. 將允許合併的最大停頓由 2.8s 收緊為 0.55s，確保不同句的對話保持獨立時間戳記與正確順序！
  */
 function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
   if (allSegments.length <= 1) return allSegments;
@@ -421,10 +427,14 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
       ...s,
       words: [...s.words],
     }))
-    .sort((a, b) => a.start - b.start || a.end - b.end);
+    .sort((a, b) => {
+      if (Math.abs(a.start - b.start) > 0.08) return a.start - b.start;
+      return a.end - b.end;
+    });
 
   const merged: Segment[] = [];
-  for (const seg of sorted) {
+  for (let i = 0; i < sorted.length; i++) {
+    const seg = sorted[i];
     if (seg.words.length === 0) continue;
     const prev = merged[merged.length - 1];
     const prevChars = prev
@@ -432,13 +442,31 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
       : 0;
     const currChars = seg.words.reduce((acc, w) => acc + w.text.length, 0);
 
+    // 檢查 prev 與 seg 之間是否有其他語者發言介入
+    let hasInterveningOtherSpeaker = false;
+    if (prev && prev.speakerId === seg.speakerId) {
+      for (let j = 0; j < sorted.length; j++) {
+        const other = sorted[j];
+        if (other.id === prev.id || other.id === seg.id) continue;
+        if (
+          other.speakerId !== prev.speakerId &&
+          other.end > prev.start + 0.05 &&
+          other.start < seg.end - 0.05
+        ) {
+          hasInterveningOtherSpeaker = true;
+          break;
+        }
+      }
+    }
+
     if (
       prev &&
+      !hasInterveningOtherSpeaker &&
       prev.chunkIndex === seg.chunkIndex &&
       prev.speakerId === seg.speakerId &&
-      seg.start >= prev.end - 0.15 &&
-      seg.start - prev.end <= 2.8 &&
-      prevChars + currChars <= 260
+      seg.start >= prev.end - 0.12 &&
+      seg.start - prev.end <= 0.55 &&
+      prevChars + currChars <= 160
     ) {
       const prevWords = [...prev.words];
       if (prevWords.length > 0) {
@@ -472,7 +500,7 @@ const DEFAULT_DIARIZATION_CONFIG: DiarizationConfig = {
   localWasmBasePath: './wasm/',
   localModelBasePath: './models/',
   yieldEveryNUnits: 14,
-  enableGlobalMeanCentering: true,
+  enableGlobalMeanCentering: false,
   languageHint: 'zh',
   shortTurnConfidenceKeepThreshold: 0.66,
   pingPongMaxDurSec: 1.6,
@@ -481,6 +509,7 @@ const DEFAULT_DIARIZATION_CONFIG: DiarizationConfig = {
   backchannelMarginThreshold: 0.12,
   enableAcousticDivergencePreproc: true,
   enableVirtualSpeakerTrackStitching: false,
+  embeddingExcludeOverlap: true,
 };
 
 interface AppState {
@@ -612,7 +641,7 @@ export const useAppStore = create<AppState>()(
               }
             : {
                 engineMode: 'mode_c_onnx_neural',
-                clusterMethod: 'spectral_cosine',
+                clusterMethod: 'ahc_cosine',
                 yieldEveryNUnits: 24,
                 scdPeakThreshold: 0.19,
                 backchannelMarginThreshold: 0.1,
@@ -735,7 +764,6 @@ export const useAppStore = create<AppState>()(
               continue;
             }
 
-            // 處理 LG-TPST 語者轉移或段內 split_before_anchor 拆句
             const speakerPatch = segPatches?.find(
               (p) =>
                 Boolean(p.newSpeakerId) && p.newSpeakerId !== seg.speakerId
@@ -800,7 +828,6 @@ export const useAppStore = create<AppState>()(
             const nextSpeakerId = speakerPatch?.newSpeakerId || seg.speakerId;
             let currentWords = [...seg.words];
 
-            // 依詞索引由後往前套用免索引槽位替換（確保多詞槽位消融不影響前方索引）
             const wordPatches = (segPatches || [])
               .filter((p) => p.wordIndex >= 0 && !p.newSpeakerId)
               .sort((a, b) => b.wordIndex - a.wordIndex);
@@ -882,7 +909,6 @@ export const useAppStore = create<AppState>()(
                 ? newText
                 : targetW.originalText || targetW.text;
 
-            // 調用問題五 5.2 之雙向音韻-字面重疊自動消融演算法！
             const newWords = applySeamlessWordSpanReplacement(
               seg.words,
               wordIndex,
@@ -1008,7 +1034,7 @@ export const useAppStore = create<AppState>()(
       setCurrentTime: (sec: number) => set({ currentTime: sec }),
     }),
     {
-      name: 'hybrid-transcriber-storage-v6',
+      name: 'hybrid-transcriber-storage-v7',
       partialize: (state) => ({
         config: state.config,
         dictionary: mergeDictLists(
@@ -1016,6 +1042,23 @@ export const useAppStore = create<AppState>()(
           state.dictionary.filter((d) => d.scope !== 'session')
         ),
       }),
+      merge: (persistedState, currentState) => {
+        const p = (persistedState || {}) as Partial<AppState>;
+        return {
+          ...currentState,
+          ...p,
+          config: {
+            ...currentState.config,
+            ...(p.config || {}),
+            diarizationConfig: {
+              ...DEFAULT_DIARIZATION_CONFIG,
+              ...(p.config?.diarizationConfig || {}),
+              // 強制預設關閉舊版會造成句子順序錯位的 Virtual Speaker-Track Stitching
+              enableVirtualSpeakerTrackStitching: false,
+            },
+          },
+        };
+      },
     }
   )
 );

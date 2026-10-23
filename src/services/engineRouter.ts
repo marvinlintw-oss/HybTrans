@@ -1,6 +1,9 @@
 // src/services/engineRouter.ts
+// 次世代多階段 AI 語意推敲、ISIAL 免索引槽位協定、三級聲學信心度閘控 (Tier 1~3) 與四重防退化重聽驗收閘門
+
 import * as OpenCC from 'opencc-js';
 import {
+  AcousticSlotTier,
   CorrectionPatchItem,
   DictEntry,
   EngineConfig,
@@ -40,6 +43,12 @@ export const UNIVERSAL_COLLOQUIAL_RULES: Array<{
     reason: 'Pass 0 口語異常連續疊字消除',
   },
   {
+    pattern: /([\u4e00-\u9fa5]{1,6})(?:[，。？！、；：,.?!\s]+\1){2,}/g,
+    wrongDesc: '跨標點異常跳針重複詞句',
+    right: '$1',
+    reason: 'Pass 0 跨標點重複跳針消除',
+  },
+  {
     pattern: /([\u4e00-\u9fa5]{2,4})(?:[，、\s]*\1)+/g,
     wrongDesc: '雙字以上異常跳針重複',
     right: '$1',
@@ -76,10 +85,6 @@ export function toAccentInsensitivePhoneticKey(text: string): string {
   return toTaiwanFuzzyPhoneticSyllables(text).join('-');
 }
 
-/**
- * 【問題一 1.1 第二維度】：高頻語法虛詞與指代詞集合 \mathcal{F}_{gram}
- * 在計算孤立單字鏈懲罰 L_{eff} 時賦予低孤立權重 0.15，避免把正常口語虛詞誤判為碎字鏈
- */
 const GRAMMATICAL_FUNCTION_CHARS = new Set(
   '的地得了著過在從跟和與及或把被對為以比連越再又也還都只就才剛正曾已經常會能可要得著過個位名次件種些點處裡上中下內外前後左右這那哪誰什怎幾多少一二三四五六七八九十百千萬億零我你他她它人嗎呢吧啊喔啦哦欸恩嗯唔哈嘿是就有但而卻讓給向往到不沒很太更別好對算'.split(
     ''
@@ -90,22 +95,40 @@ const QUESTION_CLAUSE_REGEX =
   /([？?]|怎麼辦|對不對|是不是|好不好|可以嗎|是嗎|對嗎|有沒有|算不算|對吧|嗎[。？?]?|呢[。？?]?|か[。？?]?|でしょうか[。？?]?|ますか[。？?]?|ですか[。？?]?)$/i;
 
 const DIRECT_SHORT_ANSWER_REGEX =
-  /^(不算[。，]?|算[。，]?|對[，。啊呀]?|對對對[，。]?|沒錯[，。]?|可以[，。啊]?|沒有[，。啊]?|不用[，。]?|不用不用[，。]?|好[，。的啊]?|是[，。啊的]?|不是[，。啊]?|不行[，。]?|有[，。啊]?|はい|ええ|うん|いいえ|なるほど|そうですね|yeah|yes|no|nope|right|sure|okay|ok)([，。！？!?,.\s]|$)/i;
+  /^(不算[。，啦]?|算[。，]?|對[，。啊呀]?|對對對[，。]?|沒錯[，。]?|可以[，。啊]?|沒有[，。啊]?|不用[，。]?|不用不用[，。]?|好[，。的啊]?|是[，。啊的]?|不是[，。啊]?|不行[，。]?|有[，。啊]?|はい|ええ|うん|いいえ|なるほど|そうですね|yeah|yes|no|nope|right|sure|okay|ok)([，。！？!?,.\s]|$)/i;
 
 const RHETORICAL_SELF_ANSWER_BRIDGE_REGEX =
   /^(因為|主要是|其實|也就是說|意思是|換句話說|白話講|我意思是|比如說|比方說)/;
 
+/**
+ * 【研究報告第 6.3 節】：判定 Segment 之三級聲學信心度閘控等級 (Tier 1 ~ Tier 3)
+ * - Tier 1 (`tier1_locked_anchor`): \Delta L > 1.8 且 \bar{\Omega} < 0.15（唯讀鎖定語者標籤）
+ * - Tier 2 (`tier2_candidate_constrained`): 0.45 <= \Delta L <= 1.8 且 \bar{\Omega} < 0.25（Top-2 候選限制）
+ * - Tier 3 (`tier3_overlap_split`): \Delta L < 0.45 或 \bar{\Omega} >= 0.25（雙人重疊搶話拆解槽位）
+ */
+export function resolveSegmentSlotTier(seg: Segment): AcousticSlotTier {
+  if (seg.slotTier) return seg.slotTier;
+  const dur = seg.end - seg.start;
+  const logOdds =
+    seg.logOddsMargin ??
+    ((seg.acousticMargin ?? 0.18) >= 0.16 ? 2.0 : 1.0);
+  const overlap = seg.overlapRatio ?? 0.05;
+
+  if (overlap >= 0.25 || logOdds < 0.45) {
+    return 'tier3_overlap_split';
+  }
+  if (logOdds > 1.8 && overlap < 0.15 && dur >= 1.0) {
+    return 'tier1_locked_anchor';
+  }
+  return 'tier2_candidate_constrained';
+}
+
 export interface SentenceIntelligibilityReport {
   segmentId: string;
-  /** 句子內在語意可理解度分數 I(S) \in [0.0, 1.0] (門檻 \tau_{intel} = 0.68) */
   intelligibilityScore: number;
-  /** 有效孤立單字鏈最大長度 L_{eff} */
   maxEffectiveOrphanLen: number;
-  /** 有效音節密度 \rho_{syll} (字/秒) */
   syllableDensityPerSec: number;
-  /** 最大音韻主題引力張力 G_{phon} */
   maxPhoneticGravityTension: number;
-  /** 偵測到之異常懷疑區段 */
   anomalousSpans: Array<{
     text: string;
     startCharIdx: number;
@@ -118,7 +141,6 @@ export interface SentenceIntelligibilityReport {
       | 'collocation_surprisal'
       | 'contraction_split';
   }>;
-  /** 智慧重聽決策器：僅在物理有效音節密度嚴重不足 (\rho_{syll} < 2.0) 或無近音候選之嚴重缺損時為 true */
   requireAmplifiedRelisten: boolean;
 }
 
@@ -126,19 +148,12 @@ export interface StatisticalTermEvidence {
   term: string;
   exactSig: string;
   fuzzySig: string;
-  /** 基礎統計證據質量 E(w) */
   evidenceScore: number;
-  /** 作為 3~6 字更長複合詞之子詞幹的種類數 (Compound Witness Productivity，如「業師群」見證「業師」) */
   compoundProductivity: number;
-  /** 【問題三 Pass 1】：實體主權分數 \mathcal{S}_{sov}(w)，結合複合詞見證、主題共鳴度與字典先驗 */
   sovereigntyScore: number;
-  /** 是否來自字典或背景簡報摘要 */
   isPriorVerified: boolean;
 }
 
-/**
- * 【問題三 Pass 1 核心：統計構詞包絡、字典誤聽防污染與實體主權分數 \mathcal{S}_{sov}(w) 探勘引擎】
- */
 export function analyzeCorpusStatisticalEvidence(
   allSegments: Segment[],
   dictionary: DictEntry[],
@@ -146,8 +161,6 @@ export function analyzeCorpusStatisticalEvidence(
 ): Map<string, StatisticalTermEvidence> {
   const evidenceMap = new Map<string, StatisticalTermEvidence>();
 
-  // 【關鍵防污染機制】：收集三層字典中已明確定義為「常見誤聽別名 (aliases)」的所有詞（例如：夜市、業室、商業室、郎貸、證件）
-  // 嚴禁這些誤聽別名因為 Whisper 重複聽錯多次而反客為主進入高頻核心詞庫！
   const aliasToCanonicalMap = new Map<string, string>();
   for (const d of dictionary) {
     const cleanTarget = converter(d.term.trim());
@@ -253,8 +266,6 @@ export function analyzeCorpusStatisticalEvidence(
     }
   }
 
-  // 【問題三 Pass 1 核心】：三字以上高凝聚度複合詞見證 (Compound Witness，例如「業師群」見證「業師」)
-  // 與實體主權分數 \mathcal{S}_{sov}(w) 計算
   const allCandidates = Array.from(evidenceMap.values());
   for (const cand of allCandidates) {
     const term = cand.term;
@@ -298,14 +309,6 @@ export function analyzeCorpusStatisticalEvidence(
   return evidenceMap;
 }
 
-/**
- * 【問題一 1.1 & 1.2 核心：ISIAL 四維正交語意可理解性與懷疑區段定位器】
- * 四維特徵：
- * 1. 內部構詞凝聚度 (NPMI Cohesion)
- * 2. 扣除語法虛詞之有效孤立單字鏈懲罰 (Weighted Orphan Character Chain Penalty L_{eff})
- * 3. 跨虛詞之實詞局部搭配驚訝度 (Collocational Surprisal)
- * 4. 音韻突變度與全場主題引力張力 (Phonetic-Topic Gravity Tension G_{phon}，支援連音縮讀比對)
- */
 export function evaluateSentenceIntelligibility(
   seg: Segment,
   evidenceMap: Map<string, StatisticalTermEvidence>,
@@ -349,7 +352,6 @@ export function evaluateSentenceIntelligibility(
     }
   }
 
-  // 【三源混淆集候選網格 (Confusion Set Lattice) 檢索器】
   const retrieveConfusionLatticeAndGravity = (
     sub: string
   ): { candidates: string[]; gravityTension: number } => {
@@ -414,7 +416,6 @@ export function evaluateSentenceIntelligibility(
     return { candidates: uniqueTerms, gravityTension: maxTension };
   };
 
-  // ── 維度 2：扣除語法虛詞之有效孤立單字鏈懲罰 L_{eff} ──
   let maxEffectiveOrphanLen = 0.0;
   let currentOrphanEffLen = 0.0;
   let orphanRunText = '';
@@ -484,7 +485,6 @@ export function evaluateSentenceIntelligibility(
     });
   }
 
-  // ── 維度 1、3、4：掃描 2~4 字子字串之構詞凝聚度、跨音節連音縮讀與音韻引力張力 G_{phon} ──
   let maxPhoneticGravityTension = 0.0;
 
   for (let len = 4; len >= 2; len--) {
@@ -542,7 +542,44 @@ export function evaluateSentenceIntelligibility(
     }
   }
 
-  // 形態學膨脹 (Morphological Dilation)：若兩個異常區段距離 <= 1 字（如「郎貸」與「證件」），合併為單一複合槽位
+  // ── 維度 3：局部語法與連詞搭配驚訝度偵測 (Collocational & Syntactic Surprisal) ──
+  // 當句首或子句內出現「非代名詞之雙字實詞/修飾語 + 無標點直接碰撞假設/轉折連詞 (如：神秘如果...)」時，
+  // 代表該處極可能缺漏感嘆號/逗號 (如「神秘！如果」) 或發生同音誤聽 (如「神秘禮物」)，自動圈選為槽位交由 AI 結合前文脈絡修正！
+  const NON_MODIFIER_PREFIX_SET = new Set([
+    '我們', '你們', '他們', '這個', '那個', '這樣', '那樣',
+    '因為', '所以', '但是', '可是', '不過', '其實', '當然',
+    '比如', '或者', '還是', '而且', '然後', '那邊', '這邊',
+    '現在', '後來', '大家', '覺得', '知道', '希望', '建議',
+  ]);
+  const collocationRegex = /([\u4e00-\u9fa5]{2})(如果|要是|假如|雖然|但是|可是)(?=[\u4e00-\u9fa5]{2,})/g;
+  let colMatch: RegExpExecArray | null;
+  while ((colMatch = collocationRegex.exec(fullText)) !== null) {
+    const modWord = colMatch[1];
+    const conjWord = colMatch[2];
+    const spanStart = colMatch.index;
+    const spanEnd = spanStart + modWord.length + conjWord.length;
+    if (
+      !NON_MODIFIER_PREFIX_SET.has(modWord) &&
+      !BAD_GRAMMATICAL_EDGE_REGEX.test(modWord) &&
+      !anomalousSpans.some(
+        (a) => spanStart < a.endCharIdx && spanEnd > a.startCharIdx
+      )
+    ) {
+      const punctCands = [`${modWord}！${conjWord}`, `${modWord}，${conjWord}`];
+      const { candidates: phonCands } = retrieveConfusionLatticeAndGravity(
+        `${modWord}${conjWord}`
+      );
+      anomalousSpans.push({
+        text: `${modWord}${conjWord}`,
+        startCharIdx: spanStart,
+        endCharIdx: spanEnd,
+        phoneticHypotheses: Array.from(new Set([...phonCands, ...punctCands])).slice(0, 4),
+        anomalyScore: 0.76,
+        anomalyType: 'collocation_surprisal',
+      });
+    }
+  }
+
   anomalousSpans.sort((a, b) => a.startCharIdx - b.startCharIdx);
   const dilatedSpans: typeof anomalousSpans = [];
   for (const sp of anomalousSpans) {
@@ -571,7 +608,6 @@ export function evaluateSentenceIntelligibility(
     }
   }
 
-  // ── 計算句子內在語意可理解度分數 I(S) = 1 - (\alpha \bar{A}(S) + \beta \max A(c_t)) ──
   const avgWordConf =
     seg.words.reduce((acc, w) => acc + w.confidence, 0) /
     Math.max(1, seg.words.length);
@@ -593,8 +629,6 @@ export function evaluateSentenceIntelligibility(
 
   const combinedPenalty = 0.35 * meanAnomaly + 0.65 * maxSpanAnomaly;
 
-  // 【問題四：智慧重聽決策器】
-  // 嚴格限制僅在「有效音節密度嚴重不足 (\rho_{syll} < 2.0 字/秒)」或「短促殘缺且無明確同音候選可由文字修補」時才觸發重聽！
   const hasPhysicalSyllableDeficit =
     (durSec >= 2.2 && syllableDensityPerSec < 2.0) ||
     (durSec <= 1.5 && cleanChars.length <= 2 && avgWordConf < 0.8) ||
@@ -626,14 +660,6 @@ export function evaluateSentenceIntelligibility(
   };
 }
 
-/**
- * 【問題四：四重硬性防退化驗收閘門 (Non-Regression Acceptance Gate)】
- * 任何重聽結果或整句改寫必須同時通過以下 4 項指標才准許覆蓋原句：
- * 1. 標點破碎度 F_{frag}：句中異常句號/問號切割數不得增加（防範「我覺得阿如果。算，我」劣化）
- * 2. 字數合理比 \eta_{len} \in [0.78, 1.45]
- * 3. 音韻保真度 Sim_{phon} = 1 - d_{phon}(S_{orig}, S_{new}) >= 0.58
- * 4. 可理解度淨增量 \Delta U = 100 * (I(S_{new}) - I(S_{orig})) >= 3.5 (即 \Delta I(S) >= 0.035)
- */
 export function verifyNonRegressionAcceptanceGate(params: {
   origSegment: Segment;
   candidateSegment: Segment;
@@ -686,7 +712,6 @@ export function verifyNonRegressionAcceptanceGate(params: {
     rollingSummary
   );
 
-  // 1. 標點破碎度檢查 F_{frag}
   const origMidPeriodCount = (origText.slice(0, -1).match(/[。？！]/g) || [])
     .length;
   const newMidPeriodCount = (newText.slice(0, -1).match(/[。？！]/g) || [])
@@ -694,19 +719,16 @@ export function verifyNonRegressionAcceptanceGate(params: {
   const hasBrokenFragmentation =
     newMidPeriodCount > origMidPeriodCount && newClean.length < 24;
 
-  // 2. 字數合理比 \eta_{len}
   const lengthRatio = newClean.length / Math.max(1, origClean.length);
   const isLengthReasonable =
     newClean.length >= Math.max(2, Math.floor(origClean.length * 0.78)) &&
     newClean.length <= Math.ceil(origClean.length * 1.45) + 6;
 
-  // 3. 音韻保真度 Sim_{phon}
   const phoneticDistance = computeTaiwanPhoneticDistance(origClean, newClean);
   const phoneticSimilarity = Number((1.0 - phoneticDistance).toFixed(3));
   const isPhoneticFaithful =
     phoneticSimilarity >= 0.58 || origIntel.syllableDensityPerSec < 2.0;
 
-  // 4. 可理解度淨增量 \Delta U >= 3.5 (對應 \Delta I(S) >= 0.035)
   const deltaU = Number(
     ((newIntel.intelligibilityScore - origIntel.intelligibilityScore) * 100).toFixed(
       2
@@ -729,8 +751,10 @@ export function verifyNonRegressionAcceptanceGate(params: {
 }
 
 /**
- * 【問題二 2.3 核心】：為目標視窗段落建構免 wordIndex 之「內嵌混淆槽位標籤」
- * 將懷疑區段替換為 ⟪#S1: 原詞 | 候選: 候選1, 候選2⟫ 並建立 SlotMap
+ * 【研究報告第 6.3 節核心升級】：為目標視窗段落建構免 wordIndex 之「內嵌混淆槽位標籤」與「三級聲學信心度閘控標籤」
+ * - Tier 1 (`tier1_locked_anchor`): `[LOCKED | speaker=SPK_A]` -> 唯讀鎖定語者標籤，LLM 嚴禁修改語者 ID
+ * - Tier 2 (`tier2_candidate_constrained`): `[REVIEW | Candidates: SPK_A, SPK_B]` -> 二選一受限候選集
+ * - Tier 3 (`tier3_overlap_split`): `[OVERLAP | SPK_A + SPK_B]` -> 允許在語意斷點處拆分為兩個獨立語者槽位
  */
 export function buildSlottedPromptAndMap(
   targetSegments: Segment[],
@@ -747,14 +771,17 @@ export function buildSlottedPromptAndMap(
   const lines: string[] = [];
 
   for (const seg of targetSegments) {
-    const dur = seg.end - seg.start;
-    const margin = seg.acousticMargin ?? 0.18;
-    const isLocked = margin >= 0.16 && dur >= 1.2;
-    const gateTag = isLocked
-      ? `[LOCKED | speaker=${seg.speakerId}]`
-      : `[REVIEW | top1=${seg.speakerId}, top2=${
-          seg.runnerUpSpeakerId || seg.speakerId
-        }, margin=${margin.toFixed(2)}]`;
+    const tier = resolveSegmentSlotTier(seg);
+    const runnerUp = seg.runnerUpSpeakerId || seg.speakerId;
+    const logOdds = (seg.logOddsMargin ?? 1.2).toFixed(2);
+    const overlap = (seg.overlapRatio ?? 0.05).toFixed(2);
+
+    const gateTag =
+      tier === 'tier1_locked_anchor'
+        ? `[LOCKED | speaker=${seg.speakerId}, logOdds=${logOdds}]`
+        : tier === 'tier3_overlap_split'
+        ? `[OVERLAP | top1=${seg.speakerId}, top2=${runnerUp}, overlap=${overlap}]`
+        : `[REVIEW | top1=${seg.speakerId}, top2=${runnerUp}, logOdds=${logOdds}]`;
 
     const intel = evaluateSentenceIntelligibility(
       seg,
@@ -861,7 +888,7 @@ export function buildSlottedPromptAndMap(
 }
 
 /**
- * 【問題三 LG-TPST：偵測不合理「自問自答」並自動拆句移轉給前、後語者】
+ * 【LG-TPST + Tier 3 重疊拆解】：偵測不合理「自問自答」與「句尾附和插話重疊」並自動拆句移轉給候選語者
  */
 export function resolveUnreasonableSelfQAAndTransferSpeaker(
   segments: Segment[],
@@ -889,17 +916,19 @@ export function resolveUnreasonableSelfQAAndTransferSpeaker(
     runnerUpSpk?: string,
     neighborSpk?: string
   ): string => {
-    if (neighborSpk && neighborSpk !== currentSpk) return neighborSpk;
     if (runnerUpSpk && runnerUpSpk !== currentSpk) return runnerUpSpk;
+    if (neighborSpk && neighborSpk !== currentSpk) return neighborSpk;
     const alt = allSpeakerIds.find((id) => id !== currentSpk);
     return alt || currentSpk;
   };
 
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i];
+    const tier = resolveSegmentSlotTier(seg);
     const prevSeg = expanded.length > 0 ? expanded[expanded.length - 1] : null;
     const nextSeg = i + 1 < segments.length ? segments[i + 1] : null;
 
+    // 1. 檢查段內問答對 (QA_SPEAKER_CHANGE)
     const qWordIdx = seg.words.findIndex((w) => /[？?]/.test(w.text));
 
     if (qWordIdx >= 0 && qWordIdx < seg.words.length - 1) {
@@ -939,13 +968,14 @@ export function resolveUnreasonableSelfQAAndTransferSpeaker(
             id: answerSegId,
             speakerId: targetAnswerSpeaker,
             runnerUpSpeakerId: seg.speakerId,
+            slotTier: 'tier2_candidate_constrained',
             start: splitTime,
             end: Math.max(splitTime + 0.25, seg.end),
             words: afterWords.map((w, idx) => ({
               ...w,
               id: `${answerSegId}_w_${idx}`,
               status: 'auto_corrected' as const,
-              reason: `LG-TPST 消除段內自問自答，將回答移轉至互動語者 (${targetAnswerSpeaker})`,
+              reason: `LG-TPST 消除段內自問自答，將回答移轉至競爭候選語者 (${targetAnswerSpeaker})`,
             })),
             isCorrected: true,
           };
@@ -978,6 +1008,7 @@ export function resolveUnreasonableSelfQAAndTransferSpeaker(
             id: qSegId,
             speakerId: questionOwner,
             runnerUpSpeakerId: seg.speakerId,
+            slotTier: 'tier2_candidate_constrained',
             start: seg.start,
             end: splitTime,
             words: beforeWords.map((w, idx) => ({
@@ -1001,13 +1032,76 @@ export function resolveUnreasonableSelfQAAndTransferSpeaker(
       }
     }
 
+    // 2. 針對 Tier 3 重疊搶話槽位 (`tier3_overlap_split`)：若長句尾端粘連了短促附和詞（如「...下週上線。對沒錯。」），自動拆出附和槽位
+    if (tier === 'tier3_overlap_split' && seg.words.length >= 4) {
+      let splitWIdx = -1;
+      for (let w = seg.words.length - 2; w >= 1; w--) {
+        if (/[。！？?!]$/.test(seg.words[w].text)) {
+          const tailText = seg.words
+            .slice(w + 1)
+            .map((item) => item.text)
+            .join('')
+            .trim();
+          if (DIRECT_SHORT_ANSWER_REGEX.test(tailText) && tailText.length <= 6) {
+            splitWIdx = w + 1;
+            break;
+          }
+        }
+      }
+
+      if (splitWIdx > 0) {
+        const mainWords = seg.words.slice(0, splitWIdx);
+        const bcWords = seg.words.slice(splitWIdx);
+        const bcSpeaker = findInterlocutorSpeakerId(
+          seg.speakerId,
+          seg.runnerUpSpeakerId,
+          nextSeg?.speakerId
+        );
+        if (bcSpeaker !== seg.speakerId) {
+          const splitTime = Number(
+            mainWords[mainWords.length - 1].end.toFixed(2)
+          );
+          const bcSegId = `${seg.id}_ov_bc`;
+          expanded.push(
+            {
+              ...seg,
+              end: splitTime,
+              words: mainWords,
+            },
+            {
+              ...seg,
+              id: bcSegId,
+              speakerId: bcSpeaker,
+              runnerUpSpeakerId: seg.speakerId,
+              slotTier: 'tier2_candidate_constrained',
+              start: splitTime,
+              end: Math.max(splitTime + 0.22, seg.end),
+              words: bcWords.map((w, idx) => ({
+                ...w,
+                id: `${bcSegId}_w_${idx}`,
+                status: 'auto_corrected' as const,
+                reason: `Tier 3 重疊搶話拆解：將尾端附和句拆分至重疊語者 (${bcSpeaker})`,
+              })),
+              isCorrected: true,
+            }
+          );
+          transferredSegmentIds.push(bcSegId);
+          continue;
+        }
+      }
+    }
+
     expanded.push(seg);
   }
 
+  // 3. 跨段問答對檢查（嚴格遵守 Tier 1 唯讀鎖定、Tier 2 Top-2 候選限制）
   for (let i = 1; i < expanded.length; i++) {
     const prev = expanded[i - 1];
     const curr = expanded[i];
     if (prev.speakerId !== curr.speakerId) continue;
+
+    const currTier = resolveSegmentSlotTier(curr);
+    if (currTier === 'tier1_locked_anchor') continue;
 
     const prevText = prev.words.map((w) => w.text).join('').trim();
     const currText = curr.words.map((w) => w.text).join('').trim();
@@ -1035,7 +1129,7 @@ export function resolveUnreasonableSelfQAAndTransferSpeaker(
           curr.words[0] = {
             ...curr.words[0],
             status: 'auto_corrected',
-            reason: `LG-TPST 消除跨段自問自答衝突，移轉至應答語者 (${targetSpk})`,
+            reason: `LG-TPST 消除跨段自問自答衝突，移轉至 Top-2 候選應答語者 (${targetSpk})`,
           };
         }
         transferredSegmentIds.push(curr.id);
@@ -1219,7 +1313,6 @@ export function buildTriLevelContextPayload(
     }
   }
 
-  // 建立免索引槽位映射與內嵌槽位標籤文本
   const { suspectSlots, slottedPromptTranscript } = buildSlottedPromptAndMap(
     targetWindowSegments,
     evidenceMap,
@@ -1242,9 +1335,6 @@ export function buildTriLevelContextPayload(
   };
 }
 
-/**
- * 【Pass 0 + Pass 1 整合】：即時確定性清理 + 跨句實體主權分數 \mathcal{S}_{sov}(w) 音韻自舉收斂 + ISIAL 懷疑區段標記
- */
 export function applySentenceLevelLocalCorrection(
   targetSegments: Segment[],
   verifiedTerms: string[],
@@ -1296,7 +1386,6 @@ export function applySentenceLevelLocalCorrection(
     }
   }
 
-  // Pass 1：依據實體主權分數 \mathcal{S}_{sov}(w) 建立「精確聲韻主導表」與「台式模糊音韻主導表」
   const exactDominantMap = new Map<string, StatisticalTermEvidence>();
   const fuzzyDominantMap = new Map<string, StatisticalTermEvidence>();
 
@@ -1308,7 +1397,6 @@ export function applySentenceLevelLocalCorrection(
       exactDominantMap.set(item.exactSig, item);
     }
 
-    // 模糊音韻主導錨點必須具備字典先驗或三字以上複合詞見證 (compoundProductivity >= 2)
     if (item.isPriorVerified || item.compoundProductivity >= 2) {
       const prevFuzzy = fuzzyDominantMap.get(item.fuzzySig);
       if (!prevFuzzy || item.sovereigntyScore > prevFuzzy.sovereigntyScore) {
@@ -1359,14 +1447,12 @@ export function applySentenceLevelLocalCorrection(
       }
     }
 
-    // 消除替換後可能產生的相鄰重複詞組（防禦「店店面翻修翻修」）
     refinedSentence = refinedSentence
       .replace(/([\u4e00-\u9fa5]{2,3})\1+/g, '$1')
       .replace(/([\u4e00-\u9fa5])\1(?=[\u4e00-\u9fa5]{2})/g, '$1')
       .replace(/店店面/g, '店面')
       .replace(/翻修修/g, '翻修');
 
-    // Pass 1 第一層：精確聲韻母實體主權收斂
     for (const [sig, anchor] of exactEntries) {
       const correctTerm = anchor.term;
       if (
@@ -1402,7 +1488,6 @@ export function applySentenceLevelLocalCorrection(
       }
     }
 
-    // Pass 1 第二層：台式模糊音韻與複合詞見證收斂（如後文「業師群」見證回頭修正前文「夜市」）
     for (const [fKey, anchor] of fuzzyEntries) {
       const correctTerm = anchor.term;
       if (
@@ -1558,8 +1643,56 @@ export function applySentenceLevelLocalCorrection(
 }
 
 /**
- * 【問題三 Pass 2：滾動視窗之免索引槽位 LLM 深度語意推敲與 LG-TPST 自問自答移轉】
+ * 【研究報告 6.3 節】：對 LLM (雲端 Gemini 或本地 WebLLM) 回傳之語者變更 Patch 執行三級信心度安全過濾
+ * - Tier 1 (`tier1_locked_anchor`): 嚴格攔截任何修改語者 ID 的請求
+ * - Tier 2 (`tier2_candidate_constrained`): 僅允許切換至 `runnerUpSpeakerId` (Top-2 候選語者)
+ * - Tier 3 (`tier3_overlap_split`): 允許拆句並切換至 `runnerUpSpeakerId` 或鄰近活躍語者
  */
+function enforceThreeTierGatingOnModelPatches(
+  rawPatches: CorrectionPatchItem[],
+  targetSegments: Segment[]
+): CorrectionPatchItem[] {
+  const segMap = new Map<string, Segment>();
+  for (const s of targetSegments) segMap.set(s.id, s);
+
+  const filtered: CorrectionPatchItem[] = [];
+  for (const p of rawPatches) {
+    if (!p.newSpeakerId) {
+      filtered.push(p);
+      continue;
+    }
+
+    const seg = segMap.get(p.segmentId);
+    if (!seg) continue;
+
+    const tier = resolveSegmentSlotTier(seg);
+    if (tier === 'tier1_locked_anchor') {
+      // Tier 1 唯讀鎖定：攔截語者修改
+      continue;
+    }
+
+    if (tier === 'tier2_candidate_constrained') {
+      // Tier 2 二選一候選集限制：若 LLM 給出的語者既不是原語者也不是 Top-2 競爭語者，強制收斂為 Top-2 競爭語者
+      const allowedRunnerUp = seg.runnerUpSpeakerId || seg.speakerId;
+      if (
+        p.newSpeakerId !== seg.speakerId &&
+        p.newSpeakerId !== allowedRunnerUp
+      ) {
+        if (allowedRunnerUp !== seg.speakerId) {
+          filtered.push({
+            ...p,
+            newSpeakerId: allowedRunnerUp,
+          });
+        }
+        continue;
+      }
+    }
+
+    filtered.push(p);
+  }
+  return filtered;
+}
+
 export async function runTriLevelWindowCorrection(params: {
   config: EngineConfig;
   payload: TriLevelContextPayload;
@@ -1580,7 +1713,6 @@ export async function runTriLevelWindowCorrection(params: {
     onApplyPatches,
   } = params;
 
-  // 1. 先執行 Pass 0 + Pass 1 跨句實體主權收斂與 ISIAL 診斷
   const { updatedSegments: step1Segments, patches: localPatches } =
     applySentenceLevelLocalCorrection(
       payload.highAttentionTargetSegments,
@@ -1588,7 +1720,6 @@ export async function runTriLevelWindowCorrection(params: {
       dictionary
     );
 
-  // 2. 執行 LG-TPST 不合理自問自答偵測與前後語者自動拆句移轉
   const state = useAppStore.getState();
   const { resolvedSegments, flaggedForRelistenIds } =
     resolveUnreasonableSelfQAAndTransferSpeaker(step1Segments, state.speakers);
@@ -1608,7 +1739,6 @@ export async function runTriLevelWindowCorrection(params: {
 
   const targetIds = resolvedSegments.map((s) => s.id);
 
-  // 3. 重新為 resolvedSegments 建立免索引槽位映射表 (#S1 ~ #S5) 與內嵌槽位標籤文本
   const evidenceMap = analyzeCorpusStatisticalEvidence(
     state.segments.length > 0 ? state.segments : resolvedSegments,
     dictionary,
@@ -1621,15 +1751,14 @@ export async function runTriLevelWindowCorrection(params: {
     state.rollingMeetingSummary
   );
 
-  // 若整批句子在 Pass 1 後皆已完全通順 (無任何懷疑槽位且皆為 LOCKED)，直接免呼叫 LLM 節省算力！
-  const hasReviewSegments = resolvedSegments.some(
-    (s) => (s.acousticMargin ?? 0.18) < 0.16 || s.end - s.start < 1.2
+  const hasNonLockedSegments = resolvedSegments.some(
+    (s) => resolveSegmentSlotTier(s) !== 'tier1_locked_anchor'
   );
-  if (suspectSlots.length === 0 && !hasReviewSegments) {
+  if (suspectSlots.length === 0 && !hasNonLockedSegments) {
     return localPatches;
   }
 
-  let modelPatches: CorrectionPatchItem[] = [];
+  let rawModelPatches: CorrectionPatchItem[] = [];
   const updatedPayload: TriLevelContextPayload = {
     ...payload,
     highAttentionTargetSegments: resolvedSegments,
@@ -1639,7 +1768,7 @@ export async function runTriLevelWindowCorrection(params: {
 
   if (config.geminiApiKey.trim()) {
     try {
-      modelPatches = await cloudClient.correctWithGeminiTriLevel(
+      rawModelPatches = await cloudClient.correctWithGeminiTriLevel(
         config.geminiApiKey.trim(),
         updatedPayload
       );
@@ -1648,22 +1777,23 @@ export async function runTriLevelWindowCorrection(params: {
     }
   } else if (runLocalLlmCorrection) {
     try {
-      modelPatches = await runLocalLlmCorrection(updatedPayload);
+      rawModelPatches = await runLocalLlmCorrection(updatedPayload);
     } catch (err) {
       console.warn('本機 WebLLM 槽位校正略過:', err);
     }
   }
 
-  if (modelPatches.length > 0) {
-    onApplyPatches(modelPatches, targetIds);
+  const gatedPatches = enforceThreeTierGatingOnModelPatches(
+    rawModelPatches,
+    resolvedSegments
+  );
+
+  if (gatedPatches.length > 0) {
+    onApplyPatches(gatedPatches, targetIds);
   }
-  return [...localPatches, ...modelPatches];
+  return [...localPatches, ...gatedPatches];
 }
 
-/**
- * 【問題三 Pass 3：全局回溯精修 (Retroactive Pass)】
- * 利用全場完整知識庫（如後文出現的「業師群」見證）回頭掃描並分批修復整份逐字稿
- */
 export async function runGlobalRetroactiveContextPass(params: {
   config: EngineConfig;
   allSegments: Segment[];
@@ -1721,7 +1851,7 @@ export async function runGlobalRetroactiveContextPass(params: {
     return (
       intel.intelligibilityScore < 0.72 ||
       intel.anomalousSpans.length > 0 ||
-      (s.acousticMargin !== undefined && s.acousticMargin < 0.16) ||
+      resolveSegmentSlotTier(s) !== 'tier1_locked_anchor' ||
       s.words.some(
         (w) => w.confidence < 0.8 || w.status === 'semantic_uncertain'
       )
@@ -1763,14 +1893,18 @@ export async function runGlobalRetroactiveContextPass(params: {
           config.geminiApiKey.trim(),
           retroPayload
         );
-        if (cloudPatches.length > 0) {
+        const gated = enforceThreeTierGatingOnModelPatches(
+          cloudPatches,
+          batchTarget
+        );
+        if (gated.length > 0) {
           useAppStore
             .getState()
             .applyCorrectionPatches(
-              cloudPatches,
+              gated,
               batchTarget.map((s) => s.id)
             );
-          aiFixedCount += cloudPatches.length;
+          aiFixedCount += gated.length;
         }
       } catch {
         // ignore
@@ -1778,14 +1912,18 @@ export async function runGlobalRetroactiveContextPass(params: {
     } else if (runLocalLlmCorrection) {
       try {
         const llmPatches = await runLocalLlmCorrection(retroPayload);
-        if (llmPatches.length > 0) {
+        const gated = enforceThreeTierGatingOnModelPatches(
+          llmPatches,
+          batchTarget
+        );
+        if (gated.length > 0) {
           useAppStore
             .getState()
             .applyCorrectionPatches(
-              llmPatches,
+              gated,
               batchTarget.map((s) => s.id)
             );
-          aiFixedCount += llmPatches.length;
+          aiFixedCount += gated.length;
         }
       } catch {
         // ignore
@@ -1796,9 +1934,6 @@ export async function runGlobalRetroactiveContextPass(params: {
   return patches.length + aiFixedCount;
 }
 
-/**
- * 【問題四：智慧重聽決策器 + 常數線性增益預處理 + 四重硬性防退化驗收閘門】
- */
 export async function executeBoundedQuotaRelisten(params: {
   config: EngineConfig;
   chunkSamples: Float32Array;
@@ -1835,7 +1970,6 @@ export async function executeBoundedQuotaRelisten(params: {
     state.docContextSummary
   );
 
-  // 智慧重聽決策器：僅篩選「物理音節密度嚴重不足 (\rho_{syll} < 2.0 字/秒)」或「無同音候選且聲學低信心度」的真實物理缺損段落！
   const candidates = chunkSegments
     .filter((seg) => (seg.relistenCount || 0) < 1 && seg.end - seg.start >= 0.8)
     .map((seg) => {
@@ -1873,7 +2007,6 @@ export async function executeBoundedQuotaRelisten(params: {
   let relistenedCount = 0;
 
   for (const { seg, intel } of candidates) {
-    // 嚴格停用會破壞 Whisper 相位與造成幻覺的 WSOLA 變速 (enableTimeStretch: false)
     const {
       subSamples,
       subWavBuffer,
@@ -1936,7 +2069,6 @@ export async function executeBoundedQuotaRelisten(params: {
       );
       const refinedSeg = updatedSegments[0];
 
-      // 【問題四：四重硬性防退化驗收閘門】
       const gateResult = verifyNonRegressionAcceptanceGate({
         origSegment: seg,
         candidateSegment: refinedSeg,

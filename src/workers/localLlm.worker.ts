@@ -1,7 +1,10 @@
 // src/workers/localLlm.worker.ts
+// 本地 WebLLM (Qwen2.5-3B / Gemma-2-2B) 免索引槽位校對與三級聲學信心度閘控 (Tier 1~3) 執行引擎
+
 import { CreateMLCEngine, MLCEngine } from '@mlc-ai/web-llm';
 import * as OpenCC from 'opencc-js';
 import {
+  AcousticSlotTier,
   CorrectionPatchItem,
   Segment,
   StructuredSlotGerResponse,
@@ -15,7 +18,7 @@ let llmEngine: MLCEngine | null = null;
 let currentModelId: string | null = null;
 
 /**
- * 【問題二 2.3】：針對 WebLLM XGrammar 最佳化之嚴格 JSON Schema
+ * 針對 WebLLM XGrammar 最佳化之嚴格 JSON Schema
  * 將 brief_reason (15字內微推理 Micro-CoT) 排在 action 與 selected_text 之前，
  * 強迫 2B/3B 小模型先執行語境推理再決定填空答案，並免除 wordIndex 算術！
  */
@@ -79,7 +82,7 @@ const HYBTRANS_SLOT_GER_JSON_SCHEMA = {
           split_before_anchor: {
             type: 'string',
             description:
-              '若為QA_SPEAKER_CHANGE，填寫回答句開頭的精確2至4個字作為切分錨點',
+              '若為QA_SPEAKER_CHANGE或BACKCHANNEL_INTERJECTION，填寫回答句或附和句開頭的精確2至4個字作為切分錨點',
           },
           new_speaker_id: { type: 'string' },
         },
@@ -92,8 +95,37 @@ const HYBTRANS_SLOT_GER_JSON_SCHEMA = {
         additionalProperties: false,
       },
     },
+    contextual_fixes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          utterance_id: { type: 'string' },
+          brief_reason: {
+            type: 'string',
+            description: '15字以內說明根據前文脈絡修正詞彙或標點的理由',
+          },
+          wrong_span: {
+            type: 'string',
+            description:
+              '原句中與上下文不符或漏標點之局部片段(2至8字，須精確出現於原句)',
+          },
+          corrected_span: {
+            type: 'string',
+            description: '呼應上下文脈絡或補齊標點後之修正片段',
+          },
+        },
+        required: [
+          'utterance_id',
+          'brief_reason',
+          'wrong_span',
+          'corrected_span',
+        ],
+        additionalProperties: false,
+      },
+    },
   },
-  required: ['slot_corrections', 'turn_splits'],
+  required: ['slot_corrections', 'contextual_fixes', 'turn_splits'],
   additionalProperties: false,
 };
 
@@ -178,10 +210,21 @@ async function ensureLlmEngine(modelId: string): Promise<MLCEngine> {
   }
 }
 
-function isSegmentAcousticallyLocked(seg: Segment): boolean {
+function getSegmentSlotTier(seg: Segment): AcousticSlotTier {
+  if (seg.slotTier) return seg.slotTier;
   const dur = seg.end - seg.start;
-  const margin = seg.acousticMargin ?? 0.18;
-  return margin >= 0.16 && dur >= 1.2;
+  const logOdds =
+    seg.logOddsMargin ??
+    ((seg.acousticMargin ?? 0.18) >= 0.16 ? 2.0 : 1.0);
+  const overlap = seg.overlapRatio ?? 0.05;
+
+  if (overlap >= 0.25 || logOdds < 0.45) {
+    return 'tier3_overlap_split';
+  }
+  if (logOdds > 1.8 && overlap < 0.15 && dur >= 1.0) {
+    return 'tier1_locked_anchor';
+  }
+  return 'tier2_candidate_constrained';
 }
 
 function fallbackBuildSlottedView(segments: Segment[]): {
@@ -191,12 +234,15 @@ function fallbackBuildSlottedView(segments: Segment[]): {
   const slotMap = new Map<string, SuspectSlotItem>();
   let counter = 1;
   const lines = segments.map((seg) => {
-    const isLocked = isSegmentAcousticallyLocked(seg);
-    const gateTag = isLocked
-      ? `[LOCKED | speaker=${seg.speakerId}]`
-      : `[REVIEW | top1=${seg.speakerId}, top2=${
-          seg.runnerUpSpeakerId || seg.speakerId
-        }]`;
+    const tier = getSegmentSlotTier(seg);
+    const runnerUp = seg.runnerUpSpeakerId || seg.speakerId;
+    const gateTag =
+      tier === 'tier1_locked_anchor'
+        ? `[LOCKED | speaker=${seg.speakerId}]`
+        : tier === 'tier3_overlap_split'
+        ? `[OVERLAP | top1=${seg.speakerId}, top2=${runnerUp}]`
+        : `[REVIEW | top1=${seg.speakerId}, top2=${runnerUp}]`;
+
     const rendered = seg.words
       .map((w, idx) => {
         if (
@@ -280,15 +326,19 @@ self.onmessage = async (event: MessageEvent) => {
       const hotwords =
         payload.lowAttentionGlobalMemory.verifiedTerms.join('、');
 
-      const systemPrompt = `你是台灣政商與學術會議逐字稿之「免索引槽位校對與 LG-TPST 對話語用引擎」。
-請針對目標段落中標記為 ⟪#S1: 原詞 | 候選: ...⟫ 的懷疑槽位與 [REVIEW] 語者段落進行推敲，並嚴格輸出符合 Schema 之 JSON 物件：
+      const systemPrompt = `你是台灣政商與學術會議逐字稿之「上下文脈絡語意校對、標點修復與三級聲學信心度閘控引擎」。
+請結合【全局會議背景】、【前文對話脈絡】與【目標段落】，嚴格輸出符合 Schema 之 JSON 物件：
 1. 【槽位填空校對 (slot_corrections)】：
-   - 先在 brief_reason 寫下 15 字以內的上下文搭配理由（微推理 Micro-CoT）。
-   - 若候選詞或近音詞能讓整句符合【全局會議背景】與前後文邏輯，將 action 設為 "APPLY_HIGH_CONF"，並在 selected_text 僅填入該槽位替換後的詞彙本身（嚴禁包含槽位外的前後文字！）。
-   - 若有 2~3 個近音詞皆合理但無法 100% 肯定，將 action 設為 "MARK_UNCERTAIN"，並在 uncertain_candidates 列出 2~3 個候選詞。
-   - 若原詞已完全通順合理，將 action 設為 "KEEP_ORIGINAL"。
-2. 【語用拆句與語者移轉 (turn_splits)】：
-   - [LOCKED] 段落嚴禁變更語者；[REVIEW | top1=..., top2=...] 段落若出現「前句提問、後句直接回答卻標同一人（QA_SPEAKER_CHANGE）」或「短促附和插話（BACKCHANNEL_INTERJECTION）」，請填入 new_speaker_id（如 top2 語者）與回答開頭 2~4 字錨點 split_before_anchor。`;
+   - 針對標記為 ⟪#S1: 原詞 | 候選: ...⟫ 的懷疑槽位，先在 brief_reason 寫下 15 字內的上下文呼應理由。
+   - 若候選詞、同音詞或補標點版本能讓句子呼應前後文邏輯（例如前文討論送某人東西，後文「神秘如果我們再寄給他」應修正為「神秘禮物」或「神秘！如果」），將 action 設為 "APPLY_HIGH_CONF"，並在 selected_text 填入替換後的片段本身。
+   - 若有 2~3 個近音詞皆可能，將 action 設為 "MARK_UNCERTAIN"，並在 uncertain_candidates 列出候選詞。
+2. 【全句上下文語意與標點主動校對 (contextual_fixes)】：
+   - 除了 #S1 槽位外，請主動檢視目標段落每一句是否與【前文對話脈絡】呼應、語意是否通順、標點符號（如感嘆號「！」、問號「？」、頓號或子句逗號「，」）是否缺漏或誤植。
+   - 若發現句中有局部同音誤聽或標點粘連錯誤（2~8 字），請在 contextual_fixes 填入 utterance_id、brief_reason、wrong_span（原句中的精確片段）與 corrected_span（修正後的詞彙或補齊標點片段）。
+3. 【三級聲學信心度語用拆句與語者移轉 (turn_splits)】：
+   - Tier 1 [LOCKED] 段落：唯讀鎖定，嚴禁變更語者！
+   - Tier 2 [REVIEW | top1=..., top2=...] 段落：僅能在 top1 與 top2 間依問答語意決定歸屬。
+   - Tier 3 [OVERLAP | top1=..., top2=...] 段落：允許將粘連在同一句內的「主講句 + 附和短句」在斷點處填入 split_before_anchor 並指派給 top2。`;
 
       const userPrompt = `【全局會議背景與摘要】：
 ${payload.lowAttentionGlobalMemory.docSummary || '無'}
@@ -302,7 +352,6 @@ ${payload.mediumAttentionRollingText.slice(-600) || '無'}
 【待執行槽位填空與語用檢驗之目標段落】：
 ${slottedTranscript}`;
 
-      // 優先啟用 WebLLM 內建 XGrammar 結構化 JSON Schema 約束解碼
       let rawContent = '{}';
       try {
         const reply = await engine.chat.completions.create({
@@ -362,7 +411,7 @@ ${slottedTranscript}`;
               sc.action === 'APPLY_HIGH_CONF' &&
               cleanSelected &&
               cleanSelected !== slot.originalText &&
-              Math.abs(cleanSelected.length - slot.originalText.length) <= 2
+              Math.abs(cleanSelected.length - slot.originalText.length) <= 3
             ) {
               patches.push({
                 segmentId: slot.segmentId,
@@ -390,7 +439,85 @@ ${slottedTranscript}`;
           }
         }
 
-        // 2. 解析 LG-TPST 語用拆句與語者移轉 (turn_splits)
+        // 2. 解析全句上下文語意與標點主動校對 (contextual_fixes)
+        if (Array.isArray(parsed.contextual_fixes)) {
+          for (const cf of parsed.contextual_fixes) {
+            if (!cf.utterance_id || !cf.wrong_span || !cf.corrected_span) {
+              continue;
+            }
+            const targetSeg = targetSegments.find(
+              (s) => s.id === cf.utterance_id
+            );
+            if (!targetSeg) continue;
+
+            const wrongSpan = toTwp(cf.wrong_span.trim());
+            const correctedSpan = toTwp(cf.corrected_span.trim());
+            if (
+              !wrongSpan ||
+              !correctedSpan ||
+              wrongSpan === correctedSpan ||
+              wrongSpan.length < 2 ||
+              Math.abs(correctedSpan.length - wrongSpan.length) > 3
+            ) {
+              continue;
+            }
+
+            let charPos = 0;
+            const wRanges = targetSeg.words.map((w, idx) => {
+              const start = charPos;
+              charPos += w.text.length;
+              return { idx, start, end: charPos, text: w.text };
+            });
+            const fullText = targetSeg.words.map((w) => w.text).join('');
+            const hitCharIdx = fullText.indexOf(wrongSpan);
+            if (hitCharIdx === -1) continue;
+
+            const hitEndCharIdx = hitCharIdx + wrongSpan.length;
+            const hitWords = wRanges.filter(
+              (r) => r.end > hitCharIdx && r.start < hitEndCharIdx
+            );
+            if (hitWords.length === 0) continue;
+
+            const sWIdx = hitWords[0].idx;
+            const eWIdx = hitWords[hitWords.length - 1].idx + 1;
+            const origWordsText = targetSeg.words
+              .slice(sWIdx, eWIdx)
+              .map((w) => w.text)
+              .join('');
+            const replacedWordsText = origWordsText.replace(
+              wrongSpan,
+              correctedSpan
+            );
+
+            // 避免與已經由 #S1 槽位修正的區段重複
+            if (
+              patches.some(
+                (p) =>
+                  p.segmentId === targetSeg.id &&
+                  p.wordIndex >= 0 &&
+                  sWIdx < (p.endWordIndex ?? p.wordIndex + 1) &&
+                  eWIdx > p.wordIndex
+              )
+            ) {
+              continue;
+            }
+
+            const cleanReason = toTwp(
+              cf.brief_reason || '依前後文脈絡與語意呼應修正'
+            );
+            patches.push({
+              segmentId: targetSeg.id,
+              wordIndex: sWIdx,
+              endWordIndex: eWIdx,
+              originalText: origWordsText,
+              status: 'auto_corrected',
+              correctedText: replacedWordsText,
+              reason: `[AI 脈絡校對] ${cleanReason}`,
+            });
+          }
+        }
+
+        // 3. 解析三級聲學信心度閘控之語用拆句與語者移轉 (turn_splits)
         if (Array.isArray(parsed.turn_splits)) {
           for (const ts of parsed.turn_splits) {
             if (
@@ -403,9 +530,22 @@ ${slottedTranscript}`;
             const targetSeg = targetSegments.find(
               (s) => s.id === ts.utterance_id
             );
-            if (!targetSeg || isSegmentAcousticallyLocked(targetSeg)) continue;
+            if (!targetSeg) continue;
 
-            const candidateSpk = (ts.new_speaker_id || '').trim();
+            const tier = getSegmentSlotTier(targetSeg);
+            // Tier 1 唯讀鎖定：嚴禁 LLM 修改語者
+            if (tier === 'tier1_locked_anchor') continue;
+
+            let candidateSpk = (ts.new_speaker_id || '').trim();
+            // Tier 2 二選一受限候選集：強制約束於 runnerUpSpeakerId
+            if (
+              tier === 'tier2_candidate_constrained' &&
+              targetSeg.runnerUpSpeakerId &&
+              targetSeg.runnerUpSpeakerId !== targetSeg.speakerId
+            ) {
+              candidateSpk = targetSeg.runnerUpSpeakerId;
+            }
+
             const isValidSpk =
               validSpeakerIds.has(candidateSpk) ||
               /^Speaker_\d{2}$/.test(candidateSpk);
@@ -418,7 +558,7 @@ ${slottedTranscript}`;
               status: 'auto_corrected',
               newSpeakerId: candidateSpk,
               splitBeforeAnchor: toTwp((ts.split_before_anchor || '').trim()),
-              reason: `LG-TPST 語用校正 (${ts.pragmatic_type}: ${targetSeg.speakerId} → ${candidateSpk})`,
+              reason: `LG-TPST 三級閘控語用校正 (${ts.pragmatic_type}: ${targetSeg.speakerId} → ${candidateSpk})`,
             });
           }
         }

@@ -1,9 +1,12 @@
 // src/hooks/usePipelineScheduler.ts
+// 次世代雙軌耦合調度器 (5 分鐘 Macro-Chunk 零相位前瞻正規化 + 12~22s 靜音谷底最佳化視窗 + 全域幀級後驗矩陣傳遞 + 本地/雲端統一字級 Viterbi 對齊)
+
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
 import {
   CorrectionPatchItem,
   FineDiarizationTurn,
+  FrameSpeakerPosteriorMatrix,
   Segment,
   Speaker,
   SpeakerTrackBatch,
@@ -19,6 +22,12 @@ import {
   releaseKeepAwakeLock,
   TARGET_SAMPLE_RATE,
 } from '../utils/audioProcessor';
+import {
+  decodeWordLevelSpeakersViterbi,
+  groupAlignedWordsIntoSegments,
+  RawWordTimestampItem,
+  synthesizePosteriorMatrixFromFineTurns,
+} from '../utils/viterbiWordAligner';
 import {
   applySentenceLevelLocalCorrection,
   buildTriLevelContextPayload,
@@ -165,6 +174,7 @@ function unwarpCloudSegmentsFromVirtualTrack(
 
     const dur = Math.max(0.2, realEnd - realStart);
     const step = dur / Math.max(1, seg.words.length);
+    const isLocked = bestItem.speakerMargin >= 0.16 && dur >= 1.2;
 
     return {
       ...seg,
@@ -172,6 +182,11 @@ function unwarpCloudSegmentsFromVirtualTrack(
       runnerUpSpeakerId:
         bestItem.runnerUpSpeakerId || bestItem.speakerId || speakerId,
       acousticMargin: bestItem.speakerMargin,
+      logOddsMargin: isLocked ? 2.1 : 1.1,
+      overlapRatio: 0.05,
+      slotTier: isLocked
+        ? 'tier1_locked_anchor'
+        : 'tier2_candidate_constrained',
       start: realStart,
       end: realEnd,
       words: seg.words.map((w, idx) => ({
@@ -181,6 +196,77 @@ function unwarpCloudSegmentsFromVirtualTrack(
       })),
     };
   });
+}
+
+/**
+ * 【雲端 BYOK 專屬升級】：當走雲端 Groq / Gemini 轉寫 12~22s 最佳化視窗時，
+ * 將雲端回傳之 words 透過與本地 WebGPU 完全相同的 `decodeWordLevelSpeakersViterbi` 對齊至全域語者後驗機率矩陣！
+ */
+function alignCloudSegmentsWithViterbi(
+  rawCloudSegs: Segment[],
+  windowStartSec: number,
+  windowEndSec: number,
+  fineTurns: FineDiarizationTurn[],
+  posteriorMatrix: FrameSpeakerPosteriorMatrix | undefined,
+  chunkIndex: number,
+  windowIndex: number,
+  acousticThreshold: number,
+  backchannelMarginThreshold = 0.12,
+  pingPongMaxDurSec = 1.6
+): Segment[] {
+  if (rawCloudSegs.length === 0) return [];
+
+  const wordItems: RawWordTimestampItem[] = [];
+  for (const seg of rawCloudSegs) {
+    for (const w of seg.words) {
+      const tok = w.text.trim();
+      if (!tok) continue;
+      if (/^[，。？！、；：,.?!]+$/.test(tok) && wordItems.length > 0) {
+        const prev = wordItems[wordItems.length - 1];
+        if (!/[，。？！、；：,.?!]$/.test(prev.text)) {
+          prev.text += tok[0];
+        }
+        continue;
+      }
+      wordItems.push({
+        text: tok,
+        start: w.start,
+        end: w.end,
+        confidence: w.confidence,
+      });
+    }
+  }
+
+  if (wordItems.length === 0) return rawCloudSegs;
+
+  const activeMatrix =
+    posteriorMatrix &&
+    posteriorMatrix.numFrames > 0 &&
+    posteriorMatrix.speakerIds.length > 0
+      ? posteriorMatrix
+      : synthesizePosteriorMatrixFromFineTurns(
+          fineTurns,
+          windowStartSec,
+          windowEndSec,
+          0.02
+        );
+
+  const alignedSlots = decodeWordLevelSpeakersViterbi(
+    wordItems,
+    activeMatrix,
+    {
+      lambdaTrans: 0.65,
+      backchannelMarginThreshold,
+      pingPongMaxDurSec,
+    }
+  );
+
+  return groupAlignedWordsIntoSegments(
+    alignedSlots,
+    chunkIndex,
+    windowIndex,
+    acousticThreshold
+  );
 }
 
 export function usePipelineScheduler() {
@@ -253,13 +339,24 @@ export function usePipelineScheduler() {
       payload: TriLevelContextPayload
     ): Promise<CorrectionPatchItem[]> => {
       return new Promise((resolve) => {
-        const timeout = setTimeout(() => {
+        let timeout = setTimeout(() => {
+          worker.removeEventListener('message', handleMsg);
           useAppStore.getState().setModelDownload({ active: false });
           resolve([]);
-        }, 45000);
+        }, 90000);
+
+        const resetWatchdog = () => {
+          clearTimeout(timeout);
+          timeout = setTimeout(() => {
+            worker.removeEventListener('message', handleMsg);
+            useAppStore.getState().setModelDownload({ active: false });
+            resolve([]);
+          }, 90000);
+        };
 
         const handleMsg = (e: MessageEvent) => {
           if (e.data?.type === 'LLM_LOAD_PROGRESS') {
+            resetWatchdog();
             const pct = Math.round((Number(e.data.progress) || 0) * 100);
             useAppStore.getState().setModelDownload({
               active: pct < 100,
@@ -334,10 +431,10 @@ export function usePipelineScheduler() {
     chunkEndSec: number
   ): FineDiarizationTurn[] => {
     const turns: FineDiarizationTurn[] = [];
-    for (let t = chunkStartSec; t < chunkEndSec; t += 15) {
+    for (let t = chunkStartSec; t < chunkEndSec; t += 16) {
       turns.push({
         start: t,
-        end: Math.min(chunkEndSec, t + 15),
+        end: Math.min(chunkEndSec, t + 16),
         speakerId: 'Speaker_01',
         f0Hz: 155,
       });
@@ -358,6 +455,7 @@ export function usePipelineScheduler() {
     asrWindows: Array<{ start: number; end: number }>;
     speakerTrackBatches: SpeakerTrackBatch[];
     updatedSpeakers: Speaker[];
+    posteriorMatrix?: FrameSpeakerPosteriorMatrix;
   }> => {
     return new Promise((resolve) => {
       const worker = new Worker(
@@ -375,6 +473,12 @@ export function usePipelineScheduler() {
           asrWindows: fb.map((t) => ({ start: t.start, end: t.end })),
           speakerTrackBatches: [],
           updatedSpeakers: existingSpeakers,
+          posteriorMatrix: synthesizePosteriorMatrixFromFineTurns(
+            fb,
+            chunkStartSec,
+            chunkEndSec,
+            0.02
+          ),
         };
       };
 
@@ -427,9 +531,18 @@ export function usePipelineScheduler() {
             : [];
           const updatedSpeakers =
             msg.updatedSpeakers || msg.data?.speakers || existingSpeakers;
+          const posteriorMatrix: FrameSpeakerPosteriorMatrix | undefined =
+            msg.posteriorMatrix;
+
           resolve(
             turns.length > 0
-              ? { turns, asrWindows, speakerTrackBatches, updatedSpeakers }
+              ? {
+                  turns,
+                  asrWindows,
+                  speakerTrackBatches,
+                  updatedSpeakers,
+                  posteriorMatrix,
+                }
               : fallback('Turns 為空陣列')
           );
         } else if (msg.type === 'DIARIZE_ERROR' || msg.type === 'ERROR') {
@@ -501,7 +614,7 @@ export function usePipelineScheduler() {
             'mode_0_heritage_classic';
           const useVirtualTrackStitching =
             currentConfig.diarizationConfig
-              ?.enableVirtualSpeakerTrackStitching ?? true;
+              ?.enableVirtualSpeakerTrackStitching ?? false;
 
           const modeLabel =
             engineMode === 'mode_0_heritage_classic'
@@ -510,12 +623,13 @@ export function usePipelineScheduler() {
               ? 'Mode A 純 DSP 極速'
               : engineMode === 'mode_c_onnx_neural'
               ? 'Mode C WeSpeaker ONNX 雙尺度'
-              : 'Mode B 雙流形譜聚類';
+              : 'Mode B E2CP + VBx 譜聚類';
 
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'preprocessing',
             progress: 10,
-            detailText: '音訊切片與 85Hz 降噪濾波中...',
+            detailText:
+              '音訊切片、85Hz 零相位濾波與前瞻包絡響度正規化中...',
           });
 
           const { samples: chunkSamples } =
@@ -531,7 +645,7 @@ export function usePipelineScheduler() {
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'diarizing',
             progress: 15,
-            detailText: `${modeLabel} 黃金長句定錨與聲紋分離中 (${currentConfig.minSpeakers}~${currentConfig.maxSpeakers} 人)...`,
+            detailText: `${modeLabel} 重疊排除聲紋純化與 VBx 聚類中 (${currentConfig.minSpeakers}~${currentConfig.maxSpeakers} 人)...`,
           });
 
           const existingSpeakers = Object.values(
@@ -542,6 +656,7 @@ export function usePipelineScheduler() {
             asrWindows,
             speakerTrackBatches,
             updatedSpeakers,
+            posteriorMatrix,
           } = await runDiarizationStage(
             chunkSamples,
             cIdx,
@@ -656,7 +771,7 @@ export function usePipelineScheduler() {
           };
 
           // ==================================================================
-          // 分支 A：【升級版】語者專屬虛擬音軌拼接轉寫 (Virtual Speaker-Track Stitching)
+          // 分支 A：語者專屬虛擬音軌拼接轉寫 (Virtual Speaker-Track Stitching)
           // ==================================================================
           if (useVirtualTrackStitching && speakerTrackBatches.length > 0) {
             useAppStore.getState().updateChunkState(cIdx, {
@@ -816,7 +931,7 @@ export function usePipelineScheduler() {
                 ) {
                   useAppStore.getState().updateChunkState(cIdx, {
                     stage: 'correcting',
-                    detailText: `三層關注度介入：修正近 ${pendingWindowChars} 字...`,
+                    detailText: `三層關注度與三級信心度閘控介入：修正近 ${pendingWindowChars} 字...`,
                   });
                   await flushPendingWindowCorrection(
                     currentConfig.keepModelsCoResident
@@ -828,7 +943,7 @@ export function usePipelineScheduler() {
             }
           } else {
             // ================================================================
-            // 分支 B：傳統混合音訊視窗轉寫 + 事後 Viterbi 對齊
+            // 分支 B：【次世代主力推薦】12~22s 靜音谷底最佳化視窗 + Cross-Attention DTW 字級 Viterbi 對齊
             // ================================================================
             for (let wIdx = 0; wIdx < asrWindows.length; wIdx++) {
               if (globalAbortFlag) break;
@@ -855,7 +970,7 @@ export function usePipelineScheduler() {
               useAppStore.getState().updateChunkState(cIdx, {
                 stage: 'transcribing',
                 progress: winProgress,
-                detailText: `語境轉寫與多語系子句聲紋對齊 (${wIdx + 1}/${asrWindows.length})`,
+                detailText: `12~22s 谷底視窗轉寫與字級 Viterbi 對齊 (${wIdx + 1}/${asrWindows.length})`,
               });
 
               let windowSegments: Segment[] = [];
@@ -875,7 +990,7 @@ export function usePipelineScheduler() {
                     (ft) => ft.end > win.start && ft.start < win.end
                   )?.speakerId || 'Speaker_01';
 
-                windowSegments = currentConfig.groqApiKey.trim()
+                const rawCloudSegments = currentConfig.groqApiKey.trim()
                   ? await transcribeWithGroq(
                       turnWav,
                       currentConfig.groqApiKey.trim(),
@@ -894,6 +1009,20 @@ export function usePipelineScheduler() {
                       cIdx,
                       currentConfig.acousticThreshold
                     );
+
+                windowSegments = alignCloudSegmentsWithViterbi(
+                  rawCloudSegments,
+                  win.start,
+                  win.end,
+                  fineTurns,
+                  posteriorMatrix,
+                  cIdx,
+                  wIdx,
+                  currentConfig.acousticThreshold,
+                  currentConfig.diarizationConfig
+                    ?.backchannelMarginThreshold ?? 0.12,
+                  currentConfig.diarizationConfig?.pingPongMaxDurSec ?? 1.6
+                );
               } else if (asrWorker) {
                 const activeWorker = asrWorker;
                 const languageHint =
@@ -947,6 +1076,7 @@ export function usePipelineScheduler() {
                       windowStartSec: win.start,
                       windowEndSec: win.end,
                       fineTurns,
+                      posteriorMatrix,
                       chunkIndex: cIdx,
                       windowIndex: wIdx,
                       modelName: currentConfig.localAsrModel,
@@ -991,7 +1121,7 @@ export function usePipelineScheduler() {
                 ) {
                   useAppStore.getState().updateChunkState(cIdx, {
                     stage: 'correcting',
-                    detailText: `三層關注度介入：修正近 ${pendingWindowChars} 字...`,
+                    detailText: `三層關注度與三級信心度閘控介入：修正近 ${pendingWindowChars} 字...`,
                   });
                   await flushPendingWindowCorrection(
                     currentConfig.keepModelsCoResident

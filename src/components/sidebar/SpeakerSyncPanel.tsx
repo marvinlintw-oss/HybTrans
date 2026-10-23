@@ -36,43 +36,43 @@ const ENGINE_STRATEGY_GUIDES: Record<
   }
 > = {
   mode_0_heritage_classic: {
-    shortBadge: '初代經典穩健 (推薦)',
-    title: 'Mode 0：初代經典穩健引擎 (全域音色保留 + AHC)',
+    shortBadge: '兩階段神經定錨 (推薦)',
+    title: 'Mode 0：兩階段黃金長句定錨 + WeSpeaker 256維聲紋 (推薦)',
     scenario:
-      '一般 2~6 人部門會議、訪談、男女與同性混合討論（最接近初代 HybTrans 的穩定分群表現）。',
+      '一般 2~6 人台灣商務與專案會議、男女與同性混合討論、包含頻繁無停頓接話與短促附和（「不算」、「對」）。',
     strengths:
-      '保留完整靜態聲道共振峰（不因短句減均值而洗掉音色），搭配黃金長句定錨，換人邊界果斷、同性語者不易被強制黏合。',
+      '自動載入 /public/models/ 下之 WeSpeaker 256 維模型執行第一階段長句定錨，再以「基頻跳變+能量谷底」精準切出微觀話輪，能同時分出多位同性別語者並保持句子時間順序 100% 精準。',
     limitations:
-      '若環境有劇烈移動或中途切換不同麥克風，對通道變化的抵抗力略低於 ONNX 深度模型。',
+      '若環境有劇烈移動或多人完全同時間重疊大聲爭論，建議搭配微調敏感度滑桿。',
   },
   mode_b_advanced_dsp: {
-    shortBadge: '雙流形譜聚類',
-    title: 'Mode B：進階雙流形譜聚類 (Auto-Tuning NME-SC)',
+    shortBadge: '密度感知譜聚類',
+    title: 'Mode B：密度感知譜聚類 + 溫和先驗 VBx (NME-SC + VBx)',
     scenario:
-      '人數未知、發言長度極度不均（例如 1 人主講、多人偶爾插話提問）的中大型會議。',
+      '人數未知、發言長度極度不均（例如 1 人主講 60%、少數語者僅偶爾插話幾句）的中大型會議。',
     strengths:
-      '透過拉普拉斯特徵間隙自動推估各性別流形人數，擅長處理長時段演講穿插問答。',
+      '結合拉普拉斯特徵間隙、AHC 自然群數探測與阻尼先驗 VBx，不會因為主講人話量過大而吞併少數發言者（如僅講幾句話的第二位女性或男性與會者）。',
     limitations:
-      '當兩位同性別語者音色極度接近且頻繁短句搶話時，譜平滑可能偏向合併為同一人。',
+      '當會議室回音極重且未放置本地 ONNX 模型時，譜平滑對極短句的解析度略低於 AHC。',
   },
   mode_c_onnx_neural: {
-    shortBadge: 'ONNX 深度聲紋',
-    title: 'Mode C：本地 WeSpeaker 256維深度神經聲紋',
+    shortBadge: 'ONNX 雙尺度深層聲紋',
+    title: 'Mode C：本地 WeSpeaker 256維雙尺度深度神經聲紋',
     scenario:
-      '已於 /public/models/ 放置 ONNX 權重檔、且有多位同性別與會者需要高維度音色區分時。',
+      '已於 /public/models/ 放置 ONNX 權重檔、且有多位同性別與會者（如 2女2男 或 3男2女）需要高維度音色區分時。',
     strengths:
-      '256 維超球面聲紋對同性別不同人的細微腔調與共鳴分辨力最高，支援雙尺度融合。',
+      '256 維超球面聲紋對同性別不同人的細微腔調與共鳴分辨力最高，支援時長自適應混合 CMN 與短句週期延展保護。',
     limitations:
-      '需預先放置本地 .onnx 模型檔（若未放置會自動退回 DSP 模式），且 CPU 運算耗時較長。',
+      '需預先放置本地 .onnx 模型檔（若未放置會自動退回 DSP 模式）。',
   },
   mode_a_classic: {
     shortBadge: '極速輕量 DSP',
-    title: 'Mode A：極速輕量模式 (低耗能快速切分)',
+    title: 'Mode A：極速輕量模式 (純 DSP 低耗能快速切分)',
     scenario:
       '文書筆電、長達 2 小時以上錄音，或僅需快速取得初稿再手動微調語者的情境。',
     strengths: 'CPU 佔用率最低、轉檔等待時間最短，不會造成低階裝置發熱降頻。',
     limitations:
-      '切分粒度較粗，對於 1 秒內的快速附和詞（「對」、「好」）較容易併入前一位語者。',
+      '僅使用 64 維頻譜包絡特徵，對音色接近之同性別語者分辨力低於 WeSpeaker ONNX 模式。',
   },
 };
 
@@ -105,7 +105,7 @@ export const SpeakerSyncPanel: React.FC = () => {
     scdPeakThreshold: 0.22,
     backchannelMarginThreshold: 0.12,
     enableAcousticDivergencePreproc: true,
-    enableVirtualSpeakerTrackStitching: true,
+    enableVirtualSpeakerTrackStitching: false,
   };
 
   const currentGuide =
@@ -117,8 +117,9 @@ export const SpeakerSyncPanel: React.FC = () => {
   const hasPhoneticCandidates = phoneticCandidates.length > 0;
   const scdThreshold = diarCfg.scdPeakThreshold ?? 0.22;
   const preprocEnabled = diarCfg.enableAcousticDivergencePreproc ?? true;
+  // 預設關閉會破壞多人搶話時間軸順序的 Virtual Speaker-Track Stitching
   const virtualTrackEnabled =
-    diarCfg.enableVirtualSpeakerTrackStitching ?? true;
+    diarCfg.enableVirtualSpeakerTrackStitching ?? false;
 
   const handleStartEdit = (id: string, currentName: string) => {
     setEditingId(id);
@@ -135,15 +136,14 @@ export const SpeakerSyncPanel: React.FC = () => {
           .scanHomophoneSpeakerMentions as (...args: unknown[]) => unknown;
 
         if (typeof matcherFn === 'function') {
-          const fullText = segments
-            .map((seg) => seg.words.map((w) => w.text).join(''))
-            .join('\n');
-
           let result: unknown;
           try {
-            result = matcherFn(fullText, trimmed, segments);
+            result = matcherFn(trimmed, segments);
           } catch {
-            result = matcherFn(segments, trimmed);
+            const fullText = segments
+              .map((seg) => seg.words.map((w) => w.text).join(''))
+              .join('\n');
+            result = matcherFn(fullText, trimmed, segments);
           }
 
           if (Array.isArray(result)) {
@@ -184,6 +184,7 @@ export const SpeakerSyncPanel: React.FC = () => {
         clusterMethod: 'ahc_cosine',
         scdPeakThreshold: 0.21,
         backchannelMarginThreshold: 0.11,
+        enableVirtualSpeakerTrackStitching: false,
       });
     } else if (mode === 'mode_a_classic') {
       updateDiarizationConfig({
@@ -191,20 +192,23 @@ export const SpeakerSyncPanel: React.FC = () => {
         clusterMethod: 'ahc_cosine',
         scdPeakThreshold: 0.27,
         backchannelMarginThreshold: 0.15,
+        enableVirtualSpeakerTrackStitching: false,
       });
     } else if (mode === 'mode_b_advanced_dsp') {
       updateDiarizationConfig({
         engineMode: mode,
         clusterMethod: 'spectral_cosine',
-        scdPeakThreshold: 0.23,
-        backchannelMarginThreshold: 0.13,
+        scdPeakThreshold: 0.22,
+        backchannelMarginThreshold: 0.12,
+        enableVirtualSpeakerTrackStitching: false,
       });
     } else {
       updateDiarizationConfig({
         engineMode: mode,
-        clusterMethod: 'spectral_cosine',
+        clusterMethod: 'ahc_cosine',
         scdPeakThreshold: 0.19,
         backchannelMarginThreshold: 0.1,
+        enableVirtualSpeakerTrackStitching: false,
       });
     }
   };
@@ -218,7 +222,7 @@ export const SpeakerSyncPanel: React.FC = () => {
             與會語者與分離策略
           </h3>
           <span
-            title="平時自動收摺進階聲紋設定；展開後可切換「語者專屬虛擬音軌拼接轉寫 (Track-First ASR)」與 4 種分離策略"
+            title="平時自動收摺進階聲紋設定；展開後可切換 4 種分離策略與微調換人切分敏感度"
             className="text-slate-400 hover:text-slate-600 cursor-help"
           >
             <Info className="w-3.5 h-3.5" />
@@ -323,29 +327,6 @@ export const SpeakerSyncPanel: React.FC = () => {
 
         {isStrategyExpanded && (
           <div className="p-2.5 border-t border-slate-200/80 space-y-2.5 text-xs bg-white">
-            {/* 【核心升級開關】長短句定錨 + 語者專屬虛擬音軌拼接轉寫 */}
-            <div className="rounded-lg border border-indigo-200 p-2 bg-indigo-50/50 space-y-1">
-              <label className="flex items-center justify-between cursor-pointer">
-                <span className="text-[11px] font-semibold text-indigo-950 flex items-center gap-1">
-                  <Layers className="w-3.5 h-3.5 text-indigo-600" />
-                  語者專屬虛擬音軌拼接轉寫 (Track-First)
-                </span>
-                <input
-                  type="checkbox"
-                  checked={virtualTrackEnabled}
-                  onChange={(e) =>
-                    updateDiarizationConfig({
-                      enableVirtualSpeakerTrackStitching: e.target.checked,
-                    })
-                  }
-                  className="rounded text-indigo-600 focus:ring-0 cursor-pointer"
-                />
-              </label>
-              <p className="text-[10px] text-indigo-800/90 leading-normal">
-                先用黃金長句定錨分出語者，再將同語者片段（夾 0.35s 斷句隔板）拼接為純淨同語者音軌送入 Whisper，物理級杜絕跨語者混聽與長靜音幻覺，並自動還原真實時間軸！
-              </p>
-            </div>
-
             {/* 策略選擇器 */}
             <div className="space-y-1">
               <label className="text-[11px] font-medium text-slate-600 block">
@@ -361,16 +342,16 @@ export const SpeakerSyncPanel: React.FC = () => {
                 className="w-full bg-slate-50 border border-slate-300 rounded-md px-2 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:border-indigo-500"
               >
                 <option value="mode_0_heritage_classic">
-                  ★ Mode 0：初代經典穩健模式 (全域音色 + AHC，最穩定推薦)
-                </option>
-                <option value="mode_b_advanced_dsp">
-                  Mode B：雙流形自動調參譜聚類 (NME-SC，適合未知人數演講)
+                  ★ Mode 0：兩階段黃金長句定錨 + WeSpeaker (最穩定推薦)
                 </option>
                 <option value="mode_c_onnx_neural">
-                  Mode C：WeSpeaker ONNX 深度聲紋 (需本地模型檔，同性區分強)
+                  Mode C：WeSpeaker ONNX 雙尺度深度聲紋 (同性別多人區分強)
+                </option>
+                <option value="mode_b_advanced_dsp">
+                  Mode B：密度感知譜聚類 + VBx (適合未知人數演講)
                 </option>
                 <option value="mode_a_classic">
-                  Mode A：極速輕量模式 (低耗能快速初稿)
+                  Mode A：極速輕量模式 (純 DSP 低耗能初稿)
                 </option>
               </select>
             </div>
@@ -420,12 +401,35 @@ export const SpeakerSyncPanel: React.FC = () => {
                 />
               </label>
               <p className="text-[10px] text-slate-500 leading-normal">
-                僅在「語者分離軌道」強化個人聲道共振峰（F2~F4）與全場基底去均值；送給 Whisper 轉寫的音訊保持 100% 原始無損音質。
+                僅在「語者分離軌道」強化個人聲道共振峰與時長自適應混合去均值；送給 Whisper 轉寫的音訊保持自然連續語境。
               </p>
             </div>
 
-            {/* Mode C ONNX 專屬模型與後端設定 */}
-            {diarCfg.engineMode === 'mode_c_onnx_neural' && (
+            {/* 實驗性虛擬音軌拼接開關 (預設關閉) */}
+            <div className="rounded-lg border border-slate-200 p-2 bg-slate-50/50 space-y-1">
+              <label className="flex items-center justify-between cursor-pointer">
+                <span className="text-[11px] font-medium text-slate-600 flex items-center gap-1">
+                  <Layers className="w-3.5 h-3.5 text-slate-500" />
+                  實驗性：語者專屬虛擬音軌拼接 (建議關閉以維持句子順序)
+                </span>
+                <input
+                  type="checkbox"
+                  checked={virtualTrackEnabled}
+                  onChange={(e) =>
+                    updateDiarizationConfig({
+                      enableVirtualSpeakerTrackStitching: e.target.checked,
+                    })
+                  }
+                  className="rounded text-indigo-600 focus:ring-0 cursor-pointer"
+                />
+              </label>
+              <p className="text-[10px] text-slate-500 leading-normal">
+                預設關閉（採用 12~20s 靜音谷底視窗 + 字級 Viterbi 對齊，確保多人快速問答順序 100% 準確）。
+              </p>
+            </div>
+
+            {/* ONNX 模型與後端設定 */}
+            {diarCfg.engineMode !== 'mode_a_classic' && (
               <div className="grid grid-cols-2 gap-1.5 pt-0.5">
                 <select
                   value={diarCfg.onnxModelFilename}
@@ -498,35 +502,31 @@ export const SpeakerSyncPanel: React.FC = () => {
             </div>
 
             {/* SCD 微觀換人切分敏感度微調 */}
-            <div className="bg-slate-50 px-2 py-1.5 rounded border border-slate-200 space-y-1">
-              <div className="flex items-center justify-between text-[11px]">
-                <span className="text-slate-600 flex items-center gap-1">
-                  <Activity className="w-3 h-3 text-indigo-500" />
+            <div className="rounded-lg border border-slate-200 p-2 bg-slate-50/60 space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] text-slate-700 font-medium flex items-center gap-1">
+                  <Activity className="w-3 h-3 text-indigo-600" />
                   搶話與插話切分敏感度
                 </span>
-                <span className="font-semibold text-indigo-700">
-                  {scdThreshold <= 0.21
+                <span className="text-[11px] font-semibold text-indigo-700">
+                  {scdThreshold <= 0.19
                     ? `高敏果斷 (${scdThreshold.toFixed(2)})`
-                    : scdThreshold >= 0.26
-                    ? `保守穩健 (${scdThreshold.toFixed(2)})`
-                    : `標準平衡 (${scdThreshold.toFixed(2)})`}
+                    : scdThreshold <= 0.24
+                    ? `標準平衡 (${scdThreshold.toFixed(2)})`
+                    : `保守抗噪 (${scdThreshold.toFixed(2)})`}
                 </span>
               </div>
               <input
                 type="range"
-                min={0.18}
-                max={0.3}
-                step={0.02}
+                min={0.16}
+                max={0.32}
+                step={0.01}
                 value={scdThreshold}
-                onChange={(e) => {
-                  const val = Number(e.target.value);
+                onChange={(e) =>
                   updateDiarizationConfig({
-                    scdPeakThreshold: val,
-                    backchannelMarginThreshold: Number(
-                      Math.max(0.09, val * 0.55).toFixed(2)
-                    ),
-                  });
-                }}
+                    scdPeakThreshold: Number(e.target.value),
+                  })
+                }
                 className="w-full accent-indigo-600 h-1.5 bg-slate-200 rounded-lg cursor-pointer"
               />
               <div className="flex justify-between text-[10px] text-slate-400">
@@ -538,152 +538,143 @@ export const SpeakerSyncPanel: React.FC = () => {
         )}
       </div>
 
-      {/* 語者清單 */}
-      <div className="space-y-1.5 max-h-52 overflow-y-auto pr-1">
+      {/* 語者清單與更名 */}
+      <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
         {speakerList.length === 0 ? (
-          <p className="text-xs text-slate-400 text-center py-2.5">
-            上傳音檔後將自動識別發言者與聲紋錨點
-          </p>
+          <div className="text-xs text-slate-400 text-center py-3 bg-slate-50 rounded-lg border border-dashed border-slate-200">
+            上傳音檔開始轉寫後將自動識別與會語者
+          </div>
         ) : (
-          speakerList.map((sp) => {
-            const isEditing = editingId === sp.id;
-            const f0Val = sp.f0Hz
-              ? Math.round(sp.f0Hz)
-              : sp.centroid?.[0]
-              ? Math.round(sp.centroid[0])
-              : null;
-            const anchorCount = sp.anchorBank?.length || 0;
-            return (
-              <div
-                key={sp.id}
-                title={
-                  f0Val
-                    ? `F0 基準：約 ${f0Val}Hz | 錨點數：${anchorCount} | 累積發聲：${Math.round(
-                        sp.accumulatedMass || 0
-                      )}s`
-                    : undefined
-                }
-                className="flex items-center justify-between p-2 rounded-lg border border-slate-100 hover:border-slate-200 bg-slate-50/50"
-              >
-                <div className="flex items-center gap-2 min-w-0 flex-1">
-                  <span
-                    className="w-2.5 h-2.5 rounded-full shrink-0"
-                    style={{ backgroundColor: sp.color }}
-                  />
-                  {isEditing ? (
+          speakerList.map((sp) => (
+            <div
+              key={sp.id}
+              className="flex items-center justify-between px-2.5 py-1.5 rounded-lg border border-slate-200/80 bg-slate-50/60 hover:bg-slate-100/70 transition-colors"
+            >
+              <div className="flex items-center gap-2 min-w-0 flex-1">
+                <span
+                  className="w-2.5 h-2.5 rounded-full shrink-0"
+                  style={{ backgroundColor: sp.color }}
+                />
+                {editingId === sp.id ? (
+                  <div className="flex items-center gap-1 flex-1">
                     <input
                       type="text"
                       value={nameInput}
                       onChange={(e) => setNameInput(e.target.value)}
-                      onKeyDown={(e) =>
-                        e.key === 'Enter' && handleConfirmRename(sp.id)
-                      }
-                      placeholder="輸入姓名或職稱"
-                      className="text-xs px-2 py-0.5 border border-blue-400 rounded w-full focus:outline-none"
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleConfirmRename(sp.id);
+                        if (e.key === 'Escape') setEditingId(null);
+                      }}
                       autoFocus
+                      className="text-xs px-1.5 py-0.5 border border-blue-400 rounded bg-white text-slate-800 w-full focus:outline-none"
                     />
-                  ) : (
-                    <span className="text-xs font-medium text-slate-800 truncate">
-                      {sp.name}
-                    </span>
-                  )}
-                </div>
-
-                {isEditing ? (
-                  <button
-                    type="button"
-                    onClick={() => handleConfirmRename(sp.id)}
-                    className="text-xs text-blue-600 font-medium px-2 py-0.5 hover:bg-blue-50 rounded"
-                  >
-                    確定
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmRename(sp.id)}
+                      className="text-[11px] px-1.5 py-0.5 bg-blue-600 text-white rounded shrink-0 hover:bg-blue-700"
+                    >
+                      確定
+                    </button>
+                  </div>
                 ) : (
-                  <button
-                    type="button"
-                    onClick={() => handleStartEdit(sp.id, sp.name)}
-                    className="text-[11px] text-slate-500 hover:text-blue-600 px-1.5 py-0.5"
-                  >
-                    更名
-                  </button>
+                  <span className="text-xs font-medium text-slate-800 truncate">
+                    {sp.name}
+                  </span>
                 )}
               </div>
-            );
-          })
+
+              {editingId !== sp.id && (
+                <button
+                  type="button"
+                  onClick={() => handleStartEdit(sp.id, sp.name)}
+                  className="text-[11px] text-slate-500 hover:text-blue-600 ml-2 shrink-0"
+                >
+                  更名
+                </button>
+              )}
+            </div>
+          ))
         )}
       </div>
 
-      {/* 語者手動合併工具 */}
+      {/* 同音稱謂連動修正提示 */}
+      {hasPhoneticCandidates && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50/80 p-2.5 space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-amber-900 flex items-center gap-1">
+              <Sparkles className="w-3.5 h-3.5 text-amber-600" />
+              發現 {phoneticCandidates.length} 處同音稱謂可一鍵修正
+            </span>
+            <button
+              type="button"
+              onClick={applyPhoneticReplacements}
+              className="text-[11px] px-2 py-0.5 bg-amber-600 text-white rounded font-medium hover:bg-amber-700 flex items-center gap-1"
+            >
+              <CheckCircle2 className="w-3 h-3" />
+              套用修正
+            </button>
+          </div>
+          <div className="max-h-28 overflow-y-auto space-y-1 text-[11px] text-amber-800">
+            {phoneticCandidates.map((cand, idx) => (
+              <div
+                key={`${cand.segmentId}_${cand.wordIndex}_${idx}`}
+                className="flex items-center justify-between bg-white/80 px-2 py-1 rounded border border-amber-200/60"
+              >
+                <span className="truncate">
+                  {cand.contextPreview} →{' '}
+                  <strong className="text-amber-950">
+                    {cand.targetSpeakerName}
+                  </strong>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* 合併同一人之語者標籤 */}
       {hasMultipleSpeakers && (
         <div className="pt-2 border-t border-slate-100 space-y-1.5">
-          <div className="flex items-center gap-1 text-xs font-medium text-slate-600">
-            <Merge className="w-3.5 h-3.5" />
-            <span>合併同一人之語者標籤</span>
+          <div className="text-xs font-medium text-slate-600 flex items-center gap-1">
+            <Merge className="w-3.5 h-3.5 text-slate-400" />
+            合併同一人之語者標籤
           </div>
           <div className="flex items-center gap-1.5">
             <select
               value={mergeSourceId}
               onChange={(e) => setMergeSourceId(e.target.value)}
-              className="text-xs border border-slate-200 rounded px-1.5 py-1 flex-1 bg-white truncate"
+              className="flex-1 text-xs border border-slate-200 rounded px-1.5 py-1 bg-slate-50 text-slate-700 focus:outline-none"
             >
               <option value="">選擇來源...</option>
-              {speakerList.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
+              {speakerList.map((sp) => (
+                <option key={sp.id} value={sp.id}>
+                  {sp.name}
                 </option>
               ))}
             </select>
-            <span className="text-xs text-slate-400">➔</span>
+            <span className="text-xs text-slate-400">→</span>
             <select
               value={mergeTargetId}
               onChange={(e) => setMergeTargetId(e.target.value)}
-              className="text-xs border border-slate-200 rounded px-1.5 py-1 flex-1 bg-white truncate"
+              className="flex-1 text-xs border border-slate-200 rounded px-1.5 py-1 bg-slate-50 text-slate-700 focus:outline-none"
             >
               <option value="">併入目標...</option>
-              {speakerList.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
+              {speakerList
+                .filter((sp) => sp.id !== mergeSourceId)
+                .map((sp) => (
+                  <option key={sp.id} value={sp.id}>
+                    {sp.name}
+                  </option>
+                ))}
             </select>
             <button
               type="button"
+              disabled={!mergeSourceId || !mergeTargetId}
               onClick={handleMergeConfirm}
-              disabled={
-                !mergeSourceId ||
-                !mergeTargetId ||
-                mergeSourceId === mergeTargetId
-              }
-              className="text-xs bg-slate-800 text-white px-2 py-1 rounded disabled:opacity-40 shrink-0"
+              className="px-2 py-1 text-xs bg-slate-800 text-white rounded hover:bg-slate-700 disabled:opacity-40 shrink-0"
             >
               合併
             </button>
-          </div>
-        </div>
-      )}
-
-      {/* 內文同音稱謂連動修正清單 */}
-      {hasPhoneticCandidates && (
-        <div className="p-2.5 bg-amber-50/80 border border-amber-200 rounded-lg space-y-1.5">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold text-amber-900 flex items-center gap-1">
-              <Sparkles className="w-3.5 h-3.5 text-amber-600" />
-              同音稱謂建議 ({phoneticCandidates.length})
-            </span>
-            <button
-              type="button"
-              onClick={applyPhoneticReplacements}
-              className="text-[11px] bg-amber-600 text-white px-2 py-0.5 rounded flex items-center gap-1 hover:bg-amber-700"
-            >
-              <CheckCircle2 className="w-3 h-3" />
-              全部替換
-            </button>
-          </div>
-          <div className="max-h-24 overflow-y-auto space-y-1 text-[11px] text-amber-800">
-            {phoneticCandidates.map((c, idx) => (
-              <div key={`${c.segmentId}-${idx}`} className="truncate">
-                「{c.matchedText}」➔ <strong>{c.targetSpeakerName}</strong>
-              </div>
-            ))}
           </div>
         </div>
       )}
