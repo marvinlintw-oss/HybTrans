@@ -7,14 +7,12 @@ import {
   Sliders,
   Sparkles,
   Info,
-  Cpu,
   Globe2,
   Activity,
   ChevronDown,
   ChevronUp,
-  ShieldCheck,
-  Waves,
-  Layers,
+  HelpCircle,
+  Settings2,
 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import {
@@ -25,55 +23,98 @@ import {
 } from '../../types';
 import * as phoneticModule from '../../utils/phoneticMatcher';
 
-const ENGINE_STRATEGY_GUIDES: Record<
-  DiarizationEngineMode,
+interface ModeScenarioGuide {
+  shortBadge: string;
+  optionLabel: string;
+  whyChoose: string;
+  bestFor: string;
+  notFor: string;
+  techPrincipleTitle: string;
+  techPrincipleDetail: string;
+}
+
+const ENGINE_STRATEGY_GUIDES: Record<DiarizationEngineMode, ModeScenarioGuide> =
   {
-    shortBadge: string;
-    title: string;
-    scenario: string;
-    strengths: string;
-    limitations: string;
-  }
-> = {
-  mode_0_heritage_classic: {
-    shortBadge: '兩階段神經定錨 (推薦)',
-    title: 'Mode 0：兩階段黃金長句定錨 + WeSpeaker 256維聲紋 (推薦)',
-    scenario:
-      '一般 2~6 人台灣商務與專案會議、男女與同性混合討論、包含頻繁無停頓接話與短促附和（「不算」、「對」）。',
-    strengths:
-      '自動載入 /public/models/ 下之 WeSpeaker 256 維模型執行第一階段長句定錨，再以「基頻跳變+能量谷底」精準切出微觀話輪，能同時分出多位同性別語者並保持句子時間順序 100% 精準。',
-    limitations:
-      '若環境有劇烈移動或多人完全同時間重疊大聲爭論，建議搭配微調敏感度滑桿。',
-  },
-  mode_b_advanced_dsp: {
-    shortBadge: '密度感知譜聚類',
-    title: 'Mode B：密度感知譜聚類 + 溫和先驗 VBx (NME-SC + VBx)',
-    scenario:
-      '人數未知、發言長度極度不均（例如 1 人主講 60%、少數語者僅偶爾插話幾句）的中大型會議。',
-    strengths:
-      '結合拉普拉斯特徵間隙、AHC 自然群數探測與阻尼先驗 VBx，不會因為主講人話量過大而吞併少數發言者（如僅講幾句話的第二位女性或男性與會者）。',
-    limitations:
-      '當會議室回音極重且未放置本地 ONNX 模型時，譜平滑對極短句的解析度略低於 AHC。',
-  },
-  mode_c_onnx_neural: {
-    shortBadge: 'ONNX 雙尺度深層聲紋',
-    title: 'Mode C：本地 WeSpeaker 256維雙尺度深度神經聲紋',
-    scenario:
-      '已於 /public/models/ 放置 ONNX 權重檔、且有多位同性別與會者（如 2女2男 或 3男2女）需要高維度音色區分時。',
-    strengths:
-      '256 維超球面聲紋對同性別不同人的細微腔調與共鳴分辨力最高，支援時長自適應混合 CMN 與短句週期延展保護。',
-    limitations:
-      '需預先放置本地 .onnx 模型檔（若未放置會自動退回 DSP 模式）。',
-  },
-  mode_a_classic: {
-    shortBadge: '極速輕量 DSP',
-    title: 'Mode A：極速輕量模式 (純 DSP 低耗能快速切分)',
-    scenario:
-      '文書筆電、長達 2 小時以上錄音，或僅需快速取得初稿再手動微調語者的情境。',
-    strengths: 'CPU 佔用率最低、轉檔等待時間最短，不會造成低階裝置發熱降頻。',
-    limitations:
-      '僅使用 64 維頻譜包絡特徵，對音色接近之同性別語者分辨力低於 WeSpeaker ONNX 模式。',
-  },
+    mode_0_heritage_classic: {
+      shortBadge: '標準會議 (推薦)',
+      optionLabel: '★ 標準會議模式（預設推薦・多數會議首選）',
+      whyChoose: '兼顧「多人聲音區分」與「對話先後順序」，開箱即用最穩定。',
+      bestFor: '2～6 人一般部門會議、專案討論、男女與同性別混合且有來回接話。',
+      notFor: '超過 2 小時以上長錄音且使用無獨顯舊筆電（建議改選快速省電模式）。',
+      techPrincipleTitle: '兩階段黃金長句定錨 + WeSpeaker 256維聲紋',
+      techPrincipleDetail:
+        '第一階段先抓取 1.2～2.2 秒高信噪比長句提取 256 維神經聲紋定錨語者；第二階段結合「基頻跳變 + 能量谷底 + 共振峰通量」切出微觀話輪，並以 12～20 秒靜音谷底視窗搭配字級 Viterbi 對齊，確保同性別可分開且句子順序不顛倒。',
+    },
+    mode_c_onnx_neural: {
+      shortBadge: '同性別精細區分',
+      optionLabel: '精細音色模式（多位同性別與會者）',
+      whyChoose: '針對聲音相近的同性別同事，強化細微腔調與音色共鳴的區分度。',
+      bestFor: '多位同性別與會者（如 3 女 1 男、全男或全女）且需要細分每個人時。',
+      notFor: '現場環境雜音極大、麥克風離太遠，或想最快拿到初稿時。',
+      techPrincipleTitle: 'WeSpeaker 256維雙尺度深度聲紋 + 短句延展',
+      techPrincipleDetail:
+        '融合宏觀與微觀雙尺度 256 維超球面神經聲紋，並針對短於 1 秒的附和詞執行時長自適應混合 CMN 與張量週期延展，最大化同性別不同語者的超球面餘弦邊際。',
+    },
+    mode_b_advanced_dsp: {
+      shortBadge: '主講與簡報',
+      optionLabel: '主講與簡報模式（一人主講、少數人提問）',
+      whyChoose: '保護偶爾才開口提問的人，不會因為主講人講太久而被系統吞併。',
+      bestFor: '教育訓練、專題發表、1 人主講佔 70% 以上時間、其他人僅偶爾插話。',
+      notFor: '每個人都在頻繁搶話、每句話都只有兩三個字的激烈討論。',
+      techPrincipleTitle: '密度感知譜聚類 (NME-SC) + 溫和先驗 VBx',
+      techPrincipleDetail:
+        '結合正規化拉普拉斯算子特徵間隙與阻尼先驗變分貝氏聚類（Tempered-Prior VBx），防止高發言量主講人的先驗機率過度膨脹而吸走少數發言者的短句。',
+    },
+    mode_a_classic: {
+      shortBadge: '快速省電初稿',
+      optionLabel: '快速省電模式（長錄音 / 一般文書筆電）',
+      whyChoose: '轉檔速度最快、最省電，適合先快速產出文字初稿再手動微調。',
+      bestFor: '1～2 小時以上長錄音、輕薄文書筆電，或不在意同性別細分的情境。',
+      notFor: '有多位同性別同事且希望系統自動精準分出每個人時。',
+      techPrincipleTitle: '純 DSP 64維共振峰統計池化 (無須 ONNX 模型)',
+      techPrincipleDetail:
+        '全程使用輕量級 64 維 Kaldi Fbank 共振峰包絡與時序統計池化（TSTP），CPU 與記憶體負擔最低，老舊筆電也能流暢執行。',
+    },
+  };
+
+/**
+ * 浮出式說明視窗組件 (Hover / Focus Popover)
+ * 平時只顯示輕巧圖示或文字標籤，滑鼠移過去時才浮出詳細說明視窗
+ */
+const HoverInfoPopover: React.FC<{
+  label?: string;
+  title: string;
+  children: React.ReactNode;
+  align?: 'left' | 'right';
+}> = ({ label, title, children, align = 'right' }) => {
+  return (
+    <div className="relative inline-flex items-center group">
+      <button
+        type="button"
+        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-indigo-600 transition-colors cursor-help focus:outline-none"
+      >
+        <HelpCircle className="w-3.5 h-3.5 shrink-0" />
+        {label && (
+          <span className="underline decoration-dotted underline-offset-2">
+            {label}
+          </span>
+        )}
+      </button>
+
+      {/* 浮出式說明卡片 */}
+      <div
+        className={`absolute ${
+          align === 'right' ? 'right-0' : 'left-0'
+        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 opacity-0 invisible group-hover:opacity-100 group-hover:visible group-focus-within:opacity-100 group-focus-within:visible transition-all duration-150 pointer-events-none group-hover:pointer-events-auto`}
+      >
+        <div className="font-semibold text-white mb-1 flex items-center gap-1.5 border-b border-slate-700/80 pb-1">
+          <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+          <span>{title}</span>
+        </div>
+        <div className="text-slate-300 space-y-1">{children}</div>
+      </div>
+    </div>
+  );
 };
 
 export const SpeakerSyncPanel: React.FC = () => {
@@ -94,7 +135,7 @@ export const SpeakerSyncPanel: React.FC = () => {
   const [nameInput, setNameInput] = useState('');
   const [mergeSourceId, setMergeSourceId] = useState<string>('');
   const [mergeTargetId, setMergeTargetId] = useState<string>('');
-  const [isStrategyExpanded, setIsStrategyExpanded] = useState<boolean>(false);
+  const [showAdvancedTech, setShowAdvancedTech] = useState<boolean>(false);
 
   const diarCfg = config.diarizationConfig || {
     engineMode: 'mode_0_heritage_classic',
@@ -117,7 +158,6 @@ export const SpeakerSyncPanel: React.FC = () => {
   const hasPhoneticCandidates = phoneticCandidates.length > 0;
   const scdThreshold = diarCfg.scdPeakThreshold ?? 0.22;
   const preprocEnabled = diarCfg.enableAcousticDivergencePreproc ?? true;
-  // 預設關閉會破壞多人搶話時間軸順序的 Virtual Speaker-Track Stitching
   const virtualTrackEnabled =
     diarCfg.enableVirtualSpeakerTrackStitching ?? false;
 
@@ -184,6 +224,7 @@ export const SpeakerSyncPanel: React.FC = () => {
         clusterMethod: 'ahc_cosine',
         scdPeakThreshold: 0.21,
         backchannelMarginThreshold: 0.11,
+        enableAcousticDivergencePreproc: true,
         enableVirtualSpeakerTrackStitching: false,
       });
     } else if (mode === 'mode_a_classic') {
@@ -192,6 +233,7 @@ export const SpeakerSyncPanel: React.FC = () => {
         clusterMethod: 'ahc_cosine',
         scdPeakThreshold: 0.27,
         backchannelMarginThreshold: 0.15,
+        enableAcousticDivergencePreproc: true,
         enableVirtualSpeakerTrackStitching: false,
       });
     } else if (mode === 'mode_b_advanced_dsp') {
@@ -200,6 +242,7 @@ export const SpeakerSyncPanel: React.FC = () => {
         clusterMethod: 'spectral_cosine',
         scdPeakThreshold: 0.22,
         backchannelMarginThreshold: 0.12,
+        enableAcousticDivergencePreproc: true,
         enableVirtualSpeakerTrackStitching: false,
       });
     } else {
@@ -208,6 +251,7 @@ export const SpeakerSyncPanel: React.FC = () => {
         clusterMethod: 'ahc_cosine',
         scdPeakThreshold: 0.19,
         backchannelMarginThreshold: 0.1,
+        enableAcousticDivergencePreproc: true,
         enableVirtualSpeakerTrackStitching: false,
       });
     }
@@ -215,34 +259,43 @@ export const SpeakerSyncPanel: React.FC = () => {
 
   return (
     <div className="bg-white rounded-xl border border-slate-200 p-3.5 shadow-sm space-y-3">
+      {/* 標題列 */}
       <div className="flex items-center justify-between border-b border-slate-100 pb-2">
         <div className="flex items-center gap-1.5">
           <Users className="w-4 h-4 text-blue-600" />
           <h3 className="font-semibold text-slate-800 text-sm">
-            與會語者與分離策略
+            與會語者與會議情境
           </h3>
-          <span
-            title="平時自動收摺進階聲紋設定；展開後可切換 4 種分離策略與微調換人切分敏感度"
-            className="text-slate-400 hover:text-slate-600 cursor-help"
-          >
-            <Info className="w-3.5 h-3.5" />
-          </span>
         </div>
         <span className="text-xs px-2 py-0.5 bg-blue-50 text-blue-700 rounded-full font-medium">
           {speakerList.length} 人
         </span>
       </div>
 
-      {/* 會議人數範圍設定 */}
+      {/* 1. 預估會議人數 */}
       <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200/80 space-y-2">
         <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-slate-700 flex items-center gap-1">
+          <div className="flex items-center gap-1">
             <Sliders className="w-3.5 h-3.5 text-slate-500" />
-            預估會議人數
-          </span>
+            <span className="text-xs font-medium text-slate-700">
+              預估會議人數
+            </span>
+            <HoverInfoPopover
+              title="如何設定會議人數？"
+              align="left"
+            >
+              <p>
+                • <strong>點選上方快捷鍵</strong>即可套用常見人數範圍。
+              </p>
+              <p>
+                • 若不確定實際有幾人開口，建議維持 <strong>2～6 人</strong>，系統會根據聲音特徵自動判斷實際人數。
+              </p>
+            </HoverInfoPopover>
+          </div>
+
           <div className="flex items-center gap-1">
             {[
-              { label: '2人對談', min: 2, max: 2 },
+              { label: '2人', min: 2, max: 2 },
               { label: '2~4人', min: 2, max: 4 },
               { label: '2~6人', min: 2, max: 6 },
               { label: '4~8人', min: 4, max: 8 },
@@ -274,8 +327,8 @@ export const SpeakerSyncPanel: React.FC = () => {
         </div>
 
         <div className="grid grid-cols-2 gap-2">
-          <div className="bg-white px-2 py-1.5 rounded border border-slate-200 flex items-center justify-between">
-            <span className="text-xs text-slate-500">最少</span>
+          <div className="bg-white px-2 py-1 rounded border border-slate-200 flex items-center justify-between">
+            <span className="text-xs text-slate-500">最少人數</span>
             <input
               type="number"
               min={1}
@@ -285,8 +338,8 @@ export const SpeakerSyncPanel: React.FC = () => {
               className="w-10 text-right font-semibold text-xs text-slate-800 focus:outline-none border-b border-slate-300"
             />
           </div>
-          <div className="bg-white px-2 py-1.5 rounded border border-slate-200 flex items-center justify-between">
-            <span className="text-xs text-slate-500">最多</span>
+          <div className="bg-white px-2 py-1 rounded border border-slate-200 flex items-center justify-between">
+            <span className="text-xs text-slate-500">最多人數</span>
             <input
               type="number"
               min={1}
@@ -299,95 +352,235 @@ export const SpeakerSyncPanel: React.FC = () => {
         </div>
       </div>
 
-      {/* 可收摺的語者分離策略設定區 */}
-      <div className="rounded-lg border border-slate-200/90 bg-slate-50/70 overflow-hidden">
-        <button
-          type="button"
-          onClick={() => setIsStrategyExpanded((prev) => !prev)}
-          className="w-full flex items-center justify-between px-2.5 py-2 text-left hover:bg-slate-100/80 transition-colors"
+      {/* 2. 會議情境模式選擇 (白話直覺版 + 浮出式技術說明) */}
+      <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-2.5 space-y-2">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-slate-700">
+            會議情境模式
+          </span>
+          <HoverInfoPopover
+            label="技術原理說明"
+            title={currentGuide.techPrincipleTitle}
+            align="right"
+          >
+            <p>{currentGuide.techPrincipleDetail}</p>
+            <p className="text-indigo-300 pt-1 border-t border-slate-700/80">
+              💡 系統已自動為此情境配好最佳分群與聲紋強化參數，一般使用無須手動調整。
+            </p>
+          </HoverInfoPopover>
+        </div>
+
+        <select
+          value={diarCfg.engineMode}
+          onChange={(e) =>
+            handleSelectEngineMode(e.target.value as DiarizationEngineMode)
+          }
+          className="w-full bg-white border border-slate-300 rounded-md px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:border-blue-500 shadow-2xs"
         >
-          <div className="flex items-center gap-1.5 min-w-0">
-            <Cpu className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
-            <span className="text-xs font-medium text-slate-700 shrink-0">
-              分離策略：
-            </span>
-            <span className="text-[11px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200/80 px-1.5 py-0.5 rounded truncate">
-              {currentGuide.shortBadge}
-            </span>
+          <option value="mode_0_heritage_classic">
+            {ENGINE_STRATEGY_GUIDES.mode_0_heritage_classic.optionLabel}
+          </option>
+          <option value="mode_c_onnx_neural">
+            {ENGINE_STRATEGY_GUIDES.mode_c_onnx_neural.optionLabel}
+          </option>
+          <option value="mode_b_advanced_dsp">
+            {ENGINE_STRATEGY_GUIDES.mode_b_advanced_dsp.optionLabel}
+          </option>
+          <option value="mode_a_classic">
+            {ENGINE_STRATEGY_GUIDES.mode_a_classic.optionLabel}
+          </option>
+        </select>
+
+        {/* 簡潔三行情境提示：為什麼選 / 適合 / 不適合 */}
+        <div className="rounded-md bg-white border border-slate-200/90 p-2 text-[11px] leading-relaxed space-y-1">
+          <div className="text-slate-800">
+            <span className="font-semibold text-indigo-700">💡 為什麼選：</span>
+            {currentGuide.whyChoose}
           </div>
-          <div className="flex items-center gap-1 text-[11px] text-slate-500 shrink-0">
-            <span>{isStrategyExpanded ? '收起' : '變更 / 說明'}</span>
-            {isStrategyExpanded ? (
+          <div className="text-slate-700">
+            <span className="font-semibold text-emerald-700">✅ 適合情境：</span>
+            {currentGuide.bestFor}
+          </div>
+          <div className="text-slate-500">
+            <span className="font-semibold text-amber-700">⚠️ 不適合：</span>
+            {currentGuide.notFor}
+          </div>
+        </div>
+
+        {/* 會議語言與插話敏感度 (精簡直覺版) */}
+        <div className="grid grid-cols-2 gap-1.5 pt-0.5">
+          <div className="flex items-center bg-white px-2 py-1 rounded border border-slate-200">
+            <Globe2 className="w-3.5 h-3.5 text-slate-400 shrink-0 mr-1.5" />
+            <select
+              value={diarCfg.languageHint}
+              onChange={(e) =>
+                updateDiarizationConfig({
+                  languageHint: e.target.value as MeetingLanguageHint,
+                })
+              }
+              className="text-[11px] font-medium text-slate-700 bg-transparent focus:outline-none w-full"
+            >
+              <option value="zh">華語 / 中英夾雜</option>
+              <option value="auto_multilingual">中 / 英 / 日混用</option>
+              <option value="ja">日本語會議</option>
+              <option value="en">English</option>
+            </select>
+          </div>
+
+          <div className="flex items-center justify-between bg-white px-2 py-1 rounded border border-slate-200">
+            <div className="flex items-center gap-1 min-w-0">
+              <Activity className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+              <select
+                value={
+                  scdThreshold <= 0.19
+                    ? 'high'
+                    : scdThreshold <= 0.24
+                    ? 'normal'
+                    : 'low'
+                }
+                onChange={(e) => {
+                  const val = e.target.value;
+                  updateDiarizationConfig({
+                    scdPeakThreshold:
+                      val === 'high' ? 0.18 : val === 'normal' ? 0.22 : 0.27,
+                  });
+                }}
+                className="text-[11px] font-medium text-slate-700 bg-transparent focus:outline-none"
+              >
+                <option value="high">換人：積極切分</option>
+                <option value="normal">換人：標準平衡</option>
+                <option value="low">換人：減少碎切</option>
+              </select>
+            </div>
+            <HoverInfoPopover
+              title="換人切分敏感度說明"
+              align="right"
+            >
+              <p>
+                • <strong>標準平衡（預設）</strong>：適合絕大多數會議。
+              </p>
+              <p>
+                • <strong>積極切分</strong>：當大家頻繁插話（「對」、「沒錯」），覺得兩個人常被黏在同一句時選這個。
+              </p>
+              <p>
+                • <strong>減少碎切</strong>：當同一個人講話常停頓喘氣，卻被誤切成兩個人時選這個。
+              </p>
+            </HoverInfoPopover>
+          </div>
+        </div>
+
+        {/* 進階工程微調 (預設收起，不干擾一般同事) */}
+        <div className="pt-1 border-t border-slate-200/70">
+          <button
+            type="button"
+            onClick={() => setShowAdvancedTech((prev) => !prev)}
+            className="w-full flex items-center justify-between text-[11px] text-slate-400 hover:text-slate-600 py-0.5 transition-colors"
+          >
+            <span className="flex items-center gap-1">
+              <Settings2 className="w-3 h-3" />
+              進階工程微調（一般同事無須調整）
+            </span>
+            {showAdvancedTech ? (
               <ChevronUp className="w-3.5 h-3.5" />
             ) : (
               <ChevronDown className="w-3.5 h-3.5" />
             )}
-          </div>
-        </button>
+          </button>
 
-        {isStrategyExpanded && (
-          <div className="p-2.5 border-t border-slate-200/80 space-y-2.5 text-xs bg-white">
-            {/* 策略選擇器 */}
-            <div className="space-y-1">
-              <label className="text-[11px] font-medium text-slate-600 block">
-                選擇語者分離核心策略：
-              </label>
-              <select
-                value={diarCfg.engineMode}
-                onChange={(e) =>
-                  handleSelectEngineMode(
-                    e.target.value as DiarizationEngineMode
-                  )
-                }
-                className="w-full bg-slate-50 border border-slate-300 rounded-md px-2 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:border-indigo-500"
-              >
-                <option value="mode_0_heritage_classic">
-                  ★ Mode 0：兩階段黃金長句定錨 + WeSpeaker (最穩定推薦)
-                </option>
-                <option value="mode_c_onnx_neural">
-                  Mode C：WeSpeaker ONNX 雙尺度深度聲紋 (同性別多人區分強)
-                </option>
-                <option value="mode_b_advanced_dsp">
-                  Mode B：密度感知譜聚類 + VBx (適合未知人數演講)
-                </option>
-                <option value="mode_a_classic">
-                  Mode A：極速輕量模式 (純 DSP 低耗能初稿)
-                </option>
-              </select>
-            </div>
+          {showAdvancedTech && (
+            <div className="mt-2 pt-2 border-t border-slate-200/60 space-y-2 text-[11px]">
+              {/* 細部滑桿與演算法選項，皆附帶浮出視窗說明 */}
+              <div className="flex items-center justify-between">
+                <span className="text-slate-600 flex items-center gap-1">
+                  分群演算法
+                  <HoverInfoPopover
+                    title="分群演算法差異"
+                    align="left"
+                  >
+                    <p>
+                      • <strong>AHC 階層凝聚</strong>：對同性別不同音色的切分較果斷，適合 2～6 人商務會議。
+                    </p>
+                    <p>
+                      • <strong>NME-SC 譜聚類</strong>：利用全局相似度圖譜平滑分群，適合長篇演講。
+                    </p>
+                  </HoverInfoPopover>
+                </span>
+                <select
+                  value={diarCfg.clusterMethod}
+                  onChange={(e) =>
+                    updateDiarizationConfig({
+                      clusterMethod:
+                        e.target.value as DiarizationClusterMethod,
+                    })
+                  }
+                  className="bg-white border border-slate-200 rounded px-1.5 py-0.5 text-[11px] text-slate-700"
+                >
+                  <option value="ahc_cosine">AHC 階層凝聚 (果斷)</option>
+                  <option value="spectral_cosine">NME-SC 譜聚類 (平滑)</option>
+                </select>
+              </div>
 
-            {/* 白話情境、強項與限制說明卡 */}
-            <div className="rounded-lg bg-slate-50 border border-slate-200 p-2.5 space-y-1.5 text-[11px] leading-relaxed">
-              <div className="font-semibold text-slate-900 flex items-center gap-1">
-                <ShieldCheck className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
-                {currentGuide.title}
-              </div>
-              <div className="text-slate-700">
-                <span className="font-semibold text-slate-900">
-                  🎯 適用情境：
-                </span>
-                {currentGuide.scenario}
-              </div>
-              <div className="text-emerald-800">
-                <span className="font-semibold text-emerald-950">
-                  💪 核心強項：
-                </span>
-                {currentGuide.strengths}
-              </div>
-              <div className="text-amber-800">
-                <span className="font-semibold text-amber-950">
-                  ⚠️ 潛在限制：
-                </span>
-                {currentGuide.limitations}
-              </div>
-            </div>
+              {diarCfg.engineMode !== 'mode_a_classic' && (
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600 flex items-center gap-1">
+                    聲紋模型與運算後端
+                    <HoverInfoPopover
+                      title="聲紋模型與執行後端"
+                      align="left"
+                    >
+                      <p>
+                        • <strong>WeSpeaker ResNet34</strong>：256 維神經聲紋模型（存放於 <code>/public/models/</code>，未放置時自動退回 DSP）。
+                      </p>
+                      <p>
+                        • <strong>WASM 後端（推薦）</strong>：使用 CPU SIMD 運算，0 顯存佔用，把顯卡記憶體全部留給 Whisper 與 LLM。
+                      </p>
+                    </HoverInfoPopover>
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <select
+                      value={diarCfg.onnxModelFilename}
+                      onChange={(e) =>
+                        updateDiarizationConfig({
+                          onnxModelFilename:
+                            e.target.value as CompliantOnnxSpeakerModel,
+                        })
+                      }
+                      className="bg-white border border-slate-200 rounded px-1.5 py-0.5 text-[10px] text-slate-700 max-w-[115px] truncate"
+                    >
+                      <option value="wespeaker_voxceleb_resnet34_int8.onnx">
+                        WeSpeaker ResNet34
+                      </option>
+                      <option value="nemo_en_titanet_small.int8.onnx">
+                        NeMo TitaNet
+                      </option>
+                    </select>
+                    <select
+                      value={diarCfg.executionBackend}
+                      onChange={(e) =>
+                        updateDiarizationConfig({
+                          executionBackend: e.target.value as 'wasm' | 'webgpu',
+                        })
+                      }
+                      className="bg-white border border-slate-200 rounded px-1.5 py-0.5 text-[10px] text-slate-700"
+                    >
+                      <option value="wasm">WASM</option>
+                      <option value="webgpu">WebGPU</option>
+                    </select>
+                  </div>
+                </div>
+              )}
 
-            {/* 雙軌無損聲紋差異強化預處理開關 */}
-            <div className="rounded-lg border border-slate-200 p-2 bg-slate-50/70 space-y-1">
               <label className="flex items-center justify-between cursor-pointer">
-                <span className="text-[11px] font-semibold text-slate-800 flex items-center gap-1">
-                  <Waves className="w-3.5 h-3.5 text-blue-600" />
-                  雙軌無損聲紋差異強化預處理
+                <span className="text-slate-600 flex items-center gap-1">
+                  雙軌聲紋差異強化
+                  <HoverInfoPopover
+                    title="雙軌無損聲紋差異強化"
+                    align="left"
+                  >
+                    <p>
+                      僅在「語者分離軌道」強化個人聲道共振峰（F2～F4）與時長自適應去均值；送給 Whisper 轉寫的音訊保持 100% 原始自然音質。建議保持開啟。
+                    </p>
+                  </HoverInfoPopover>
                 </span>
                 <input
                   type="checkbox"
@@ -400,17 +593,18 @@ export const SpeakerSyncPanel: React.FC = () => {
                   className="rounded text-blue-600 focus:ring-0 cursor-pointer"
                 />
               </label>
-              <p className="text-[10px] text-slate-500 leading-normal">
-                僅在「語者分離軌道」強化個人聲道共振峰與時長自適應混合去均值；送給 Whisper 轉寫的音訊保持自然連續語境。
-              </p>
-            </div>
 
-            {/* 實驗性虛擬音軌拼接開關 (預設關閉) */}
-            <div className="rounded-lg border border-slate-200 p-2 bg-slate-50/50 space-y-1">
               <label className="flex items-center justify-between cursor-pointer">
-                <span className="text-[11px] font-medium text-slate-600 flex items-center gap-1">
-                  <Layers className="w-3.5 h-3.5 text-slate-500" />
-                  實驗性：語者專屬虛擬音軌拼接 (建議關閉以維持句子順序)
+                <span className="text-slate-500 flex items-center gap-1">
+                  實驗性：同語者音軌拼接
+                  <HoverInfoPopover
+                    title="實驗性：語者專屬虛擬音軌拼接"
+                    align="left"
+                  >
+                    <p>
+                      將同一位語者散落在不同時間的片段拼成同一條音軌送給 Whisper。在多人快速問答時較容易發生時間錯位，<strong>強烈建議保持關閉</strong>（預設採用 12～20 秒靜音谷底視窗 + 字級 Viterbi 對齊）。
+                    </p>
+                  </HoverInfoPopover>
                 </span>
                 <input
                   type="checkbox"
@@ -423,122 +617,12 @@ export const SpeakerSyncPanel: React.FC = () => {
                   className="rounded text-indigo-600 focus:ring-0 cursor-pointer"
                 />
               </label>
-              <p className="text-[10px] text-slate-500 leading-normal">
-                預設關閉（採用 12~20s 靜音谷底視窗 + 字級 Viterbi 對齊，確保多人快速問答順序 100% 準確）。
-              </p>
             </div>
-
-            {/* ONNX 模型與後端設定 */}
-            {diarCfg.engineMode !== 'mode_a_classic' && (
-              <div className="grid grid-cols-2 gap-1.5 pt-0.5">
-                <select
-                  value={diarCfg.onnxModelFilename}
-                  onChange={(e) =>
-                    updateDiarizationConfig({
-                      onnxModelFilename:
-                        e.target.value as CompliantOnnxSpeakerModel,
-                    })
-                  }
-                  title="自託管於 /public/models/ 目錄下"
-                  className="bg-white border border-indigo-200 rounded px-1.5 py-1 text-[10px] text-indigo-900 truncate"
-                >
-                  <option value="wespeaker_voxceleb_resnet34_int8.onnx">
-                    WeSpeaker ResNet34 (推薦)
-                  </option>
-                  <option value="nemo_en_titanet_small.int8.onnx">
-                    NeMo TitaNet-Small (INT8)
-                  </option>
-                </select>
-                <select
-                  value={diarCfg.executionBackend}
-                  onChange={(e) =>
-                    updateDiarizationConfig({
-                      executionBackend: e.target.value as 'wasm' | 'webgpu',
-                    })
-                  }
-                  className="bg-white border border-slate-200 rounded px-1.5 py-1 text-[10px] text-slate-700"
-                >
-                  <option value="wasm">後端：WASM (0顯存)</option>
-                  <option value="webgpu">後端：WebGPU</option>
-                </select>
-              </div>
-            )}
-
-            <div className="grid grid-cols-2 gap-1.5">
-              <div className="flex items-center justify-between bg-slate-50 px-2 py-1 rounded border border-slate-200">
-                <span className="text-[11px] text-slate-500">分群法:</span>
-                <select
-                  value={diarCfg.clusterMethod}
-                  onChange={(e) =>
-                    updateDiarizationConfig({
-                      clusterMethod:
-                        e.target.value as DiarizationClusterMethod,
-                    })
-                  }
-                  className="text-[11px] font-medium text-slate-800 bg-transparent focus:outline-none"
-                >
-                  <option value="ahc_cosine">AHC 階層凝聚 (果斷)</option>
-                  <option value="spectral_cosine">NME-SC 譜聚類 (平滑)</option>
-                </select>
-              </div>
-
-              <div className="flex items-center justify-between bg-slate-50 px-2 py-1 rounded border border-slate-200">
-                <Globe2 className="w-3 h-3 text-slate-400 shrink-0 mr-1" />
-                <select
-                  value={diarCfg.languageHint}
-                  onChange={(e) =>
-                    updateDiarizationConfig({
-                      languageHint: e.target.value as MeetingLanguageHint,
-                    })
-                  }
-                  className="text-[11px] font-medium text-slate-800 bg-transparent focus:outline-none w-full"
-                >
-                  <option value="zh">華語/中英夾雜會議</option>
-                  <option value="auto_multilingual">中/英/日自動混用</option>
-                  <option value="ja">日本語會議 (相槌保護)</option>
-                  <option value="en">English Meeting</option>
-                </select>
-              </div>
-            </div>
-
-            {/* SCD 微觀換人切分敏感度微調 */}
-            <div className="rounded-lg border border-slate-200 p-2 bg-slate-50/60 space-y-1">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] text-slate-700 font-medium flex items-center gap-1">
-                  <Activity className="w-3 h-3 text-indigo-600" />
-                  搶話與插話切分敏感度
-                </span>
-                <span className="text-[11px] font-semibold text-indigo-700">
-                  {scdThreshold <= 0.19
-                    ? `高敏果斷 (${scdThreshold.toFixed(2)})`
-                    : scdThreshold <= 0.24
-                    ? `標準平衡 (${scdThreshold.toFixed(2)})`
-                    : `保守抗噪 (${scdThreshold.toFixed(2)})`}
-                </span>
-              </div>
-              <input
-                type="range"
-                min={0.16}
-                max={0.32}
-                step={0.01}
-                value={scdThreshold}
-                onChange={(e) =>
-                  updateDiarizationConfig({
-                    scdPeakThreshold: Number(e.target.value),
-                  })
-                }
-                className="w-full accent-indigo-600 h-1.5 bg-slate-200 rounded-lg cursor-pointer"
-              />
-              <div className="flex justify-between text-[10px] text-slate-400">
-                <span>← 數值越小：積極切出短句換人</span>
-                <span>數值越大：減少切分 →</span>
-              </div>
-            </div>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
-      {/* 語者清單與更名 */}
+      {/* 3. 語者清單與更名 */}
       <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
         {speakerList.length === 0 ? (
           <div className="text-xs text-slate-400 text-center py-3 bg-slate-50 rounded-lg border border-dashed border-slate-200">
@@ -597,7 +681,7 @@ export const SpeakerSyncPanel: React.FC = () => {
         )}
       </div>
 
-      {/* 同音稱謂連動修正提示 */}
+      {/* 4. 同音稱謂連動修正提示 */}
       {hasPhoneticCandidates && (
         <div className="rounded-lg border border-amber-200 bg-amber-50/80 p-2.5 space-y-2">
           <div className="flex items-center justify-between">
@@ -632,12 +716,20 @@ export const SpeakerSyncPanel: React.FC = () => {
         </div>
       )}
 
-      {/* 合併同一人之語者標籤 */}
+      {/* 5. 合併同一人之語者標籤 */}
       {hasMultipleSpeakers && (
         <div className="pt-2 border-t border-slate-100 space-y-1.5">
           <div className="text-xs font-medium text-slate-600 flex items-center gap-1">
             <Merge className="w-3.5 h-3.5 text-slate-400" />
-            合併同一人之語者標籤
+            <span>合併同一人之語者標籤</span>
+            <HoverInfoPopover
+              title="什麼時候需要合併語者？"
+              align="left"
+            >
+              <p>
+                若同一位同事因為某幾句笑聲或音量變化被分成兩個標籤（例如「語者 01」與「語者 04」其實是同一人），可在此將「語者 04」併入「語者 01」，全文會自動同步合併。
+              </p>
+            </HoverInfoPopover>
           </div>
           <div className="flex items-center gap-1.5">
             <select
