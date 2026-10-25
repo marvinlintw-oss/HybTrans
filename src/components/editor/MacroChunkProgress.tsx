@@ -3,6 +3,8 @@ import React, { useState } from 'react';
 import {
   Loader2,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Download,
   Layers,
   Sparkles,
@@ -25,10 +27,15 @@ const STAGE_LABEL_MAP: Record<ChunkStage, string> = {
   idle: '等待處理',
   preprocessing: '音訊切片與降噪中',
   diarizing: '語者分離中',
+  DIARIZING: '語者分離中',
   transcribing: '語音轉文字中',
-  correcting: '前後文語境修正中',
+  TRANSCRIBING_ASR: '語音轉文字中',
+  correcting: '先句後詞兩階段語境修正中',
+  refining: '先句後詞兩階段語境修正中',
+  LLM_REFINING: '先句後詞兩階段語境修正中',
   relistening: '模糊段落重聽校準中',
   completed: '已完成',
+  COMPLETED: '已完成',
   error: '發生錯誤',
 };
 
@@ -38,6 +45,7 @@ export const MacroChunkProgress: React.FC = () => {
   const { isProcessing, stopPipeline, triggerRetroactivePass } =
     usePipelineScheduler();
   const [retroMsg, setRetroMsg] = useState<string | null>(null);
+  const [expandSummary, setExpandSummary] = useState<boolean>(false);
 
   const hasChunks = chunks.length > 0;
   const isDownloading = modelDownload?.active === true;
@@ -47,20 +55,27 @@ export const MacroChunkProgress: React.FC = () => {
   }
 
   const handleManualRetroPass = async () => {
-    setRetroMsg('正在用全場詞彙重順前文...');
+    setRetroMsg('正在用全場詞彙與先句後詞引擎潤飾現有逐字稿（不重跑音訊）...');
     const count = await triggerRetroactivePass();
     setRetroMsg(
       count > 0
-        ? `✨ 已回頭修正 ${count} 處前文同音詞！`
-        : '✨ 前後文用語已全數一致！'
+        ? `✨ 已回頭修正 ${count} 處跨句結構與同音詞！`
+        : '✨ 前後文句意與全場用語已全數一致！'
     );
     setTimeout(() => setRetroMsg(null), 3500);
   };
 
   const totalChunks = chunks.length;
-  const completedCount = chunks.filter((c) => c.stage === 'completed').length;
+  const completedCount = chunks.filter(
+    (c) => c.stage === 'completed' || c.stage === 'COMPLETED'
+  ).length;
   const activeChunk =
-    chunks.find((c) => c.stage !== 'idle' && c.stage !== 'completed') ||
+    chunks.find(
+      (c) =>
+        c.stage !== 'idle' &&
+        c.stage !== 'completed' &&
+        c.stage !== 'COMPLETED'
+    ) ||
     (completedCount === totalChunks && totalChunks > 0
       ? chunks[totalChunks - 1]
       : chunks[0]);
@@ -74,7 +89,9 @@ export const MacroChunkProgress: React.FC = () => {
           100,
           Math.round(
             ((completedCount * 100 +
-              (activeChunk && activeChunk.stage !== 'completed'
+              (activeChunk &&
+              activeChunk.stage !== 'completed' &&
+              activeChunk.stage !== 'COMPLETED'
                 ? activeChunk.progress
                 : 0)) /
               (totalChunks * 100)) *
@@ -84,8 +101,8 @@ export const MacroChunkProgress: React.FC = () => {
       : 0;
 
   return (
-    <div className="bg-white border-b border-slate-200 px-4 py-2 shadow-sm space-y-1.5">
-      <div className="w-full flex flex-wrap items-center justify-between gap-3 text-xs">
+    <div className="bg-white border-b border-slate-200 px-4 py-1.5 shadow-xs space-y-1">
+      <div className="w-full flex flex-wrap items-center justify-between gap-2 text-xs">
         {/* 左側：切塊資訊與當前進度 */}
         <div className="flex items-center gap-2 flex-wrap">
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-medium">
@@ -108,7 +125,7 @@ export const MacroChunkProgress: React.FC = () => {
               {isAllCompleted ? (
                 <span className="inline-flex items-center gap-1 text-emerald-600 font-semibold">
                   <CheckCircle2 className="w-4 h-4" />
-                  全部處理完成！
+                  全部處理完成！（可直接檢視與點擊下方逐字稿微調）
                 </span>
               ) : (
                 <>
@@ -129,7 +146,8 @@ export const MacroChunkProgress: React.FC = () => {
                   <span className="text-slate-300">|</span>
                   <span className="font-medium text-indigo-700 flex items-center gap-1">
                     <Sparkles className="w-3.5 h-3.5" />
-                    {activeChunk.detailText || STAGE_LABEL_MAP[activeChunk.stage]}{' '}
+                    {activeChunk.detailText ||
+                      STAGE_LABEL_MAP[activeChunk.stage]}{' '}
                     ({activeChunk.progress}%)
                   </span>
                 </>
@@ -138,17 +156,17 @@ export const MacroChunkProgress: React.FC = () => {
           )}
         </div>
 
-        {/* 右側：總進度條、「重順前文」與「停止轉檔」 */}
+        {/* 右側：總進度條、「AI 全文順稿」與「停止轉檔」 */}
         <div className="flex items-center gap-2">
           {segments.length > 0 && (
             <button
               type="button"
               onClick={handleManualRetroPass}
-              className="inline-flex items-center gap-1 px-2 py-1 rounded bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-medium text-xs transition-colors cursor-pointer"
-              title="利用目前累積至後文的完整詞彙與摘要，回頭重新順過前面的所有文字"
+              className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-medium text-xs transition-colors cursor-pointer"
+              title="不重跑音訊轉寫，僅利用目前累積至後文的完整詞彙與摘要，回頭重新順過所有文字（約 1~2 秒）"
             >
               <Wand2 className="w-3.5 h-3.5" />
-              重順前文
+              AI 全文順稿（不重跑音訊）
             </button>
           )}
 
@@ -210,13 +228,38 @@ export const MacroChunkProgress: React.FC = () => {
         </div>
       )}
 
-      {/* 動態滾動會議摘要 */}
+      {/* 動態滾動會議摘要（預設單行緊湊顯示，可點擊展開） */}
       {rollingMeetingSummary && (
-        <div className="px-2.5 py-1.5 bg-indigo-50/50 border border-indigo-200/70 rounded flex items-start gap-1.5 text-xs text-slate-700">
-          <FileText className="w-3.5 h-3.5 text-indigo-600 shrink-0 mt-0.5" />
-          <div className="text-[11px] text-slate-600 whitespace-pre-line leading-relaxed flex-1">
-            {rollingMeetingSummary}
+        <div
+          onClick={() => setExpandSummary((prev) => !prev)}
+          className="px-2.5 py-1 bg-indigo-50/50 border border-indigo-200/70 rounded flex items-start justify-between gap-2 text-xs text-slate-700 cursor-pointer hover:bg-indigo-50/80 transition-colors"
+          title="點擊展開或收合全場高頻核心詞與近期共識摘要"
+        >
+          <div className="flex items-start gap-1.5 min-w-0 flex-1">
+            <FileText className="w-3.5 h-3.5 text-indigo-600 shrink-0 mt-0.5" />
+            <div
+              className={`text-[11px] text-slate-600 leading-relaxed flex-1 ${
+                expandSummary
+                  ? 'whitespace-pre-line'
+                  : 'truncate whitespace-nowrap overflow-hidden'
+              }`}
+            >
+              {expandSummary
+                ? rollingMeetingSummary
+                : rollingMeetingSummary.replace(/\n+/g, ' ｜ ')}
+            </div>
           </div>
+          <span className="text-[10px] text-indigo-600 shrink-0 inline-flex items-center gap-0.5 mt-0.5">
+            {expandSummary ? (
+              <>
+                收合 <ChevronUp className="w-3 h-3" />
+              </>
+            ) : (
+              <>
+                展開摘要 <ChevronDown className="w-3 h-3" />
+              </>
+            )}
+          </span>
         </div>
       )}
     </div>

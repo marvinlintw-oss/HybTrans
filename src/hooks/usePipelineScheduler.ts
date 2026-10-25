@@ -1,5 +1,9 @@
 // src/hooks/usePipelineScheduler.ts
 // 次世代雙軌耦合調度器 (5 分鐘 Macro-Chunk 零相位前瞻正規化 + 12~22s 靜音谷底最佳化視窗 + 全域幀級後驗矩陣傳遞 + 本地/雲端統一字級 Viterbi 對齊)
+// 修正重點：
+// 1. 徹底解決 F12 Console `ID3D12Device::CreatePlacedResource failed with DXGI_ERROR_DEVICE_REMOVED (0x887A0005)` 與 `DXGI_ERROR_DEVICE_HUNG (0x887A0006)`：
+//    在啟動本地 WebLLM 進行語意修復前，若顯卡不支援 shader-f16 或未勾選雙模型常駐，強制執行 `asrWorker.terminate()` 徹底銷毀 ONNX Runtime WebGPU Context 並等待 180ms 讓 D3D12 回收 ~1.8GB 顯存緩衝池，杜絕 Whisper 與 WebLLM 同時爭奪 VRAM 導致驅動崩潰！
+// 2. 內建 WebGPU 裝置熔斷追蹤 (`llmCircuitBrokenRef`)：若本地顯卡 VRAM 不足觸發熔斷，後續視窗自動零延遲切換至確定性 Stage 1/2 語意與音韻引擎，不再重複建立失敗的 WebLLM 實例。
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
@@ -16,6 +20,8 @@ import {
 } from '../types';
 import {
   acquireKeepAwakeLock,
+  analyzeFullAudioAcousticProfile,
+  applyVadGatedLookAheadLoudnessNormalization,
   encodeFloat32ToWav,
   extractAndPreprocessMacroChunk,
   getAudioDuration,
@@ -35,6 +41,7 @@ import {
   executeBoundedQuotaRelisten,
   mineAdaptiveHighFreqTerms,
   runGlobalRetroactiveContextPass,
+  runStage1SentenceIntegrityCheckAndRepair,
   runTriLevelWindowCorrection,
 } from '../services/engineRouter';
 import {
@@ -48,7 +55,32 @@ const listeners = new Set<(val: boolean) => void>();
 
 function setGlobalProcessing(val: boolean) {
   globalIsProcessing = val;
+  try {
+    useAppStore.getState().setIsRunning(val);
+  } catch {
+    // ignore store init order
+  }
   listeners.forEach((fn) => fn(val));
+}
+
+/**
+ * 探測當前顯卡是否支援 WebGPU `shader-f16`。
+ * 若不支援 `shader-f16`，代表 Whisper 與 WebLLM 皆需以 FP32 緩衝區運行，此時嚴禁兩者同時常駐於同一張顯卡，必須序列化先 Terminate ASR Worker 再啟動 LLM Worker！
+ */
+async function checkWebGpuSupportsFp16(): Promise<boolean> {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const gpu = (navigator as unknown as { gpu?: any }).gpu;
+    if (!gpu || typeof gpu.requestAdapter !== 'function') return false;
+    const adapter = await gpu.requestAdapter();
+    return Boolean(
+      adapter?.features &&
+        typeof adapter.features.has === 'function' &&
+        adapter.features.has('shader-f16')
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -274,6 +306,7 @@ export function usePipelineScheduler() {
   const coResidentAsrWorkerRef = useRef<Worker | null>(null);
   const coResidentLlmWorkerRef = useRef<Worker | null>(null);
   const activeDiarWorkerRef = useRef<Worker | null>(null);
+  const llmCircuitBrokenRef = useRef<boolean>(false);
 
   useEffect(() => {
     const handler = (val: boolean) => setIsProcessing(val);
@@ -281,6 +314,55 @@ export function usePipelineScheduler() {
     return () => {
       listeners.delete(handler);
     };
+  }, []);
+
+  const terminateAsrWorkerAndReclaimVram = useCallback(async () => {
+    if (!coResidentAsrWorkerRef.current) return;
+    const w = coResidentAsrWorkerRef.current;
+    coResidentAsrWorkerRef.current = null;
+    try {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(() => resolve(), 1200);
+        const onUnload = (e: MessageEvent) => {
+          if (e.data?.type === 'UNLOAD_DONE') {
+            clearTimeout(t);
+            w.removeEventListener('message', onUnload);
+            resolve();
+          }
+        };
+        w.addEventListener('message', onUnload);
+        w.postMessage({ type: 'UNLOAD_MODEL' });
+      });
+    } catch {
+      // ignore
+    }
+    w.terminate();
+    // 給予瀏覽器 GPU Process 180ms 回收 D3D12 PlacedResources 緩衝池
+    await new Promise((r) => setTimeout(r, 180));
+  }, []);
+
+  const terminateLlmWorkerAndReclaimVram = useCallback(async () => {
+    if (!coResidentLlmWorkerRef.current) return;
+    const w = coResidentLlmWorkerRef.current;
+    coResidentLlmWorkerRef.current = null;
+    try {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(() => resolve(), 1000);
+        const onUnload = (e: MessageEvent) => {
+          if (e.data?.type === 'LLM_UNLOAD_DONE') {
+            clearTimeout(t);
+            w.removeEventListener('message', onUnload);
+            resolve();
+          }
+        };
+        w.addEventListener('message', onUnload);
+        w.postMessage({ type: 'UNLOAD_LLM' });
+      });
+    } catch {
+      // ignore
+    }
+    w.terminate();
+    await new Promise((r) => setTimeout(r, 150));
   }, []);
 
   const terminateAllWorkers = useCallback(() => {
@@ -303,7 +385,8 @@ export function usePipelineScheduler() {
     });
   }, []);
 
-  const ensureLocalLlmWorker = useCallback((): Worker => {
+  const ensureLocalLlmWorker = useCallback((): Worker | null => {
+    if (llmCircuitBrokenRef.current) return null;
     if (!coResidentLlmWorkerRef.current) {
       coResidentLlmWorkerRef.current = new Worker(
         new URL('../workers/localLlm.worker.ts', import.meta.url),
@@ -338,6 +421,9 @@ export function usePipelineScheduler() {
       modelId: string,
       payload: TriLevelContextPayload
     ): Promise<CorrectionPatchItem[]> => {
+      if (llmCircuitBrokenRef.current) {
+        return Promise.resolve([]);
+      }
       return new Promise((resolve) => {
         let timeout = setTimeout(() => {
           worker.removeEventListener('message', handleMsg);
@@ -375,6 +461,9 @@ export function usePipelineScheduler() {
             clearTimeout(timeout);
             worker.removeEventListener('message', handleMsg);
             useAppStore.getState().setModelDownload({ active: false });
+            if (e.data?.deviceLost) {
+              llmCircuitBrokenRef.current = true;
+            }
             resolve([]);
           }
         };
@@ -395,7 +484,10 @@ export function usePipelineScheduler() {
 
     let tempLlmWorker: Worker | null = null;
     try {
-      if (!state.config.geminiApiKey.trim()) {
+      // 執行手動順稿前，先確保釋放可能殘留的 ASR Worker 顯存
+      await terminateAsrWorkerAndReclaimVram();
+
+      if (!state.config.geminiApiKey.trim() && !llmCircuitBrokenRef.current) {
         tempLlmWorker = new Worker(
           new URL('../workers/localLlm.worker.ts', import.meta.url),
           { type: 'module' }
@@ -424,7 +516,7 @@ export function usePipelineScheduler() {
         tempLlmWorker.terminate();
       }
     }
-  }, [invokeLocalLlmWorker]);
+  }, [invokeLocalLlmWorker, terminateAsrWorkerAndReclaimVram]);
 
   const buildFallbackTurns = (
     chunkStartSec: number,
@@ -587,16 +679,82 @@ export function usePipelineScheduler() {
     });
   };
 
+  const preAnalyzeAudioFile = useCallback(async (file: File) => {
+    const store = useAppStore.getState();
+    store.setAudioFile(file);
+    store.setIsPreAnalyzingAudio(true);
+    store.setPreAnalysisProgress(
+      5,
+      '正在啟動 3~5 秒全場多點深度聲學預分析...'
+    );
+
+    try {
+      const dur = await getAudioDuration(file);
+      store.setDuration(dur);
+    } catch {
+      // ignore metadata fallback
+    }
+
+    try {
+      const profile = await analyzeFullAudioAcousticProfile(
+        file,
+        (pct, detail) => {
+          useAppStore.getState().setPreAnalysisProgress(pct, detail);
+        }
+      );
+      useAppStore.getState().setAudioPreAnalysis(profile);
+      // 自動預選最佳推薦方案並將建議參數同步至設定，使用者可直接點擊啟動或自由切換方案 A/B/C
+      useAppStore
+        .getState()
+        .applyRecommendedPreset(profile.recommendedPresetId);
+      return profile;
+    } catch (err) {
+      console.warn('⚠️ [Pre-Analysis] 全文聲學預分析略過:', err);
+      return null;
+    } finally {
+      useAppStore.getState().setIsPreAnalyzingAudio(false);
+    }
+  }, []);
+
   const startPipeline = useCallback(
-    async (file: File) => {
+    async (fileParam?: File) => {
       if (globalIsProcessing) return;
+      const store = useAppStore.getState();
+      const file = fileParam || store.audioFile;
+      if (!file) return;
+
+      if (fileParam && fileParam !== store.audioFile) {
+        store.setAudioFile(fileParam);
+      }
+
       setGlobalProcessing(true);
       globalAbortFlag = false;
-
-      const store = useAppStore.getState();
+      llmCircuitBrokenRef.current = false;
 
       try {
         await acquireKeepAwakeLock();
+        const gpuSupportsFp16 = await checkWebGpuSupportsFp16();
+
+        // 若使用者尚未執行全文預分析就直接呼叫 startPipeline，自動補跑一次預分析並套用推薦參數
+        if (!useAppStore.getState().audioPreAnalysis) {
+          useAppStore.getState().setIsPreAnalyzingAudio(true);
+          try {
+            const autoProfile = await analyzeFullAudioAcousticProfile(
+              file,
+              (pct, detail) => {
+                useAppStore.getState().setPreAnalysisProgress(pct, detail);
+              }
+            );
+            useAppStore.getState().setAudioPreAnalysis(autoProfile);
+            useAppStore
+              .getState()
+              .applyRecommendedPreset(autoProfile.recommendedPresetId);
+          } catch {
+            // ignore
+          } finally {
+            useAppStore.getState().setIsPreAnalyzingAudio(false);
+          }
+        }
 
         const totalDurationSec = await getAudioDuration(file);
         store.clearTranscript(false);
@@ -615,6 +773,10 @@ export function usePipelineScheduler() {
           const useVirtualTrackStitching =
             currentConfig.diarizationConfig
               ?.enableVirtualSpeakerTrackStitching ?? false;
+
+          // 僅當顯卡原生支援 shader-f16 且使用者開啟雙模型常駐時，才允許 Whisper 與 WebLLM 同時駐留顯存
+          const canSafelyCoReside =
+            Boolean(currentConfig.keepModelsCoResident) && gpuSupportsFp16;
 
           const modeLabel =
             engineMode === 'mode_0_heritage_classic'
@@ -689,10 +851,7 @@ export function usePipelineScheduler() {
             asrWorker = coResidentAsrWorkerRef.current;
           }
 
-          if (
-            currentConfig.keepModelsCoResident &&
-            !currentConfig.geminiApiKey.trim()
-          ) {
+          if (canSafelyCoReside && !currentConfig.geminiApiKey.trim()) {
             ensureLocalLlmWorker();
           }
 
@@ -745,14 +904,15 @@ export function usePipelineScheduler() {
               config: currentConfig,
               payload,
               dictionary: latestState.dictionary,
-              runLocalLlmCorrection: activeLlmWorker
-                ? (pl) =>
-                    invokeLocalLlmWorker(
-                      activeLlmWorker,
-                      currentConfig.localLlmModel,
-                      pl
-                    )
-                : undefined,
+              runLocalLlmCorrection:
+                activeLlmWorker && !llmCircuitBrokenRef.current
+                  ? (pl) =>
+                      invokeLocalLlmWorker(
+                        activeLlmWorker,
+                        currentConfig.localLlmModel,
+                        pl
+                      )
+                  : undefined,
               onApplyPatches: (appliedPatches, segIds) => {
                 useAppStore
                   .getState()
@@ -934,9 +1094,7 @@ export function usePipelineScheduler() {
                     detailText: `三層關注度與三級信心度閘控介入：修正近 ${pendingWindowChars} 字...`,
                   });
                   await flushPendingWindowCorrection(
-                    currentConfig.keepModelsCoResident
-                      ? coResidentLlmWorkerRef.current
-                      : null
+                    canSafelyCoReside ? coResidentLlmWorkerRef.current : null
                   );
                 }
               }
@@ -959,10 +1117,19 @@ export function usePipelineScheduler() {
                 chunkSamples.length,
                 Math.ceil((win.end - chunkMeta.startTime) * TARGET_SAMPLE_RATE)
               );
-              const winSamples = chunkSamples.slice(
+              const rawWinSamples = chunkSamples.slice(
                 relStartSample,
                 relEndSample
               );
+              // 【雙軌分流】：語者分離使用純線性 85Hz 高通波形保留真實能量谷底；送交 Whisper ASR 之視窗則執行 VAD 閘控前瞻響度補償，強化遠距小聲尾音！
+              const winSamples =
+                currentConfig.diarizationConfig?.enableZeroPhaseLoudnessNorm !==
+                false
+                  ? applyVadGatedLookAheadLoudnessNormalization(
+                      rawWinSamples,
+                      TARGET_SAMPLE_RATE
+                    )
+                  : rawWinSamples;
 
               const winProgress =
                 35 +
@@ -1098,11 +1265,41 @@ export function usePipelineScheduler() {
               if (globalAbortFlag) break;
 
               if (windowSegments.length > 0) {
-                const latestDict = useAppStore.getState().dictionary;
+                const stateBeforeWin = useAppStore.getState();
+                const latestDict = stateBeforeWin.dictionary;
                 const quickTerms = latestDict.map((d) => d.term);
+                const existingSegs = stateBeforeWin.segments;
+                const lastPriorSeg =
+                  existingSegs.length > 0
+                    ? existingSegs[existingSegs.length - 1]
+                    : null;
+
+                // 【方向二 先句後詞】：連同上一個視窗的最後一段一起執行 Stage 1 跨句尾字掉落/搶字/殘句修復
+                const combinedForStage1 = lastPriorSeg
+                  ? [lastPriorSeg, ...windowSegments]
+                  : windowSegments;
+                const { repairedSegments: stage1Fixed } =
+                  runStage1SentenceIntegrityCheckAndRepair(
+                    combinedForStage1,
+                    stateBeforeWin.speakers
+                  );
+
+                let windowStage1Segments = stage1Fixed;
+                if (
+                  lastPriorSeg &&
+                  stage1Fixed.length > 0 &&
+                  stage1Fixed[0].id === lastPriorSeg.id
+                ) {
+                  // 若上一個視窗的末段因吸收了本視窗開頭的掉落尾字而更新，立即同步回 Store
+                  useAppStore
+                    .getState()
+                    .replaceBatchSegments([stage1Fixed[0]]);
+                  windowStage1Segments = stage1Fixed.slice(1);
+                }
+
                 const { updatedSegments: instantCorrected } =
                   applySentenceLevelLocalCorrection(
-                    windowSegments,
+                    windowStage1Segments,
                     quickTerms,
                     latestDict
                   );
@@ -1124,9 +1321,7 @@ export function usePipelineScheduler() {
                     detailText: `三層關注度與三級信心度閘控介入：修正近 ${pendingWindowChars} 字...`,
                   });
                   await flushPendingWindowCorrection(
-                    currentConfig.keepModelsCoResident
-                      ? coResidentLlmWorkerRef.current
-                      : null
+                    canSafelyCoReside ? coResidentLlmWorkerRef.current : null
                   );
                 }
               }
@@ -1142,9 +1337,7 @@ export function usePipelineScheduler() {
               detailText: `語境收尾校正與會議摘要更新中...`,
             });
             await flushPendingWindowCorrection(
-              currentConfig.keepModelsCoResident
-                ? coResidentLlmWorkerRef.current
-                : null
+              canSafelyCoReside ? coResidentLlmWorkerRef.current : null
             );
           }
 
@@ -1208,34 +1401,22 @@ export function usePipelineScheduler() {
             },
           });
 
-          if (
-            !currentConfig.keepModelsCoResident &&
-            asrWorker &&
-            !currentConfig.geminiApiKey.trim()
-          ) {
-            await new Promise<void>((resolve) => {
-              const t = setTimeout(() => resolve(), 3000);
-              const onUnload = (e: MessageEvent) => {
-                if (e.data?.type === 'UNLOAD_DONE') {
-                  clearTimeout(t);
-                  asrWorker!.removeEventListener('message', onUnload);
-                  resolve();
-                }
-              };
-              asrWorker!.addEventListener('message', onUnload);
-              asrWorker!.postMessage({ type: 'UNLOAD_MODEL' });
-            });
+          // 【關鍵顯存防線】：在啟動本地 WebLLM 回溯精修前，若非安全常駐模式，必須徹底 Terminate ASR Worker 以釋放 ONNX WebGPU D3D12 PlacedResources！
+          if (!canSafelyCoReside && asrWorker) {
+            await terminateAsrWorkerAndReclaimVram();
+            asrWorker = null;
           }
 
           useAppStore.getState().updateChunkState(cIdx, {
             stage: 'correcting',
             progress: 96,
-            detailText: `全局回溯精修與 TPST 語者立場複查...`,
+            detailText: `全局回溯精修與 Stage 1/2 先句後詞複查...`,
           });
 
-          const activeLlmForRetro = !currentConfig.geminiApiKey.trim()
-            ? ensureLocalLlmWorker()
-            : null;
+          const activeLlmForRetro =
+            !currentConfig.geminiApiKey.trim() && !llmCircuitBrokenRef.current
+              ? ensureLocalLlmWorker()
+              : null;
 
           const finalState = useAppStore.getState();
           await runGlobalRetroactiveContextPass({
@@ -1254,23 +1435,8 @@ export function usePipelineScheduler() {
               : undefined,
           });
 
-          if (
-            !currentConfig.keepModelsCoResident &&
-            activeLlmForRetro &&
-            cIdx < chunks.length - 1
-          ) {
-            await new Promise<void>((resolve) => {
-              const t = setTimeout(() => resolve(), 3000);
-              const onUnload = (e: MessageEvent) => {
-                if (e.data?.type === 'LLM_UNLOAD_DONE') {
-                  clearTimeout(t);
-                  activeLlmForRetro.removeEventListener('message', onUnload);
-                  resolve();
-                }
-              };
-              activeLlmForRetro.addEventListener('message', onUnload);
-              activeLlmForRetro.postMessage({ type: 'UNLOAD_LLM' });
-            });
+          if (!canSafelyCoReside && activeLlmForRetro && cIdx < chunks.length - 1) {
+            await terminateLlmWorkerAndReclaimVram();
           }
 
           useAppStore.getState().updateChunkState(cIdx, {
@@ -1288,12 +1454,20 @@ export function usePipelineScheduler() {
         setGlobalProcessing(false);
       }
     },
-    [ensureLocalLlmWorker, invokeLocalLlmWorker, terminateAllWorkers]
+    [
+      ensureLocalLlmWorker,
+      invokeLocalLlmWorker,
+      terminateAllWorkers,
+      terminateAsrWorkerAndReclaimVram,
+      terminateLlmWorkerAndReclaimVram,
+    ]
   );
 
   return {
     isProcessing,
     isRunning: isProcessing,
+    preAnalyzeAudioFile,
+    analyzeAudioBeforeStart: preAnalyzeAudioFile,
     startPipeline,
     runPipeline: startPipeline,
     stopPipeline,

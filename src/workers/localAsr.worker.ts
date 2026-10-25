@@ -2,8 +2,9 @@
 // 次世代本地 WebGPU Whisper 語音轉寫與聲學換人錨點耦合引擎
 // 修正重點：
 // 1. 嚴格保留 probeWebGpuCapabilities() 鐵律（不支援 shader-f16 時自動降級 encoder_model: 'fp32', decoder_model_merged: 'q4'）
-// 2. 針對 Whisper 輸出之子句或字詞 Chunks，內建「語用轉折/搶話拆句 (Discourse Clause Splitting) + 聲學換人切點吸附 (Acoustic Switch-Point Snapping)」，
-//    徹底解決 Whisper 將「不是，啊如果新的店的裝修怎麼辦？不算，不算。」或「...你這樣寫的時候如果剛好就只要限定開新店就好了」黏在同一 Chunk 時的時間錯位問題！
+// 2. 將 OpenCC 轉換改為純繁體字形轉換 ({ from: 'cn', to: 'tw' })，廢除會將「對象 -> 物件、招標文件 -> 招標檔案、支持 -> 支援」強制替換的大陸對台灣資訊慣用詞轉換 (twp)，100% 忠於會議原音字面！
+// 3. 全面整合 Intl.Segmenter('zh-TW', { granularity: 'word' }) 自然詞界分詞，根除雙字正則強切造成的「我現｜在是」、「你明｜年是」、「一般｜主是」斷詞錯誤。
+// 4. 強化語法價鍵與主謂結構邊界保護（保護「這次的錢｜就是要...」、「要花｜在哪裡」、「10到｜15分鐘」不被句中誤切）。
 
 import { env, pipeline } from '@huggingface/transformers';
 import * as OpenCC from 'opencc-js';
@@ -19,22 +20,35 @@ import {
   decodeWordLevelSpeakersViterbi,
   groupAlignedWordsIntoSegments,
   RawWordTimestampItem,
+  segmentNaturalLanguageTokens,
   synthesizePosteriorMatrixFromFineTurns,
 } from '../utils/viterbiWordAligner';
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-const toTwp = OpenCC.Converter({ from: 'cn', to: 'twp' });
+// 使用純字形簡轉繁 (cn -> tw)，保留語者原話（「對象」、「招標文件」、「支持」），避免 twp 過度替換成 IT 術語（「物件」、「檔案」、「支援」）
+const toTw = OpenCC.Converter({ from: 'cn', to: 'tw' });
 
 const MODEL_ID_MAP: Record<LocalAsrModel, string> = {
   'Whisper-Large-v3-Turbo': 'onnx-community/whisper-large-v3-turbo',
+  'whisper-large-v3-turbo': 'onnx-community/whisper-large-v3-turbo',
   'SenseVoice-Small': 'onnx-community/whisper-small',
+  'whisper-base': 'onnx-community/whisper-base',
   'Breeze-ASR': 'onnx-community/whisper-base',
+  'breeze-asr-25': 'onnx-community/whisper-base',
 };
 
 const DEFAULT_ALIGNMENT_HEADS: Record<LocalAsrModel, number[][]> = {
   'Whisper-Large-v3-Turbo': [
+    [2, 4],
+    [2, 11],
+    [3, 3],
+    [3, 6],
+    [3, 11],
+    [3, 14],
+  ],
+  'whisper-large-v3-turbo': [
     [2, 4],
     [2, 11],
     [3, 3],
@@ -54,7 +68,27 @@ const DEFAULT_ALIGNMENT_HEADS: Record<LocalAsrModel, number[][]> = {
     [9, 9],
     [10, 5],
   ],
+  'whisper-base': [
+    [3, 1],
+    [4, 2],
+    [4, 3],
+    [4, 7],
+    [5, 1],
+    [5, 2],
+    [5, 4],
+    [5, 6],
+  ],
   'Breeze-ASR': [
+    [3, 1],
+    [4, 2],
+    [4, 3],
+    [4, 7],
+    [5, 1],
+    [5, 2],
+    [5, 4],
+    [5, 6],
+  ],
+  'breeze-asr-25': [
     [3, 1],
     [4, 2],
     [4, 3],
@@ -311,9 +345,16 @@ function estimateRepetitionCompressionRatio(text: string): number {
   return Number((1.0 / Math.max(0.15, uniqueRatio)).toFixed(2));
 }
 
-function restoreMultilingualPunctuation(rawInput: string): string {
+function restoreMultilingualPunctuation(
+  rawInput: string,
+  options?: {
+    isMidTurnContinuation?: boolean;
+    nextChunkRawText?: string;
+    pauseToNextSec?: number;
+  }
+): string {
   const hasKana = /[\u3040-\u30ff]/.test(rawInput);
-  let text = hasKana ? rawInput.trim() : toTwp(rawInput.trim());
+  let text = hasKana ? rawInput.trim() : toTw(rawInput.trim());
   if (!text) return '';
 
   // 1. 消除單字或詞組連續無標點重複、以及跨標點跳針重複 (如紙張摩擦造成之「常。謝謝。謝謝。謝謝。...」)
@@ -337,18 +378,48 @@ function restoreMultilingualPunctuation(rawInput: string): string {
     text = text
       .replace(/,/g, '，')
       .replace(/\?/g, '？')
-      .replace(/!/g, '！')
-      .replace(/([\u3040-\u9fa5])\s+([\u3040-\u9fa5])/g, '$1，$2');
+      .replace(/!/g, '！');
+
+    // 【智慧型空白轉標點】：防止 Whisper 在雙字形容詞/修飾語後留空白（如「對 神秘 如果我們再寄給他」）時，
+    // 將空白誤轉為逗號變成「神秘，如果」，導致複合詞被逗號切斷！
+    text = text.replace(
+      /([\u3040-\u9fa5]+)\s+([\u3040-\u9fa5]+)/g,
+      (_match, leftChunk: string, rightChunk: string) => {
+        if (isSyntacticallyInseparableBoundary(leftChunk, rightChunk)) {
+          return `${leftChunk}${rightChunk}`;
+        }
+        const isShortStandaloneInterjection =
+          /^(對|好|是|不是|沒有|算|不算|沒錯|可以|對啊|好啊|好那|那)$/.test(
+            leftChunk
+          );
+        if (isShortStandaloneInterjection) {
+          return `${leftChunk}，${rightChunk}`;
+        }
+        // 若左半部僅 1~2 字且非獨立應答詞（例如「神秘」+「如果/禮物」、「另外」+「一個」），直接無縫接合不插逗號！
+        if (leftChunk.length <= 2) {
+          return `${leftChunk}${rightChunk}`;
+        }
+        return `${leftChunk}，${rightChunk}`;
+      }
+    );
   }
 
+  // 【精準句首語氣詞逗號】：嚴格避開「那個/那些/那天」、「沒有嗎/沒有問題」、「對貴賓/對長官/對同仁/對於」、「另外一個」、「不是嗎/不是說」等緊密詞組！
   text = text.replace(
-    /^(不是|沒有|對|好|那|另外|不過|其實|老實說|基本上|はい|ええ|いや|なるほど)(?=[，。？！]?[^\u3000-\u303f\uff00-\uffefa-zA-Z要])/,
-    '$1，'
+    /^(?:(對|好)(?![於長官貴賓同仁講者團隊他她你我您大家這那外內接齊應照比面方手話象嗎呢吧啊呀喔啦])|(不是)(?![嗎呢說要很太都也因為])|(沒有)(?![嗎呢啊吧喔啦要人辦法問題關係錯想說那這])|(那)(?![個些邊裡麼天位種家間場樣一二三四五六七八九十百千萬兩嗎呢吧])|(另外)(?![一二三四五六七八九十兩半個種邊家位])|(不過|其實|老實說|基本上|はい|ええ|いや|なるほど))(?=[\u3040-\u9fa5])/g,
+    '$&，'
   );
   text = text.replace(
-    /^(對對對|沒有沒有|不用不用)(?=[^\u3000-\u303f\uff00-\uffef])/,
+    /^(對對對|沒有沒有|不用不用)(?=[^\u3000-\u303f\uff00-\uffef])/g,
     '$1，'
   );
+
+  // 清除任何可能殘留的假逗號組合（如「那，個」、「沒有，嗎」、「另外，一個」、「對，貴賓」）
+  text = text
+    .replace(/那，(個|些|天|邊|裡|種|位|樣)/g, '那$1')
+    .replace(/沒有，(嗎|呢|啊|吧|喔|要|問題|關係|辦法)/g, '沒有$1')
+    .replace(/另外，(一[個種邊家位半])/g, '另外$1')
+    .replace(/對，(長官|貴賓|同仁|講者|團隊|於|他|她|你|我|大家)/g, '對$1');
 
   // 依據通用華語/日語/英語句法連接詞補入子句逗號
   text = text.replace(
@@ -380,25 +451,51 @@ function restoreMultilingualPunctuation(rawInput: string): string {
     cjkRatio >= 0.25 &&
     !/[，。？！、；：.?!]$/.test(text)
   ) {
-    text += '。';
+    const nextRaw = options?.nextChunkRawText
+      ? toTw(options.nextChunkRawText.trim())
+      : '';
+    const isMidTurn = Boolean(options?.isMidTurnContinuation);
+    const pauseSec = options?.pauseToNextSec ?? 99;
+
+    // 若當前子句結尾處於語法未完成狀態（如「我在｜白姐報價之前」、「今年預算的｜狀況」、「預算是比｜另外一個單位」、「要求我們的角色要能夠｜就是比較主導性」），
+    // 不強行塞入句號「。」，改為無標點直連或逗號過渡！
+    const endsWithIncompleteHead =
+      /(?:[的之比在跟對向把被讓給為從到]|那個|這個|一些|一個|我們有|他們有)$/.test(
+        text
+      ) ||
+      (nextRaw.length > 0 && isSyntacticallyInseparableBoundary(text, nextRaw));
+    const endsWithClauseBridge =
+      /(?:要能夠|能夠|可以|應該|就是|因為|所以|而且|然後|例如說|比方說|像是|主要是)$/.test(
+        text
+      );
+
+    if (isMidTurn && endsWithIncompleteHead) {
+      // 保持無標點，讓下一個 sub-chunk 自然無縫接上
+    } else if (
+      isMidTurn &&
+      (endsWithClauseBridge || (pauseSec <= 0.75 && text.length <= 22))
+    ) {
+      text += '，';
+    } else {
+      text += '。';
+    }
   }
   return text;
 }
 
 /**
- * 通用語法起手式字元正則（僅用於當聲學軌道偵測到句中無標點換人時，在換人時間點 ±3 字內對齊最自然的詞語邊界，避免把單一詞彙切開）
- */
-/**
- * 僅保留真正能作為新子句主詞或轉折連詞之起手標記
- * 嚴格排除「他、她、好、對、算」等極易作為前句「動賓受詞 (寄給他)」或「程度補語 (都很好)」的單字！
+ * 僅保留真正能作為新話輪/新子句轉折起手之標記：
+ * 嚴格排除「就、就是要、他、她、好、對、算、在、是」等極易作為前句「主謂述語 (這次的錢就是要...)」、「動賓受詞 (寄給他)」或「介賓補語 (花在哪裡)」的字詞！
  */
 const UNIVERSAL_CLAUSE_STARTER_REGEX =
-  /^(我們|你們|他們|這個|那個|這樣|那樣|但是|可是|不過|因為|所以|如果|要是|不是|沒有|不用|不然|否則|其實|只是|那邊|這邊|現在|後來|還是|或者|而且|然後|就|那)/;
+  /^(但是|可是|不過|因為|所以|如果說|那如果|要是|不是[，、]|沒有[，、]|不用[，、]|不然|否則|其實|老實說|那我們|那你們|那我|所以我)/;
 
 /**
  * 檢查切點前後是否處於不可切斷之「強語法價鍵結構 (Syntactic Valence Bound Pair)」：
- * - 動賓/介賓結構：如「寄給｜他」、「提醒｜他們」、「告訴｜我」
- * - 狀中程度結構：如「都很｜好」、「非常｜好」、「不｜對」
+ * - 主謂緊密銜接：如「這次的錢｜就是要...」、「我們下半年要做的｜事情」
+ * - 動賓/介賓/動補結構：如「寄給｜他」、「要花｜在哪裡」、「花｜在哪裡」
+ * - 數詞範圍結構：如「10到｜15分鐘」、「60到｜70」
+ * - 狀中程度結構：如「都很｜好」、「非常｜好」、「太｜遠」
  * - 詞幹+句末助詞：如「...｜的」、「...｜了」、「...｜嗎」
  */
 function isSyntacticallyInseparableBoundary(
@@ -410,29 +507,56 @@ function isSyntacticallyInseparableBoundary(
   if (!lClean || !rClean) return false;
   if (/[，。？！、；：,.?!]$/.test(leftStr.trim())) return false;
 
-  // 1. 動詞/介詞 + 代名詞受詞 (如：寄給+他、提醒+他們、交給+你)
+  // 1. 動詞/介詞 + 代名詞受詞或處所疑問補語 (如：寄給+他、要花+在哪裡、寫+在哪裡)
   if (
-    /[給寄送交找問請跟對向讓叫幫替被把為愛看聽說告訴通知聯絡協助感謝謝謝陪帶]$/.test(
+    /[給寄送交找問請跟對向讓叫幫替被把為愛看聽說告訴通知聯絡協助感謝謝謝陪帶花寫放留住用落]$/.test(
       lClean
     ) &&
-    /^(我|你|您|他|她|它|我們|你們|他們|她們|大家|誰|自己)/.test(rClean)
-  ) {
-    return true;
-  }
-
-  // 2. 程度/範圍/否定副詞 + 形容詞/助動詞補語 (如：都很+好、非常+好、太+遠、不+對)
-  if (
-    /(很|太|更|最|超|蠻|挺|都|還|不|沒|別|真|非常|相當|特別|十分|比較|稍微|有點|已經)$/.test(
-      lClean
-    ) &&
-    /^(好|對|棒|行|可以|錯|大|小|多|少|高|低|快|慢|遠|近|久|難|易|重要|清楚|可能|確定|喜歡|想要|需要|應該|願意)/.test(
+    /^(我|你|您|他|她|它|我們|你們|他們|她們|大家|誰|自己|在哪|在哪裡|在那裡|在這裡|到哪|到哪裡|給誰|成什麼)/.test(
       rClean
     )
   ) {
     return true;
   }
 
-  // 3. 句末助詞、時態助詞或複數詞尾 (的/得/地/了/嗎/呢/吧/啊/呀/喔/啦/過/著/們)
+  // 2. 主語/定語名詞組 + 繫詞/助動詞謂語 (如：這次的錢+就是要、要做的+事情、店面+翻修)
+  if (
+    (/([的之]|錢|店|人|事|案子|部分|問題|時候|地方|範圍|時程|對象|規劃|經費|獎勵金|補助)$/.test(
+      lClean
+    ) &&
+      /^(就是|就要|就只要|是|要|會|可以|應該|沒有|不能|不用|都|也|還|才|已經)/.test(
+        rClean
+      )) ||
+    (/[的之]$/.test(lClean) && /^[\u4e00-\u9fa5]{1,4}/.test(rClean))
+  ) {
+    return true;
+  }
+
+  // 3. 數詞/範圍連接 (如：10到+15分鐘、20+25、60到+70)
+  if (
+    /([0-9一二三四五六七八九十百千萬兩]+(到|至|跟|或|～|~)?|[到至])$/.test(
+      lClean
+    ) &&
+    /^([0-9一二三四五六七八九十百千萬兩]|到|至|分|分鐘|小時|天|個|月|年|萬|元|塊|人|家|間|成|倍)/.test(
+      rClean
+    )
+  ) {
+    return true;
+  }
+
+  // 4. 程度/範圍/否定副詞 + 形容詞/助動詞補語 (如：都很+好、非常+好、太+遠、不+對)
+  if (
+    /(很|太|更|最|超|蠻|挺|都|還|不|沒|別|真|非常|相當|特別|十分|比較|稍微|有點|已經)$/.test(
+      lClean
+    ) &&
+    /^(好|對|棒|行|可以|錯|大|小|多|少|高|低|快|慢|遠|近|久|難|易|滿|亂|重要|清楚|可能|確定|喜歡|想要|需要|應該|願意)/.test(
+      rClean
+    )
+  ) {
+    return true;
+  }
+
+  // 5. 句末助詞、時態助詞或複數詞尾 (的/得/地/了/嗎/呢/吧/啊/呀/喔/啦/過/著/們)
   if (
     /^(的|得|地|了|嗎|呢|吧|啊|呀|喔|哦|啦|囉|嘛|齁|吼|過|著|們)([，。？！、；：,.?!\s]|$)/.test(
       rClean
@@ -441,12 +565,22 @@ function isSyntacticallyInseparableBoundary(
     return true;
   }
 
-  // 4. 數詞/指示詞 + 量詞 (如：一+個、這+個、那+些)
+  // 6. 數詞/指示詞 + 量詞 (如：一+個、這+個、那+些)
   if (
     /[一二三四五六七八九十百千萬兩這那某每各幾]$/.test(lClean) &&
-    /^(個|位|名|次|件|種|些|點|處|家|間|筆|項|套|場|人|天|年|月|週)/.test(
+    /^(個|位|名|次|件|種|些|點|處|家|間|筆|項|套|場|人|天|年|月|週|期|標|案|組)/.test(
       rClean
     )
+  ) {
+    return true;
+  }
+
+  // 7. 雙字詞被從中切斷保護 (如：我現+在是、你明+年是、一般+組是、開新+店)
+  if (
+    /(現|明|今|去|後|前|一|商|業|招|標|補|助|獎|勵|翻|裝|修|創|群|廊|店|公|問|時)$/.test(
+      lClean
+    ) &&
+    /^(在|年|天|組|師|署|處|標|金|修|生|聚|帶|面|家|司|題|程)/.test(rClean)
   ) {
     return true;
   }
@@ -462,10 +596,14 @@ function splitTextIntoDiscourseClauses(cleanClause: string): string[] {
   let t = cleanClause;
   // 1. 在句號、問號、感嘆號後切開
   t = t.replace(/([。？！?!])/g, '$1|');
-  // 2. 在句末終止符後緊接之通用獨立短應答詞 (如「？|不算，」、「。|對，」) 後切開
+  // 2. 在句末終止符或逗號後緊接之通用獨立短應答詞 (如「？|不算，」、「。|對，」、「不算，不算」) 後切開
   t = t.replace(
     /([|。？！?!]\s*(?:不算|算|對|對啊|對對對|好|好的|可以|沒錯|沒有|不是|了解|はい|ええ|うん|なるほど|yeah|yes|no|right|sure|ok|okay)[，、,])\s*/gi,
     '$1|'
+  );
+  t = t.replace(
+    /(^|[|，。？！?!]\s*)(不算|算|對|好|可以|沒有|不是)([，、,])\s*(?=(?:不算|算|對|好|不是|沒有|我們|那|所以|可是|但是))/g,
+    '$1$2$3|'
   );
   // 3. 當長子句 (>=4字) 以逗號結尾，且後方緊接句尾獨立短應答詞 (如「神秘如果我們再寄給他，好。」) 時，在逗號後切開！
   t = t.replace(
@@ -485,27 +623,11 @@ function splitTextIntoDiscourseClauses(cleanClause: string): string[] {
 }
 
 /**
- * 防止奇數字長中文子句在句尾留下「單字孤兒 Token」(例如 13 字「但我覺得他給團隊提醒都很好，」切成 2*6+1 導致最後一字「好，」獨立成單字 Token 而往下掉)
- * 若子句最末 Token 為單一漢字，自動與前一個雙字 Token 合併為穩固的 3 字收束詞組 (如「都很好，」、「再寄給他。」)！
+ * 使用 Intl.Segmenter 自然語言詞界分詞，並防止子句句尾留下「單字孤兒 Token」
+ * 徹底消除雙字正則強切造成的「我現｜在是」、「你明｜年是」、「一般｜主是」等斷詞錯誤！
  */
 function tokenizeClausePreventingTailOrphan(cText: string): string[] {
-  const rawTokens =
-    cText.match(
-      /[\u4e00-\u9fa5]{1,2}[，。？！、；：,.?!]*|[\u3040-\u30ff]{1,3}[，。？！、；：,.?!]*|[a-zA-Z0-9']+[，。？！、；：,.?!]*|[，。？！、；：,.?!]+/g
-    ) || [cText];
-
-  const cleaned: string[] = [];
-  for (const t of rawTokens) {
-    const st = t.trim();
-    if (!st) continue;
-    if (/^[，。？！、；：,.?!]+$/.test(st) && cleaned.length > 0) {
-      if (!/[，。？！、；：,.?!]$/.test(cleaned[cleaned.length - 1])) {
-        cleaned[cleaned.length - 1] += st[0];
-      }
-      continue;
-    }
-    cleaned.push(st);
-  }
+  const cleaned = segmentNaturalLanguageTokens(cText);
 
   if (cleaned.length >= 2) {
     const last = cleaned[cleaned.length - 1];
@@ -516,7 +638,7 @@ function tokenizeClausePreventingTailOrphan(cText: string): string[] {
       lastPure.length === 1 &&
       /^[\u4e00-\u9fa5]$/.test(lastPure) &&
       !/[，。？！、；：,.?!]$/.test(prev) &&
-      /^[\u4e00-\u9fa5]{1,2}$/.test(prevPure)
+      /^[\u4e00-\u9fa5]{1,3}$/.test(prevPure)
     ) {
       cleaned.splice(cleaned.length - 2, 2, prev + last);
     }
@@ -530,7 +652,7 @@ function tokenizeClausePreventingTailOrphan(cText: string): string[] {
  * 當某位與會者在另一人講話中途無停頓打斷搶話，導致 Whisper 輸出的單一子句 [cStart, cEnd] 內部沒有標點、
  * 卻跨越了 `fineTurns` 偵測到的真實聲學換人時間點 `midClauseSwitches` 時：
  * 1. 依字元數比例將聲學換人時間 `st` 映射為子句內的字元位置 `rawIdx`。
- * 2. 在 `rawIdx ± 3` 字範圍內尋找逗號或通用語法起手詞邊界，並嚴格避開「動賓 (寄給他) / 狀中 (都很好)」強約束結構！
+ * 2. 在 `rawIdx ± 3` 字範圍內尋找逗號或通用語法起手詞邊界，並嚴格避開「主謂、動賓、狀中、數詞範圍」強約束結構！
  */
 function splitClauseAtAcousticSwitches(
   cText: string,
@@ -538,7 +660,7 @@ function splitClauseAtAcousticSwitches(
   cEnd: number,
   midClauseSwitches: number[]
 ): Array<{ text: string; start: number; end: number; isAcousticSplit: boolean }> {
-  if (midClauseSwitches.length === 0 || cText.length < 8) {
+  if (midClauseSwitches.length === 0 || cText.length < 10) {
     return [{ text: cText, start: cStart, end: cEnd, isAcousticSplit: false }];
   }
   const chars = Array.from(cText);
@@ -547,14 +669,14 @@ function splitClauseAtAcousticSwitches(
 
   const splitPoints: Array<{ charIdx: number; timeSec: number }> = [];
   for (const st of midClauseSwitches) {
-    const rel = Math.max(0.18, Math.min(0.82, (st - cStart) / dur));
+    const rel = Math.max(0.2, Math.min(0.8, (st - cStart) / dur));
     const rawIdx = Math.round(rel * L);
     let bestIdx = -1;
     let bestScore = -5.0;
 
     for (
-      let idx = Math.max(3, rawIdx - 3);
-      idx <= Math.min(L - 3, rawIdx + 3);
+      let idx = Math.max(4, rawIdx - 3);
+      idx <= Math.min(L - 4, rawIdx + 3);
       idx++
     ) {
       const leftPart = chars.slice(0, idx).join('');
@@ -563,7 +685,7 @@ function splitClauseAtAcousticSwitches(
         continue;
       }
 
-      const distPen = Math.abs(idx - rawIdx) * 0.4;
+      const distPen = Math.abs(idx - rawIdx) * 0.45;
       const prevChar = chars[idx - 1];
       let score = -distPen;
       if (/[，、；：,:;\s]/.test(prevChar)) {
@@ -576,8 +698,8 @@ function splitClauseAtAcousticSwitches(
         bestIdx = idx;
       }
     }
-    // 僅在確實找到合法語法邊界 (逗號或明確起手連詞，且非動賓/狀中結構) 時才執行句中無標點切分，防止誤切同一人的連續句子！
-    if (bestIdx >= 3 && bestScore >= 0.4) {
+    // 僅在確實找到合法語法邊界 (逗號或明確轉折起手詞，且非主謂/動賓/狀中結構) 時才執行句中無標點切分，防止誤切同一人的連續句子！
+    if (bestIdx >= 4 && bestScore >= 0.8) {
       splitPoints.push({ charIdx: bestIdx, timeSec: st });
     }
   }
@@ -593,7 +715,7 @@ function splitClauseAtAcousticSwitches(
   let prevTime = cStart;
 
   for (const sp of splitPoints) {
-    if (sp.charIdx - prevCharIdx < 2 || L - sp.charIdx < 2) continue;
+    if (sp.charIdx - prevCharIdx < 3 || L - sp.charIdx < 3) continue;
     const subStr = chars
       .slice(prevCharIdx, sp.charIdx)
       .join('')
@@ -638,10 +760,7 @@ function buildWordSpans(
   baseConfidence: number,
   acousticThreshold = 0.72
 ): WordSpan[] {
-  const tokens =
-    cleanText.match(
-      /[\u4e00-\u9fa5]{1,2}|[\u3040-\u30ff]{1,3}|[a-zA-Z0-9']+\s*|[^\s\u4e00-\u9fa5\u3040-\u30ffa-zA-Z0-9]/g
-    ) || [cleanText];
+  const tokens = segmentNaturalLanguageTokens(cleanText);
   const dur = Math.max(0.2, endSec - startSec);
   const step = dur / Math.max(1, tokens.length);
 
@@ -805,7 +924,7 @@ function normalizeWhisperChunksToWordItems(
   if (isWordLevel) {
     for (let i = 0; i < rawChunks.length; i++) {
       const ch = rawChunks[i];
-      const rawTok = toTwp((ch.text || '').trim());
+      const rawTok = toTw((ch.text || '').trim());
       if (!rawTok) continue;
       if (/^(字幕|請不吝點讚|訂閱轉發|謝謝觀看|Amara\.org)/i.test(rawTok)) {
         continue;
@@ -828,10 +947,7 @@ function normalizeWhisperChunksToWordItems(
         ).toFixed(3)
       );
 
-      const subTokens =
-        rawTok.match(
-          /[\u4e00-\u9fa5]{1,2}[，。？！、；：,.?!]*|[\u3040-\u30ff]{1,3}[，。？！、；：,.?!]*|[a-zA-Z0-9']+[，。？！、；：,.?!]*|[，。？！、；：,.?!]+/g
-        ) || [rawTok];
+      const subTokens = segmentNaturalLanguageTokens(rawTok);
 
       const subSpan = Math.max(0.04, gEnd - gStart);
       const step = subSpan / Math.max(1, subTokens.length);
@@ -860,7 +976,31 @@ function normalizeWhisperChunksToWordItems(
   // ── 主力路徑：子句級時間戳記 + 語用拆句 + 聲學換人切點對齊 (Switch-Point Boundary Snapping) ──
   for (let i = 0; i < rawChunks.length; i++) {
     const ch = rawChunks[i];
-    const cleanClause = restoreMultilingualPunctuation(ch.text || '');
+    const nextCh = i + 1 < rawChunks.length ? rawChunks[i + 1] : null;
+    const chEndRel =
+      typeof ch.timestamp?.[1] === 'number' && ch.timestamp[1] !== null
+        ? ch.timestamp[1]
+        : typeof ch.timestamp?.[0] === 'number'
+        ? ch.timestamp[0] + 2.5
+        : 0;
+    const nextStartRel =
+      nextCh && typeof nextCh.timestamp?.[0] === 'number'
+        ? nextCh.timestamp[0]
+        : chEndRel + 99;
+    const pauseToNextSec = Math.max(0, nextStartRel - chEndRel);
+    const absChEnd = windowStartSec + chEndRel;
+    const absNextStart = windowStartSec + nextStartRel;
+    const hasSwitchBetween = switchTimes.some(
+      (st) => st >= absChEnd - 0.25 && st <= absNextStart + 0.25
+    );
+    const isMidTurnContinuation =
+      Boolean(nextCh) && !hasSwitchBetween && pauseToNextSec <= 1.15;
+
+    const cleanClause = restoreMultilingualPunctuation(ch.text || '', {
+      isMidTurnContinuation,
+      nextChunkRawText: nextCh?.text || '',
+      pauseToNextSec,
+    });
     if (!cleanClause) continue;
 
     const relStart =
@@ -1180,6 +1320,15 @@ function unwarpVirtualTrackChunksToSegments(
     const segId = `seg_c${chunkIndex}_tb${batchIndex}_s${idx}`;
     const isLocked =
       m.acousticMargin >= 0.16 && m.realEnd - m.realStart >= 1.2;
+    const words = buildWordSpans(
+      m.text,
+      segId,
+      m.realStart,
+      m.realEnd,
+      m.confidence,
+      acousticThreshold
+    );
+    const fullText = words.map((w) => w.text).join('');
     return {
       id: segId,
       chunkIndex,
@@ -1193,14 +1342,9 @@ function unwarpVirtualTrackChunksToSegments(
         : 'tier2_candidate_constrained',
       start: m.realStart,
       end: m.realEnd,
-      words: buildWordSpans(
-        m.text,
-        segId,
-        m.realStart,
-        m.realEnd,
-        m.confidence,
-        acousticThreshold
-      ),
+      words,
+      text: fullText,
+      rawText: fullText,
       isCorrected: false,
       relistenCount: 0,
     };

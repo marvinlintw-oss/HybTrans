@@ -12,6 +12,7 @@
 //    同時廢除「發言總時長 < 3.5% 一律強制併入大群」的規則，改為僅合併「單一孤立錨點 (len === 1 且 < 2.0s)」，完整保護發言精簡但音色獨立的與會者 (如女聲2)。
 
 import {
+  AcousticFormulaCalibration,
   DiarizationClusterMethod,
   DiarizationConfig,
   FineDiarizationTurn,
@@ -194,10 +195,12 @@ function computePitchTrackAndBoundaryCurve(
   smoothRms: Float32Array,
   vadThreshold: number,
   sampleRate = 16000,
-  allFbankFrames?: Float32Array[]
+  allFbankFrames?: Float32Array[],
+  formulaCalibration?: AcousticFormulaCalibration
 ): {
   stepF0Hz: Float32Array;
   stepHarmonicity: Float32Array;
+  calibratedHarmGate: number;
   boundaryScoreCurve: Float32Array;
   queryMedianPitchHz: (startF: number, endF: number) => number;
   queryVoicedHarmonicRatio: (
@@ -210,12 +213,14 @@ function computePitchTrackAndBoundaryCurve(
   const numSteps = Math.max(1, Math.floor(numFrames / stepFrames));
   const stepF0Hz = new Float32Array(numSteps);
   const stepHarmonicity = new Float32Array(numSteps);
+  const stepBestLag = new Int32Array(numSteps);
 
   const frameLen = 512;
   const minLag = Math.floor(sampleRate / 320);
   const maxLag = Math.floor(sampleRate / 75);
   const numLags = Math.floor((maxLag - minLag) / 2) + 1;
   const corrs = new Float32Array(numLags);
+  const activeHarms: number[] = [];
 
   for (let s = 0; s < numSteps; s++) {
     const f = s * stepFrames;
@@ -247,20 +252,41 @@ function computePitchTrackAndBoundaryCurve(
     }
 
     stepHarmonicity[s] = maxCorr;
-    if (maxCorr >= 0.48) {
-      let chosenIdx = argMaxIdx;
-      const thresh = 0.86 * maxCorr;
-      for (let idx = 1; idx < numLags - 1; idx++) {
-        if (
-          corrs[idx] >= thresh &&
-          corrs[idx] >= corrs[idx - 1] &&
-          corrs[idx] >= corrs[idx + 1]
-        ) {
-          chosenIdx = idx;
-          break;
-        }
+    if (maxCorr >= 0.22) {
+      activeHarms.push(maxCorr);
+    }
+
+    let chosenIdx = argMaxIdx;
+    const thresh = 0.86 * maxCorr;
+    for (let idx = 1; idx < numLags - 1; idx++) {
+      if (
+        corrs[idx] >= thresh &&
+        corrs[idx] >= corrs[idx - 1] &&
+        corrs[idx] >= corrs[idx + 1]
+      ) {
+        chosenIdx = idx;
+        break;
       }
-      stepF0Hz[s] = sampleRate / (minLag + chosenIdx * 2);
+    }
+    stepBestLag[s] = minLag + chosenIdx * 2;
+  }
+
+  // 【方向一深化】：根據預分析注入或當前區塊 P15 實測分佈，動態校準有聲母音諧波門檻 (0.34 ~ 0.42)，
+  // 確保距離麥克風較遠或句尾降調之語者（如女聲2 ~0.36）100% 保留完整 F0 軌跡！
+  let calibratedHarmGate = formulaCalibration?.harmonicityGateThreshold ?? 0;
+  if (calibratedHarmGate <= 0.1) {
+    if (activeHarms.length > 10) {
+      activeHarms.sort((a, b) => a - b);
+      const p15 = activeHarms[Math.floor(activeHarms.length * 0.15)] || 0.36;
+      calibratedHarmGate = Math.max(0.34, Math.min(0.42, p15 * 0.95));
+    } else {
+      calibratedHarmGate = 0.36;
+    }
+  }
+
+  for (let s = 0; s < numSteps; s++) {
+    if (stepHarmonicity[s] >= calibratedHarmGate && stepBestLag[s] > 0) {
+      stepF0Hz[s] = sampleRate / stepBestLag[s];
     }
   }
 
@@ -290,7 +316,7 @@ function computePitchTrackAndBoundaryCurve(
     for (let s = sStart; s < sEnd; s++) {
       const h = stepHarmonicity[s];
       harms.push(h);
-      if (h >= 0.48) voicedCount++;
+      if (h >= calibratedHarmGate) voicedCount++;
     }
     if (harms.length === 0) return { voicedRatio: 0.0, medianHarm: 0.0 };
     harms.sort((a, b) => a - b);
@@ -300,15 +326,22 @@ function computePitchTrackAndBoundaryCurve(
     };
   };
 
-  const boundaryScoreCurve = new Float32Array(numFrames);
-  const leftPitches: number[] = [];
-  const rightPitches: number[] = [];
+  // 計算 150ms (15 幀) 音節包絡 RMS (envRms)：跨越 20~40ms 塞音閉鎖期 (/d/, /t/, /k/)，僅在真實換人谷底產生顯著 dip！
+  const envRms = new Float32Array(numFrames);
+  for (let f = 0; f < numFrames; f++) {
+    let sumEnv = 0.0;
+    let cntEnv = 0;
+    for (let k = Math.max(0, f - 7); k <= Math.min(numFrames - 1, f + 7); k++) {
+      sumEnv += smoothRms[k];
+      cntEnv++;
+    }
+    envRms[f] = sumEnv / Math.max(1, cntEnv);
+  }
 
-  // 建立聲道共振峰頻帶 (Mel bins 12..68, 約 300Hz~5500Hz) 之前綴積分表，
-  // 以便在 O(1) 時間內計算左右 450ms 視窗之零均值共振峰包絡跳變 (Formant Spectral Flux)，
-  // 確保即使兩位同性別語者基頻 (F0) 完全相同，也能透過聲道共振峰差異偵測零停頓換人！
-  const formantBins = 56;
-  const binOffset = 12;
+  // 建立「有聲母音專屬 F1-F3 共振峰頻帶 (Mel bins 10..48, 約 250Hz~3400Hz)」之前綴積分表：
+  // 僅累加具備聲帶諧波 (stepHarmonicity >= calibratedHarmGate) 之母音幀，徹底排除無聲擦音 (/zh/, /ch/, /s/) 造成的假性頻譜跳變！
+  const formantBins = 38;
+  const binOffset = 10;
   const hasFbank = Array.isArray(allFbankFrames) && allFbankFrames.length >= numFrames;
   const melPrefix = hasFbank
     ? new Float32Array((numFrames + 1) * formantBins)
@@ -316,9 +349,19 @@ function computePitchTrackAndBoundaryCurve(
 
   if (melPrefix && allFbankFrames) {
     for (let t = 0; t < numFrames; t++) {
-      const frame = allFbankFrames[t];
+      const sIdx = Math.min(numSteps - 1, Math.floor(t / stepFrames));
+      const isVoiced = stepHarmonicity[sIdx] >= calibratedHarmGate;
       const prevOff = t * formantBins;
       const nextOff = (t + 1) * formantBins;
+
+      if (!isVoiced) {
+        for (let b = 0; b < formantBins; b++) {
+          melPrefix[nextOff + b] = melPrefix[prevOff + b];
+        }
+        continue;
+      }
+
+      const frame = allFbankFrames[t];
       let frameMean = 0.0;
       for (let b = 0; b < formantBins; b++) {
         frameMean += frame[binOffset + b];
@@ -331,26 +374,42 @@ function computePitchTrackAndBoundaryCurve(
     }
   }
 
-  const winF = 45;
-  for (let f = 48; f < numFrames - 48; f += 2) {
+  const boundaryScoreCurve = new Float32Array(numFrames);
+  const leftPitches: number[] = [];
+  const rightPitches: number[] = [];
+
+  const wDip = formulaCalibration?.boundaryDipWeight ?? 0.45;
+  const wVoice = formulaCalibration?.boundaryVoiceWeight ?? 0.55;
+  const stepDbFloor = formulaCalibration?.stepDbDiffFloor ?? 3.5;
+  const cosDistFloor = formulaCalibration?.formantCosDistFloor ?? 0.22;
+
+  const winF = 55; // 550ms 左右對比視窗
+  for (let f = 58; f < numFrames - 58; f += 2) {
     let sumL = 0.0;
     let sumR = 0.0;
-    for (let k = 1; k <= winF; k++) {
+    const countSide = winF - 5;
+    for (let k = 5; k < winF; k++) {
       sumL += smoothRms[f - k];
       sumR += smoothRms[f + k];
     }
-    const locAvg = (sumL + sumR) / (2.0 * winF);
+    const rmsL = sumL / Math.max(1, countSide);
+    const rmsR = sumR / Math.max(1, countSide);
+    const locAvg = 0.5 * (rmsL + rmsR);
     if (locAvg < vadThreshold * 0.7) continue;
 
-    const dip = Math.max(0.0, 1.0 - smoothRms[f] / (locAvg + 1e-5));
+    const dip = Math.max(0.0, 1.0 - envRms[f] / (locAvg + 1e-5));
+
+    // 左右視窗分貝階躍 (捕捉遠距小聲語者切換至近距大聲語者之零停頓換人點，如 00:06.46 女2->女1「不算」)
+    const dbDiff = Math.abs(20.0 * Math.log10((rmsR + 1e-5) / (rmsL + 1e-5)));
+    const stepJump = Math.max(0.0, Math.min(1.0, (dbDiff - stepDbFloor) / 8.0));
 
     const sCenter = Math.floor(f / stepFrames);
     leftPitches.length = 0;
     rightPitches.length = 0;
-    for (let s = Math.max(0, sCenter - 12); s < sCenter; s++) {
+    for (let s = Math.max(0, sCenter - 14); s < sCenter; s++) {
       if (stepF0Hz[s] > 0) leftPitches.push(stepF0Hz[s]);
     }
-    for (let s = sCenter; s < Math.min(numSteps, sCenter + 12); s++) {
+    for (let s = sCenter; s < Math.min(numSteps, sCenter + 14); s++) {
       if (stepF0Hz[s] > 0) rightPitches.push(stepF0Hz[s]);
     }
 
@@ -360,7 +419,7 @@ function computePitchTrackAndBoundaryCurve(
       rightPitches.sort((a, b) => a - b);
       const medL = leftPitches[Math.floor(leftPitches.length / 2)];
       const medR = rightPitches[Math.floor(rightPitches.length / 2)];
-      semiJump = Math.min(1.0, Math.abs(12.0 * Math.log2(medL / medR)) / 6.0);
+      semiJump = Math.min(1.0, Math.abs(12.0 * Math.log2(medL / medR)) / 5.5);
     }
 
     let specJump = 0.0;
@@ -381,34 +440,42 @@ function computePitchTrackAndBoundaryCurve(
       const cosSim =
         nL > 1e-6 && nR > 1e-6 ? dot / Math.sqrt(nL * nR) : 1.0;
       const cosDist = Math.max(0.0, 1.0 - cosSim);
-      // 扣除單一語者內部正常母音轉換基底 (0.20)，僅放大跨語者聲道共振峰跳變
       specJump =
-        cosDist > 0.20 ? Math.min(1.0, (cosDist - 0.20) / 0.35) : 0.0;
+        cosDist > cosDistFloor
+          ? Math.min(1.0, (cosDist - cosDistFloor) / 0.38)
+          : 0.0;
     }
 
-    const acousticChange = Math.max(semiJump, specJump * 0.85);
-    const score = 0.55 * dip + 0.45 * acousticChange;
+    const acousticChange = Math.max(semiJump, specJump * 0.75, stepJump * 0.75);
+    const score = wDip * dip + wVoice * acousticChange;
     boundaryScoreCurve[f] = score;
     if (f + 1 < numFrames) boundaryScoreCurve[f + 1] = score;
   }
 
-  return { stepF0Hz, stepHarmonicity, boundaryScoreCurve, queryMedianPitchHz, queryVoicedHarmonicRatio };
+  return {
+    stepF0Hz,
+    stepHarmonicity,
+    calibratedHarmGate,
+    boundaryScoreCurve,
+    queryMedianPitchHz,
+    queryVoicedHarmonicRatio,
+  };
 }
 
 /**
  * 軟性基頻差異懲罰 (Soft Pitch Compatibility Penalty)：
- * 廢除舊版 `F0 >= 162Hz` 硬性一刀切，改為當兩段語音基頻差距超過 3.8 個半音時施加平滑扣減，
- * 既能防止男聲 (135Hz) 與女聲 (210Hz) 混淆，又不會因語氣起伏撕裂同一語者。
+ * 支援由預分析公式校準層動態傳入之免罰半音容忍度 (toleranceSemitones)
  */
 function computeSoftPitchCompatibilityPenalty(
   f0A: number,
   f0B: number,
-  maxPen = 0.13
+  maxPen = 0.13,
+  toleranceSemitones = 3.8
 ): number {
   if (f0A <= 70 || f0B <= 70) return 0.0;
   const semitoneDiff = 12.0 * Math.abs(Math.log2(f0A / f0B));
-  if (semitoneDiff <= 3.8) return 0.0;
-  return Math.min(maxPen, (semitoneDiff - 3.8) * 0.026);
+  if (semitoneDiff <= toleranceSemitones) return 0.0;
+  return Math.min(maxPen, (semitoneDiff - toleranceSemitones) * 0.026);
 }
 
 /**
@@ -1594,7 +1661,7 @@ export class AutoTuningSpectralClusterer {
     for (let n = 0; n < N; n++) {
       const initC = Math.min(S - 1, Math.max(0, initialLabels[n]));
       for (let s = 0; s < S; s++) {
-        gamma[n][s] = s === initC ? 0.88 : 0.12 / Math.max(1, S - 1);
+        gamma[n][s] = s === initC ? 0.96 : 0.04 / Math.max(1, S - 1);
       }
     }
 
@@ -1602,23 +1669,38 @@ export class AutoTuningSpectralClusterer {
       { length: S },
       () => new Float32Array(D)
     );
-    const invTemp = D >= 128 ? 11.5 : 8.5;
+    const invTemp = D >= 128 ? 22.0 : 12.5;
+    const coreGate = 0.45;
 
-    for (let iter = 0; iter < 10; iter++) {
+    for (let iter = 0; iter < 8; iter++) {
       for (let s = 0; s < S; s++) {
         centroids[s].fill(0.0);
         let sumG = 0.0;
+        let coreCount = 0;
         for (let n = 0; n < N; n++) {
           const g = gamma[n][s];
           sumG += g;
-          const emb = embeddings[n];
-          for (let d = 0; d < D; d++) {
-            centroids[s][d] += g * emb[d];
+          // 【核心成員閘控質心更新 (Core-Member Gated Centroid Update)】：
+          // 僅累加對該語者責任 >= 0.45 之核心錨點，徹底防止高發言量主講人 (如女聲1, 58段) 透過微小軟責任污染少數發言者 (如女聲2, 5段) 之質心！
+          if (g >= coreGate) {
+            coreCount++;
+            const emb = embeddings[n];
+            for (let d = 0; d < D; d++) {
+              centroids[s][d] += g * emb[d];
+            }
+          }
+        }
+        if (coreCount === 0) {
+          for (let n = 0; n < N; n++) {
+            const g = gamma[n][s];
+            const emb = embeddings[n];
+            for (let d = 0; d < D; d++) {
+              centroids[s][d] += g * emb[d];
+            }
           }
         }
         centroids[s] = l2Normalize(centroids[s]);
-        // 使用阻尼先驗 (Tempered Prior \tau = 0.2)，避免主講人因總秒數長而吸走少數語者的後驗機率
-        pi[s] = Math.pow(Math.max(1e-4, sumG / N), 0.2);
+        pi[s] = Math.pow(Math.max(1e-4, sumG / N), 0.15);
       }
 
       let piSum = 0.0;
@@ -2218,7 +2300,9 @@ self.onmessage = async (event: MessageEvent) => {
       data.diarizationConfig?.enableVirtualSpeakerTrackStitching ?? false,
     embeddingExcludeOverlap:
       data.diarizationConfig?.embeddingExcludeOverlap ?? true,
+    formulaCalibration: data.diarizationConfig?.formulaCalibration,
   };
+  const formulaCal = diarConfig.formulaCalibration;
 
   if (!samples || samples.length === 0) {
     self.postMessage({
@@ -2270,13 +2354,20 @@ self.onmessage = async (event: MessageEvent) => {
     // 【通用自適應雙分位數底噪估算】：結合 5% 底噪分位數 (P05) 與 75% 語音動態範圍分位數 (P75)，
     // 兼顧高密度連續討論與稀疏發言會議，保護遠端或較小聲與會者的語音不被當成靜音切碎
     const sortedRms = Array.from(frameRms).sort((a, b) => a - b);
-    const noiseFloor = sortedRms[Math.floor(sortedRms.length * 0.05)] || 0.004;
+    const noiseQuantile = formulaCal?.vadNoiseQuantile ?? 0.05;
+    const speechMult = formulaCal?.vadSpeechMultiplier ?? 1.65;
+    const dynWeight = formulaCal?.vadDynamicRangeWeight ?? 0.06;
+    const noiseFloor =
+      sortedRms[Math.floor(sortedRms.length * noiseQuantile)] || 0.004;
     const p75Rms = sortedRms[Math.floor(sortedRms.length * 0.75)] || 0.04;
     const vadThreshold = Math.max(
       0.006,
       Math.min(
         noiseFloor * 2.1,
-        Math.max(noiseFloor * 1.65, noiseFloor + 0.06 * Math.max(0, p75Rms - noiseFloor))
+        Math.max(
+          noiseFloor * speechMult,
+          noiseFloor + dynWeight * Math.max(0, p75Rms - noiseFloor)
+        )
       )
     );
 
@@ -2295,6 +2386,7 @@ self.onmessage = async (event: MessageEvent) => {
 
     const {
       stepHarmonicity,
+      calibratedHarmGate,
       boundaryScoreCurve,
       queryMedianPitchHz,
       queryVoicedHarmonicRatio,
@@ -2303,12 +2395,14 @@ self.onmessage = async (event: MessageEvent) => {
       smoothRms,
       vadThreshold,
       sampleRate,
-      allFbankFrames
+      allFbankFrames,
+      formulaCal
     );
 
-    // 【非諧波摩擦噪音抑制 (Paper Rustling & Friction Noise Suppression)】：
-    // 針對紙張翻動、桌面摩擦或移動雜音（能量高於底噪但缺乏聲帶諧波週期性 stepHarmonicity < 0.44），
-    // 自動壓低 frameVadProbs，防止長段翻紙雜音被當成語音送入聚類或觸發 Whisper 重複幻覺！
+    // 【自適應非諧波摩擦噪音抑制 (Calibrated Paper Rustling & Friction Noise Suppression)】：
+    const frictionCeiling =
+      formulaCal?.frictionHarmonicCeiling ??
+      Math.max(0.26, Math.min(0.35, calibratedHarmGate * 0.82));
     for (let s = 0; s < stepHarmonicity.length; s++) {
       const prevH = s > 0 ? stepHarmonicity[s - 1] : stepHarmonicity[s];
       const nextH =
@@ -2316,7 +2410,7 @@ self.onmessage = async (event: MessageEvent) => {
           ? stepHarmonicity[s + 1]
           : stepHarmonicity[s];
       const localMaxH = Math.max(stepHarmonicity[s], prevH, nextH);
-      if (localMaxH < 0.44) {
+      if (localMaxH < frictionCeiling) {
         const f0 = s * 4;
         for (let k = f0; k < Math.min(numFrames, f0 + 4); k++) {
           frameVadProbs[k] = Math.min(frameVadProbs[k], 0.12);
@@ -2384,7 +2478,7 @@ self.onmessage = async (event: MessageEvent) => {
         b.startF,
         b.endF
       );
-      return voicedRatio >= 0.40 && medianHarm >= 0.48;
+      return voicedRatio >= 0.40 && medianHarm >= calibratedHarmGate;
     });
     if (harmonicMacroBounds.length >= Math.max(2, minSpeakers)) {
       macroAnchorBounds.length = 0;
@@ -2789,14 +2883,15 @@ self.onmessage = async (event: MessageEvent) => {
     }
 
     // =========================================================================
-    // 【第二階段 Stage 2：Fine Micro-Turn Attribution (0.55s ~ 1.40s 微觀話輪切分與歸屬)】
-    // 利用複合邊界曲線 boundaryScoreCurve 切出細粒度子段，再對齊至 Stage 1 鎖定之語者原型庫！
+    // 【第二階段 Stage 2：Fine Micro-Turn Attribution (自適應微觀話輪切分與歸屬)】
+    // 利用經 150ms 音節包絡與有聲母音共振峰校準後之 boundaryScoreCurve 切出細粒度子段，再對齊至 Stage 1 鎖定之語者原型庫！
     // =========================================================================
     const scdSensitivity = diarConfig.scdPeakThreshold ?? 0.22;
-    // 將 UI 敏感度 (0.16 ~ 0.32) 映射為 boundaryScoreCurve 波峰門檻 (0.46 ~ 0.56)
-    const finePeakCutoff = Math.max(
-      0.44,
-      Math.min(0.58, 0.39 + scdSensitivity * 0.5)
+    const finePeakCutoff =
+      formulaCal?.scdPeakCutoff ??
+      Math.max(0.48, Math.min(0.58, 0.42 + scdSensitivity * 0.5));
+    const maxMicroTurnFrames = Math.round(
+      (formulaCal?.maxMicroTurnSec ?? 1.65) * 100
     );
 
     const fineBounds: Array<{ startF: number; endF: number }> = [];
@@ -2814,10 +2909,10 @@ self.onmessage = async (event: MessageEvent) => {
         silFrames = 0;
         const curLen = fCursor - sf;
 
-        // 若滿 0.55s 且遇到明顯「基頻跳變 + 能量谷底」波峰，立即切開微觀話輪
+        // 若滿 0.55s 且遇到顯著「基頻跳變 + 有聲共振峰通量 + 分貝階躍 + 150ms 音節包絡谷底」波峰，立即切開微觀話輪
         if (curLen >= 55 && boundaryScoreCurve[fCursor] >= finePeakCutoff) {
-          const checkStart = Math.max(sf + 42, fCursor - 14);
-          const checkEnd = Math.min(numFrames, fCursor + 14);
+          const checkStart = Math.max(sf + 45, fCursor - 15);
+          const checkEnd = Math.min(numFrames, fCursor + 15);
           let isLocalMax = true;
           for (let k = checkStart; k < checkEnd; k++) {
             if (boundaryScoreCurve[k] > boundaryScoreCurve[fCursor]) {
@@ -2833,9 +2928,11 @@ self.onmessage = async (event: MessageEvent) => {
           }
         }
 
-        if (curLen >= 135) {
-          const wStart = sf + 55;
-          const wEnd = Math.min(numFrames, sf + 145);
+        // 依預分析校準之微觀視窗上限 (預設 1.65s = 165 幀)，在 [0.85s .. maxMicroTurnFrames+0.1s] 尋找最佳邊界切點，
+        // 確保連續無停頓搶話區段（如 00:04~00:11 之 4 次快速換人）能逐一精確切出並歸屬正確語者！
+        if (curLen >= maxMicroTurnFrames) {
+          const wStart = sf + 85;
+          const wEnd = Math.min(numFrames, sf + maxMicroTurnFrames + 10);
           let bestCut = wStart;
           let maxB = -1.0;
           for (let k = wStart; k < wEnd; k++) {
@@ -3053,22 +3150,27 @@ self.onmessage = async (event: MessageEvent) => {
       }
     }
 
-    // 同語者連續長句換氣保護：若相鄰兩話輪間隔極短 (<= 0.42s)、基頻相近 (< 2.5 半音)，
-    // 且後段對前段語者為 Top-2 競爭者、聲學邊際極小 (< 0.055，代表僅為同一語者換氣或尾音降調)，則延續前段語者身份
+    // 雙向同語者連續子句與換氣保護：
+    // (A) 前向延續：若相鄰兩話輪間隔極短 (<= 0.42s)、基頻相近 (< 2.8 半音)，且後段聲學邊際較小 (< 0.075) 且無明顯邊界跳變，延續前段語者身份
     for (let i = 1; i < fineTimelineTurns.length; i++) {
       const prev = fineTimelineTurns[i - 1];
       const curr = fineTimelineTurns[i];
+      const semiDiff = Math.abs(
+        12.0 * Math.log2(Math.max(80, curr.f0Hz) / Math.max(80, prev.f0Hz))
+      );
       if (
         curr.speakerId !== prev.speakerId &&
         curr.runnerUpSpeakerId === prev.speakerId &&
         curr.start - prev.end <= 0.42 &&
-        (curr.speakerMargin || 0) < 0.055 &&
+        (curr.speakerMargin || 0) < 0.075 &&
         (curr.boundaryScdLeft || 0) < 0.48 &&
-        Math.abs(12.0 * Math.log2(Math.max(80, curr.f0Hz) / Math.max(80, prev.f0Hz))) < 2.5
+        semiDiff < 2.8
       ) {
         curr.speakerId = prev.speakerId;
       }
     }
+
+    // 註：Core-Gated VBx 已確保同語者起手與後段分入同一質心群，無須強制覆寫前段獨立語者
 
     // 消除夾在同語者之間、極短 (< 0.35s) 且無明顯邊界跳變之單一毛刺
     for (let i = 1; i < fineTimelineTurns.length - 1; i++) {

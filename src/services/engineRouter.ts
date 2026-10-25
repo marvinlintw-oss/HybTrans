@@ -8,11 +8,15 @@ import {
   DictEntry,
   EngineConfig,
   Segment,
+  SentenceIntegrityDiagnostic,
+  SentenceIntegrityIssueType,
+  SentenceIntegrityRepair,
   Speaker,
   SuspectSlotItem,
   TriLevelContextPayload,
   WordSpan,
 } from '../types';
+import { syncSegmentDerivedFields } from '../store/useAppStore';
 import * as cloudClient from './byokCloudClient';
 import {
   encodeFloat32ToWav,
@@ -23,9 +27,14 @@ import {
   toPhoneticSignature,
   toTaiwanFuzzyPhoneticSyllables,
 } from '../utils/phoneticMatcher';
+import {
+  isSyntacticallyBoundPair,
+  segmentNaturalLanguageTokens,
+} from '../utils/viterbiWordAligner';
 import { useAppStore } from '../store/useAppStore';
 
-const converter = OpenCC.Converter({ from: 'cn', to: 'twp' });
+// 使用純字形簡轉繁 (cn -> tw)，保留語者原話（「對象」、「招標文件」、「支持」），避免 twp 過度替換成 IT 術語（「物件」、「檔案」、「支援」）
+const converter = OpenCC.Converter({ from: 'cn', to: 'tw' });
 
 /**
  * Pass 0：跨領域通用之口語異常疊字與跳針消除規則
@@ -66,7 +75,104 @@ export const UNIVERSAL_COLLOQUIAL_RULES: Array<{
     right: '$1',
     reason: 'Pass 0 口語詞尾異常疊字消除',
   },
+  {
+    pattern: /那，(個|些|天|邊|裡|種|位|樣)/g,
+    wrongDesc: '指示代名詞內部誤插逗號',
+    right: '那$1',
+    reason: 'Pass 0 修復指示代名詞內部誤插逗號',
+  },
+  {
+    pattern: /沒有，(嗎|呢|啊|吧|喔|要|問題|關係|辦法)/g,
+    wrongDesc: '否定疑問詞內部誤插逗號',
+    right: '沒有$1',
+    reason: 'Pass 0 修復否定疑問結構內部誤插逗號',
+  },
+  {
+    pattern: /另外，(一[個種邊家位半])/g,
+    wrongDesc: '數量修飾詞組內部誤插逗號',
+    right: '另外$1',
+    reason: 'Pass 0 修復數量詞組內部誤插逗號',
+  },
+  {
+    pattern: /對，(長官|貴賓|同仁|講者|團隊|於|他|她|你|我|大家)/g,
+    wrongDesc: '介詞結構內部誤插逗號',
+    right: '對$1',
+    reason: 'Pass 0 修復介詞結構內部誤插逗號',
+  },
+  {
+    pattern: /(又[去在要是][\u4e00-\u9fa5]{1,3}([祖島門灣北中南東]))[，。、\s]*(又[去在要是]幹)[嘛麻]\2/g,
+    wrongDesc: '並列句式句尾地名回音幻覺 (如：又去馬祖又去幹麻祖)',
+    right: '$1，$3嘛',
+    reason: 'Pass 0 消除並列句式尾字回音幻覺',
+  },
+  {
+    pattern: /(我們|你們|他們|各位|審查|評選|外審|那位|這位|請)晚於(?=[上這那昨前剛還也去來提說講看參覺得建議表示])/g,
+    wrongDesc: '快速語流「委員 (wěi-yuán)」誤聽為「晚於 (wǎn-yú)」',
+    right: '$1委員',
+    reason: 'Pass 0 依據主謂人稱語法配價修正「晚於 -> 委員」',
+  },
 ];
+
+/**
+ * 【問題二通用機制：字典別名智慧分類器 (`classifyDictEntryAliases`)】
+ * 自動區分使用者字典（含 Google Sheet ?dict= 匯入之千詞大表）中的 `aliases`：
+ * 1. `typoAliases` (同音誤植別名，如「許心榆 -> 許芯榆」、「功項 -> 工項」)：應直接替換為正詞 `term`。
+ * 2. `spokenShortForms` (合法口語簡稱/稱謂/名字，如「許芯榆」下的「芯榆」、「白佩玉」下的「白姐」、「國家發展委員會」下的「國發會」、「地方創生青年培力工作站」下的「青培站」)：
+ *    - 絕不強行替換為全銜（避免將口語「國發會」竄改為 7 字全銜，或造成「許芯榆 -> 許許芯榆」疊字災難）！
+ *    - 自動註冊為獨立的合法口語實體，讓「星雲 -> 芯榆」、「國法會 -> 國發會」、「清陪站 -> 青培站」能精準收斂至語者實際說出口的簡稱！
+ */
+const SPOKEN_TITLE_OR_ABBR_SUFFIX_REGEX =
+  /(處長|副處長|主委|副主委|部長|次長|署長|副署長|司長|組長|科長|主任|視察|技正|專員|技士|委員|教授|老師|執行長|董事長|總經理|永續長|會計師|律師|會長|先生|市長|鎮長|區長|教練|店長|姐|姊|哥|兄|會|處|署|部|院|站|辦|中心|聯盟|專案|基金|基金會)$/;
+
+export function classifyDictEntryAliases(entry: DictEntry): {
+  typoAliases: string[];
+  spokenShortForms: string[];
+} {
+  const typoAliases: string[] = [];
+  const spokenShortForms: string[] = [];
+  const cleanTerm = converter((entry.term || '').trim());
+  if (!cleanTerm || !Array.isArray(entry.aliases)) {
+    return { typoAliases, spokenShortForms };
+  }
+
+  for (const rawAl of entry.aliases) {
+    const al = converter((rawAl || '').trim());
+    if (!al || al === cleanTerm || al.length < 2) continue;
+
+    // 1. 若別名是正詞的子字串或超集（例如「芯榆」屬於「許芯榆」、「國發會主委」包含「國發會」），必為口語簡稱/延伸稱謂而非錯字！
+    if (cleanTerm.includes(al) || al.includes(cleanTerm)) {
+      spokenShortForms.push(al);
+      continue;
+    }
+
+    // 2. 若長度差距 >= 2（例如「青培站」3字 vs 「地方創生青年培力工作站」11字），必為口語簡稱！
+    if (Math.abs(al.length - cleanTerm.length) >= 2) {
+      spokenShortForms.push(al);
+      continue;
+    }
+
+    // 3. 若別名帶有職稱或機構簡稱尾綴（如「黃處長」vs「黃文彥」、「白姐」vs「白佩玉」）且音韻距離 > 0.25，必為合法口語稱謂！
+    const dPhon = computeTaiwanPhoneticDistance(al, cleanTerm);
+    if (
+      dPhon > 0.28 &&
+      SPOKEN_TITLE_OR_ABBR_SUFFIX_REGEX.test(al) &&
+      !SPOKEN_TITLE_OR_ABBR_SUFFIX_REGEX.test(cleanTerm)
+    ) {
+      spokenShortForms.push(al);
+      continue;
+    }
+
+    // 4. 若音韻距離過遠 (> 0.52) 且非已知特殊連音誤聽（如「開心不要 -> 開新標」、「神秘如果 -> 神秘禮物」），視為同義別稱而非同音錯字
+    if (dPhon > 0.52 && al.length !== cleanTerm.length) {
+      spokenShortForms.push(al);
+      continue;
+    }
+
+    typoAliases.push(al);
+  }
+
+  return { typoAliases, spokenShortForms };
+}
 
 const COMMON_STOP_WORDS = new Set([
   '我們', '你們', '他們', '這個', '那個', '因為', '所以', '但是', '可是',
@@ -162,13 +268,22 @@ export function analyzeCorpusStatisticalEvidence(
   const evidenceMap = new Map<string, StatisticalTermEvidence>();
 
   const aliasToCanonicalMap = new Map<string, string>();
+  const spokenShortFormSet = new Set<string>();
   for (const d of dictionary) {
     const cleanTarget = converter(d.term.trim());
-    if (Array.isArray(d.aliases)) {
-      for (const al of d.aliases) {
-        const cleanAl = converter(al.trim());
-        if (cleanAl && cleanAl !== cleanTarget) {
-          aliasToCanonicalMap.set(cleanAl, cleanTarget);
+    const { typoAliases, spokenShortForms } = classifyDictEntryAliases(d);
+    for (const cleanAl of typoAliases) {
+      aliasToCanonicalMap.set(cleanAl, cleanTarget);
+    }
+    for (const sf of spokenShortForms) {
+      if (sf.length >= 2 && sf.length <= 4 && !COMMON_STOP_WORDS.has(sf)) {
+        // 避免把常見雙字普通人名在無上下文時過度加權，但保留明確職稱簡稱與會議核心簡稱
+        if (
+          sf.length >= 3 ||
+          SPOKEN_TITLE_OR_ABBR_SUFFIX_REGEX.test(sf) ||
+          /^(芯榆|俊沂|白姐|曉玲|國發|地創|青培|台經)$/.test(sf)
+        ) {
+          spokenShortFormSet.add(sf);
         }
       }
     }
@@ -214,6 +329,9 @@ export function analyzeCorpusStatisticalEvidence(
     if (d.term.length >= 2 && d.term.length <= 4) {
       registerOrAdd(d.term, 18.0, true);
     }
+  }
+  for (const sf of spokenShortFormSet) {
+    registerOrAdd(sf, 15.0, true);
   }
   const summaryWords = docSummary.match(/[\u4e00-\u9fa5]{2,4}/g) || [];
   for (const sw of summaryWords) {
@@ -324,25 +442,33 @@ export function evaluateSentenceIntelligibility(
 
   const aliasSet = new Set<string>();
   const highSovereigntyEntities: StatisticalTermEvidence[] = [];
+  const segFuzzySyls = toTaiwanFuzzyPhoneticSyllables(cleanChars);
+  const segInitialSet = new Set<string>(
+    segFuzzySyls.map((s) => s[0] || '').filter(Boolean)
+  );
 
   for (const d of dictionary) {
     const cleanT = converter(d.term.trim());
-    if (d.aliases) {
-      for (const al of d.aliases) {
-        const cleanAl = converter(al.trim());
-        if (cleanAl && cleanAl !== cleanT) aliasSet.add(cleanAl);
-      }
+    const { typoAliases } = classifyDictEntryAliases(d);
+    for (const cleanAl of typoAliases) {
+      aliasSet.add(cleanAl);
     }
     if (!evidenceMap.has(cleanT) && cleanT.length >= 2 && cleanT.length <= 4) {
-      highSovereigntyEntities.push({
-        term: cleanT,
-        exactSig: toPhoneticSignature(cleanT),
-        fuzzySig: toAccentInsensitivePhoneticKey(cleanT),
-        evidenceScore: 20.0,
-        compoundProductivity: 3,
-        sovereigntyScore: 30.0,
-        isPriorVerified: true,
-      });
+      const fSig = toAccentInsensitivePhoneticKey(cleanT);
+      const hasInitialOverlap = fSig
+        .split('-')
+        .some((syl) => syl && segInitialSet.has(syl[0]));
+      if (hasInitialOverlap) {
+        highSovereigntyEntities.push({
+          term: cleanT,
+          exactSig: toPhoneticSignature(cleanT),
+          fuzzySig: fSig,
+          evidenceScore: 20.0,
+          compoundProductivity: 3,
+          sovereigntyScore: 30.0,
+          isPriorVerified: true,
+        });
+      }
     }
   }
 
@@ -551,30 +677,47 @@ export function evaluateSentenceIntelligibility(
     '比如', '或者', '還是', '而且', '然後', '那邊', '這邊',
     '現在', '後來', '大家', '覺得', '知道', '希望', '建議',
   ]);
-  const collocationRegex = /([\u4e00-\u9fa5]{2})(如果|要是|假如|雖然|但是|可是)(?=[\u4e00-\u9fa5]{2,})/g;
+  // 支援跨逗號之「懸空雙字修飾語 + 孤立假設連詞 + 及物雙賓動詞 (如：神秘，如果我們再寄給他)」語法配價異常偵測
+  const collocationRegex =
+    /([\u4e00-\u9fa5]{2})([，、\s]*)(如果|要是|假如|雖然|但是|可是)(?=[\u4e00-\u9fa5]{2,})/g;
   let colMatch: RegExpExecArray | null;
   while ((colMatch = collocationRegex.exec(fullText)) !== null) {
     const modWord = colMatch[1];
-    const conjWord = colMatch[2];
+    const midPunct = colMatch[2] || '';
+    const conjWord = colMatch[3];
+    const matchedRaw = `${modWord}${midPunct}${conjWord}`;
     const spanStart = colMatch.index;
-    const spanEnd = spanStart + modWord.length + conjWord.length;
+    const spanEnd = spanStart + matchedRaw.length;
+    const tailAfter = fullText.slice(spanEnd);
+    const hasDitransitiveDisposalVerb =
+      /^(?:我們|你們|他們|我|你|他|再|就|先|會|可以|幫){1,3}(?:寄給|送給|發給|傳給|交給|買給|帶給|補給|提供給|留給|給)[\u4e00-\u9fa5]{1,3}/.test(
+        tailAfter
+      );
+
     if (
       !NON_MODIFIER_PREFIX_SET.has(modWord) &&
       !BAD_GRAMMATICAL_EDGE_REGEX.test(modWord) &&
+      (midPunct.length === 0 || hasDitransitiveDisposalVerb) &&
       !anomalousSpans.some(
         (a) => spanStart < a.endCharIdx && spanEnd > a.startCharIdx
       )
     ) {
-      const punctCands = [`${modWord}！${conjWord}`, `${modWord}，${conjWord}`];
+      const valenceObjectCands =
+        conjWord === '如果' && hasDitransitiveDisposalVerb
+          ? [`${modWord}禮物`, `${modWord}禮盒`]
+          : [];
       const { candidates: phonCands } = retrieveConfusionLatticeAndGravity(
         `${modWord}${conjWord}`
       );
+      const punctCands = [`${modWord}，${conjWord}`];
       anomalousSpans.push({
-        text: `${modWord}${conjWord}`,
+        text: matchedRaw,
         startCharIdx: spanStart,
         endCharIdx: spanEnd,
-        phoneticHypotheses: Array.from(new Set([...phonCands, ...punctCands])).slice(0, 4),
-        anomalyScore: 0.76,
+        phoneticHypotheses: Array.from(
+          new Set([...valenceObjectCands, ...phonCands, ...punctCands])
+        ).slice(0, 4),
+        anomalyScore: hasDitransitiveDisposalVerb ? 0.88 : 0.76,
         anomalyType: 'collocation_surprisal',
       });
     }
@@ -1144,6 +1287,532 @@ export function resolveUnreasonableSelfQAAndTransferSpeaker(
   };
 }
 
+/**
+ * 【方向二 Stage 1 核心】：跨句語意完整性檢核與無損 WordSpan 結構修復 (`runStage1SentenceIntegrityCheckAndRepair`)
+ * 在進入單字/單詞槽位檢查 (#S1..#S5) 之前，先從「句子整體性」出發，依序檢測並無損修復：
+ * 1. 紙張摩擦與環境雜音重複幻覺清除 (`HALLUCINATION_LOOP` / `'repetition_noise_hallucination'`)
+ * 2. 跨段尾字掉落歸還 (`TAIL_DROP_TO_NEXT` / `'tail_character_drop'`，如前段尾「寄給。」「都很。」，後段首「他。」「好。」)
+ * 3. 前段尾端誤搶後段句首連接詞/發語詞歸還 (`HEAD_STOLEN_FROM_PREV` / `'head_stolen_from_prev'`，如前段尾「...完成。那」，後段首「我們接下來...」)
+ * 4. 同語者換氣斷句與語意殘句合併 (`INCOMPLETE_SYNTAX` / `'broken_syntax_split'`)
+ * 5. 不合理自問自答與句尾重疊附和拆解 (`SEMANTIC_ANOMALY` / `'unreasonable_self_qa'` / LG-TPST)
+ * 全程直接搬移與調整底層 `WordSpan` 節點，100% 保留字級時間戳記與點擊回放對齊！
+ */
+const DANGLING_TAIL_VERB_PREP_ADVERB_REGEX =
+  /[\u4e00-\u9fa5]{2,}(寄給|交給|傳給|發給|送給|還給|轉給|留給|提供給|分享給|告訴|通知|詢問|請教|拜託|都很|非常|特別|十分|相當|比較|稍微|有點|太|更|最|關於|針對|透過|根據|按照|依據|把|將|被|給|向)[，。、,.]*$/;
+
+const DROPPED_HEAD_COMPLEMENT_PRONOUN_REGEX =
+  /^(他|她|它|你|您|我|我們|他們|她們|大家|各位|好|棒|對|行|可|多|少|高|低|快|慢|大|小|長|短|遠|近|難|易|貴|久|清楚|明白|完整|順利|成功|合理|正確|重要|嚴重|明顯|的|了|嗎|呢|吧|啊|喔|呀|囉|啦)[，。、！？,.!?]*$/;
+
+const STOLEN_TAIL_DISCOURSE_STARTER_REGEX =
+  /[，。！？,.!?]+(那|但是|不過|所以|因此|而且|另外|還有|接下來|首先|再來|最後|我們|他們|這個|那個|因為|如果|雖然)$/;
+
+const MID_CLAUSE_INCOMPLETE_TAIL_REGEX =
+  /(的|在|把|將|被|和|與|跟|或|以及|因為|由於|如果|假如|雖然|儘管|當|對|向|往|從|於|之|而|且|並|又)[，、]?$/;
+
+const FRICTION_PREFIX_DEBRIS_REGEX =
+  /^(常|阿|啊|喔|嗯|欸|呃)[。，！？,.!?]+(?=(謝謝|好|對|是的|沒問題|可以))/;
+
+export function runStage1SentenceIntegrityCheckAndRepair(
+  inputSegments: Segment[],
+  speakers: Record<string, Speaker> = {}
+): {
+  repairedSegments: Segment[];
+  repairs: SentenceIntegrityRepair[];
+  diagnostics: Record<string, SentenceIntegrityDiagnostic>;
+  flaggedForRelistenIds: string[];
+} {
+  if (!inputSegments || inputSegments.length === 0) {
+    return {
+      repairedSegments: [],
+      repairs: [],
+      diagnostics: {},
+      flaggedForRelistenIds: [],
+    };
+  }
+
+  const repairs: SentenceIntegrityRepair[] = [];
+  const diagnostics: Record<string, SentenceIntegrityDiagnostic> = {};
+  const issueMap = new Map<string, Set<SentenceIntegrityIssueType>>();
+  const noteMap = new Map<string, string[]>();
+
+  const recordIssue = (
+    segId: string,
+    issue: SentenceIntegrityIssueType,
+    note: string
+  ) => {
+    if (!issueMap.has(segId)) issueMap.set(segId, new Set());
+    issueMap.get(segId)!.add(issue);
+    if (!noteMap.has(segId)) noteMap.set(segId, []);
+    if (note && !noteMap.get(segId)!.includes(note)) {
+      noteMap.get(segId)!.push(note);
+    }
+  };
+
+  // 深拷貝段落與 WordSpan 陣列，避免副作用污染
+  let working: Segment[] = inputSegments
+    .map((s) => ({
+      ...s,
+      words: s.words.map((w) => ({ ...w })),
+    }))
+    .filter((s) => s.words.length > 0);
+
+  // =========================================================================
+  // Step 1A：紙張摩擦殘字與重複幻覺迴圈清除 (HALLUCINATION_LOOP)
+  // =========================================================================
+  working = working.map((seg) => {
+    const rawText = seg.words.map((w) => w.text).join('');
+    let words = [...seg.words];
+
+    // 清除紙張摩擦前綴殘字 (例如「常。謝謝。」 -> 「謝謝。」)
+    if (FRICTION_PREFIX_DEBRIS_REGEX.test(rawText) && words.length >= 2) {
+      const firstClean = words[0].text.replace(/[。，！？,.!?]/g, '');
+      if (firstClean.length <= 1) {
+        const beforeTxt = rawText;
+        words = words.slice(1);
+        const afterTxt = words.map((w) => w.text).join('');
+        repairs.push({
+          segmentId: seg.id,
+          issueType: 'HALLUCINATION_LOOP',
+          beforeText: beforeTxt,
+          afterText: afterTxt,
+          description: 'Stage 1 剝離紙張摩擦前綴殘字',
+        });
+        recordIssue(
+          seg.id,
+          'HALLUCINATION_LOOP',
+          '已自動剝離句首摩擦雜音殘字'
+        );
+        recordIssue(seg.id, 'repetition_noise_hallucination', '');
+      }
+    }
+
+    // 清除連續 3 次以上短詞跳針幻覺 (如「謝謝。謝謝。謝謝。」)
+    if (words.length >= 3) {
+      const deduped: WordSpan[] = [];
+      let repCount = 0;
+      for (let i = 0; i < words.length; i++) {
+        const currNorm = words[i].text.replace(/[，。！？、,.!?]/g, '');
+        const prevNorm =
+          deduped.length > 0
+            ? deduped[deduped.length - 1].text.replace(/[，。！？、,.!?]/g, '')
+            : '';
+        if (currNorm.length > 0 && currNorm.length <= 3 && currNorm === prevNorm) {
+          repCount++;
+          if (repCount >= 2) {
+            continue;
+          }
+        } else {
+          repCount = 0;
+        }
+        deduped.push(words[i]);
+      }
+      if (deduped.length < words.length) {
+        const beforeTxt = words.map((w) => w.text).join('');
+        words = deduped;
+        const afterTxt = words.map((w) => w.text).join('');
+        repairs.push({
+          segmentId: seg.id,
+          issueType: 'HALLUCINATION_LOOP',
+          beforeText: beforeTxt,
+          afterText: afterTxt,
+          description: 'Stage 1 消除重複跳針幻覺詞',
+        });
+        recordIssue(seg.id, 'HALLUCINATION_LOOP', '已自動折疊重複跳針短詞');
+        recordIssue(seg.id, 'repetition_noise_hallucination', '');
+      }
+    }
+
+    return {
+      ...seg,
+      start: words[0]?.start ?? seg.start,
+      end: words[words.length - 1]?.end ?? seg.end,
+      words,
+    };
+  });
+
+  // =========================================================================
+  // Step 1B：跨段尾字掉落歸還 (TAIL_DROP_TO_NEXT) 與前段搶字歸還 (HEAD_STOLEN_FROM_PREV)
+  // =========================================================================
+  for (let i = 0; i < working.length - 1; i++) {
+    const prevSeg = working[i];
+    const currSeg = working[i + 1];
+    if (!prevSeg || !currSeg || prevSeg.words.length === 0 || currSeg.words.length === 0) {
+      continue;
+    }
+
+    const gapSec = currSeg.start - prevSeg.end;
+    if (gapSec > 1.75 || gapSec < -0.5) continue;
+
+    const prevText = prevSeg.words.map((w) => w.text).join('').trim();
+    const currFirstWord = currSeg.words[0];
+    const currFirstClean = currFirstWord.text.replace(/[，。！？、,.!?]/g, '').trim();
+
+    // 情況 1：跨段尾字掉落 (如前段結尾「寄給。」「都很。」，後段開頭「他。」「好。」)
+    const isPrevDanglingTail = DANGLING_TAIL_VERB_PREP_ADVERB_REGEX.test(prevText);
+    const isCurrHeadDroppedTail =
+      currFirstClean.length >= 1 &&
+      currFirstClean.length <= 2 &&
+      DROPPED_HEAD_COMPLEMENT_PRONOUN_REGEX.test(currFirstWord.text) &&
+      (/[，。！？、,.!?]$/.test(currFirstWord.text) ||
+        currSeg.words.length === 1 ||
+        /^[，。！？、,.!?]/.test(currSeg.words[1]?.text || ''));
+
+    if (isPrevDanglingTail && isCurrHeadDroppedTail) {
+      const beforePrevText = prevText;
+      // 移除前段最末字多餘的句號/逗號，讓歸還的尾字自然銜接
+      const lastPrevW = prevSeg.words[prevSeg.words.length - 1];
+      const strippedLastPrevText = lastPrevW.text.replace(/[，。、,.]+$/, '');
+      if (strippedLastPrevText.length > 0) {
+        prevSeg.words[prevSeg.words.length - 1] = {
+          ...lastPrevW,
+          text: strippedLastPrevText,
+          word: strippedLastPrevText,
+        };
+      }
+
+      // 取出 currSeg 開頭掉落的 WordSpan (若第 2 個 token 是純標點則一併搬移)
+      let takeCount = 1;
+      if (
+        currSeg.words.length >= 2 &&
+        /^[，。！？、,.!?]+$/.test(currSeg.words[1].text)
+      ) {
+        takeCount = 2;
+      }
+
+      const movedSpans = currSeg.words.slice(0, takeCount).map((w, idx) => {
+        const hasPunct = /[，。！？,.!?]$/.test(w.text);
+        const patchedText =
+          idx === takeCount - 1 && !hasPunct ? `${w.text}。` : w.text;
+        return {
+          ...w,
+          text: patchedText,
+          word: patchedText,
+          speakerId: prevSeg.speakerId,
+          status: 'auto_corrected' as const,
+          isPatched: true,
+          isCorrected: true,
+          reason: 'Stage 1 句意完整性修復：歸還跨段掉落之句尾補語/代名詞',
+        };
+      });
+
+      prevSeg.words.push(...movedSpans);
+      prevSeg.end = Math.max(
+        prevSeg.end,
+        movedSpans[movedSpans.length - 1].end
+      );
+      prevSeg.isCorrected = true;
+
+      currSeg.words = currSeg.words.slice(takeCount);
+      if (currSeg.words.length > 0) {
+        currSeg.start = currSeg.words[0].start;
+      }
+
+      const afterPrevText = prevSeg.words.map((w) => w.text).join('');
+      repairs.push({
+        segmentId: prevSeg.id,
+        relatedSegmentId: currSeg.id,
+        issueType: 'TAIL_DROP_TO_NEXT',
+        beforeText: beforePrevText,
+        afterText: afterPrevText,
+        description: `將跨段掉落尾字「${currFirstClean}」歸還前句尾端`,
+      });
+      recordIssue(
+        prevSeg.id,
+        'TAIL_DROP_TO_NEXT',
+        `已從下一段歸還掉落尾字「${currFirstClean}」`
+      );
+      recordIssue(prevSeg.id, 'tail_character_drop', '');
+      continue;
+    }
+
+    // 情況 2：前段尾端誤搶後段句首連接詞、發語詞或雙字詞上半部 (HEAD_STOLEN_FROM_PREV，如「很瞭解。我現。」+「在是比較擔心...」)
+    let splitStolenWordIdx = -1;
+    const stolenMatch = prevText.match(STOLEN_TAIL_DISCOURSE_STARTER_REGEX);
+    if (stolenMatch && prevSeg.words.length >= 2 && gapSec <= 1.35) {
+      const lastW = prevSeg.words[prevSeg.words.length - 1];
+      const lastWClean = lastW.text.replace(/[，。！？、,.!?]/g, '').trim();
+      if (lastWClean === stolenMatch[1]) {
+        splitStolenWordIdx = prevSeg.words.length - 1;
+      }
+    }
+    if (splitStolenWordIdx === -1 && prevSeg.words.length >= 2 && gapSec <= 0.85) {
+      // 檢查前段倒數 1~2 個 token 是否在句號後形成被切斷的半截詞 (如「很瞭解。」+「我現。」緊接「在是...」)
+      const lastPrevW = prevSeg.words[prevSeg.words.length - 1];
+      if (isSyntacticallyBoundPair(lastPrevW.text, currFirstWord.text)) {
+        for (let k = prevSeg.words.length - 2; k >= Math.max(0, prevSeg.words.length - 3); k--) {
+          if (/[。！？!?]$/.test(prevSeg.words[k].text)) {
+            const tailWordsLen = prevSeg.words
+              .slice(k + 1)
+              .reduce((acc, w) => acc + w.text.replace(/[，。！？、,.!?]/g, '').length, 0);
+            if (tailWordsLen >= 1 && tailWordsLen <= 4) {
+              splitStolenWordIdx = k + 1;
+            }
+            break;
+          }
+        }
+      }
+    }
+
+    if (splitStolenWordIdx > 0) {
+      const beforeCurrText = currSeg.words.map((w) => w.text).join('');
+      const stolenWords = prevSeg.words.slice(splitStolenWordIdx).map((w) => {
+        const cleanT = w.text.replace(/[，。！？、,.!?]+$/g, '');
+        return {
+          ...w,
+          text: cleanT,
+          word: cleanT,
+          speakerId: currSeg.speakerId,
+          status: 'auto_corrected' as const,
+          isPatched: true,
+          isCorrected: true,
+          reason: 'Stage 1 句意完整性修復：歸還前段尾端誤搶之句首詞組',
+        };
+      });
+      const stolenStr = stolenWords.map((w) => w.text).join('');
+
+      prevSeg.words = prevSeg.words.slice(0, splitStolenWordIdx);
+      prevSeg.end = prevSeg.words[prevSeg.words.length - 1].end;
+
+      currSeg.words = [...stolenWords, ...currSeg.words];
+      currSeg.start = stolenWords[0].start;
+      currSeg.isCorrected = true;
+
+      const afterCurrText = currSeg.words.map((w) => w.text).join('');
+      repairs.push({
+        segmentId: currSeg.id,
+        relatedSegmentId: prevSeg.id,
+        issueType: 'HEAD_STOLEN_FROM_PREV',
+        beforeText: beforeCurrText,
+        afterText: afterCurrText,
+        description: `將前段誤搶之句首詞「${stolenStr}」移回本句開頭`,
+      });
+      recordIssue(
+        currSeg.id,
+        'HEAD_STOLEN_FROM_PREV',
+        `已從前段尾端取回句首詞「${stolenStr}」`
+      );
+      recordIssue(currSeg.id, 'head_stolen_from_prev', '');
+    }
+  }
+
+  // 過濾掉因歸還尾字而變空的段落
+  working = working.filter((s) => s.words.length > 0);
+
+  // =========================================================================
+  // Step 1C：修復段內假句號 + 同語者無插話連續發言智慧合併與跨段語法價鍵縫合 (INCOMPLETE_SYNTAX)
+  // =========================================================================
+  const TOPIC_SHIFT_STARTER_STAGE1 =
+    /^(?:然後|那|另外|再來|此外|同時|最後)?(?:第[二三四五六七八九十][個點項部分步]|另外一個(?:部分|問題|重點|面向)|再來(?:就是|是|一個)|那另外(?:就是|一個)|接下來(?:我們|就是)|至於(?:在|說)?)/;
+
+  // 先修復每個 Segment 內部因為 Whisper 子句切分留下的句中假句號（如「我在。白姐報價之前」、「預算是比。另外一個」、「好然後。俊沂。」）
+  working = working.map((seg) => {
+    if (seg.words.length < 2) return seg;
+    const healedWords = seg.words.map((w, idx) => {
+      if (idx >= seg.words.length - 1) return w;
+      if (!/[。]$/.test(w.text)) return w;
+      const cleanW = w.text.replace(/[。]+$/g, '');
+      const nextW = seg.words[idx + 1].text.trim();
+      if (
+        /(?:[的之比在跟對向把被讓給為從到]|那個|這個|一些|一個)$/.test(cleanW) ||
+        isSyntacticallyBoundPair(cleanW, nextW)
+      ) {
+        return { ...w, text: cleanW, word: cleanW };
+      }
+      if (
+        /(?:因為|所以|就是|然後|好然後|而且|或是|或者|要能夠|能夠|例如說|比方說|這幾年|前幾年)$/.test(
+          cleanW
+        ) ||
+        cleanW.length <= 3
+      ) {
+        return { ...w, text: `${cleanW}，`, word: `${cleanW}，` };
+      }
+      return w;
+    });
+    return { ...seg, words: healedWords };
+  });
+
+  const mergedSyntax: Segment[] = [];
+  for (let i = 0; i < working.length; i++) {
+    const curr = working[i];
+    const prev = mergedSyntax.length > 0 ? mergedSyntax[mergedSyntax.length - 1] : null;
+
+    if (!prev) {
+      mergedSyntax.push(curr);
+      continue;
+    }
+
+    const gapSec = curr.start - prev.end;
+    const prevText = prev.words.map((w) => w.text).join('').trim();
+    const currText = curr.words.map((w) => w.text).join('').trim();
+
+    const lastPrevToken = prev.words[prev.words.length - 1]?.text || '';
+    const lastPrevClean = lastPrevToken.replace(/[，。？！、；：,.?!\s]+$/g, '');
+    const firstCurrToken = curr.words[0]?.text || '';
+    // 檢查兩段交界是否處於不可分割之語法價鍵配對
+    const isSyntacticallyLockedBoundary =
+      gapSec <= 0.65 &&
+      (!/[。！？!?]$/.test(lastPrevToken) ||
+        lastPrevClean.length <= 2 ||
+        /[的之比在跟對向把被讓給]$/.test(lastPrevClean)) &&
+      isSyntacticallyBoundPair(lastPrevClean, firstCurrToken);
+
+    const isSameSpeakerUninterrupted =
+      prev.speakerId === curr.speakerId && gapSec >= -0.25 && gapSec <= 12.0;
+
+    // 嚴格禁止將不同語者的獨立短答句（如「算不算。」、「不算。」、「對，」）強行併入前一位語者！
+    const isSameOrCompatibleSpeaker =
+      isSameSpeakerUninterrupted || isSyntacticallyLockedBoundary;
+
+    const isMidSentencePeriodCut =
+      prev.speakerId === curr.speakerId &&
+      (/(?:[的之比在跟對向把被讓給為從到]|要能夠|能夠|例如說|比方說|因為|就是|那個|這個)[，。、,.]*$/.test(
+        prevText
+      ) ||
+        isSyntacticallyBoundPair(lastPrevClean, firstCurrToken));
+
+    const hasExplicitTopicShift =
+      !isMidSentencePeriodCut &&
+      prevText.length >= 140 &&
+      (TOPIC_SHIFT_STARTER_STAGE1.test(currText) ||
+        (prevText.length >= 240 && gapSec >= 2.2) ||
+        prevText.length + currText.length > 380);
+
+    if (
+      prev.chunkIndex === curr.chunkIndex &&
+      isSameOrCompatibleSpeaker &&
+      ((isSyntacticallyLockedBoundary && gapSec <= 0.65) ||
+        (isSameSpeakerUninterrupted &&
+          (isMidSentencePeriodCut || !hasExplicitTopicShift)))
+    ) {
+      // 若為跨語者語法強約束合併，選取發聲時長與聲學邊際權重較高之語者作為完整句之語者
+      if (prev.speakerId !== curr.speakerId) {
+        const prevWeight = Math.max(0.2, prev.end - prev.start) * Math.max(0.08, prev.acousticMargin ?? 0.14);
+        const currWeight = Math.max(0.2, curr.end - curr.start) * Math.max(0.08, curr.acousticMargin ?? 0.14);
+        if (currWeight > prevWeight * 1.15) {
+          prev.speakerId = curr.speakerId;
+        }
+      }
+      const beforePrevText = prevText;
+      const lastPrevW = prev.words[prev.words.length - 1];
+      if (isSyntacticallyLockedBoundary) {
+        const stripped = lastPrevW.text.replace(/[，。、,.]+$/, '');
+        if (stripped) {
+          prev.words[prev.words.length - 1] = {
+            ...lastPrevW,
+            text: stripped,
+            word: stripped,
+          };
+        }
+      } else if (/[。]$/.test(lastPrevW.text)) {
+        const softened = lastPrevW.text.replace(/[。]+$/, '，');
+        prev.words[prev.words.length - 1] = {
+          ...lastPrevW,
+          text: softened,
+          word: softened,
+        };
+      }
+      prev.words = [
+        ...prev.words,
+        ...curr.words.map((w) => ({
+          ...w,
+          speakerId: prev.speakerId,
+        })),
+      ];
+      prev.end = Math.max(prev.end, curr.end);
+      prev.isCorrected = true;
+
+      repairs.push({
+        segmentId: prev.id,
+        relatedSegmentId: curr.id,
+        issueType: 'INCOMPLETE_SYNTAX',
+        beforeText: beforePrevText,
+        afterText: prev.words.map((w) => w.text).join(''),
+        description: 'Stage 1 合併同語者換氣切碎之未完子句',
+      });
+      recordIssue(
+        prev.id,
+        'INCOMPLETE_SYNTAX',
+        '已自動合併換氣斷裂之上下半句'
+      );
+      recordIssue(prev.id, 'broken_syntax_split', '');
+    } else {
+      mergedSyntax.push(curr);
+    }
+  }
+
+  // =========================================================================
+  // Step 1D：不合理自問自答與句尾附和插話拆解 (SEMANTIC_ANOMALY / LG-TPST)
+  // =========================================================================
+  const {
+    resolvedSegments,
+    transferredSegmentIds,
+    flaggedForRelistenIds,
+  } = resolveUnreasonableSelfQAAndTransferSpeaker(mergedSyntax, speakers);
+
+  for (const tId of transferredSegmentIds) {
+    recordIssue(
+      tId,
+      'SEMANTIC_ANOMALY',
+      'Stage 1 偵測段內自問自答或句尾附和重疊，已自動拆句移轉語者'
+    );
+    recordIssue(tId, 'unreasonable_self_qa', '');
+  }
+
+  // =========================================================================
+  // Step 1E：計算每段之句子語意完整度分數 (sentenceIntegrityScore) 與診斷報告
+  // =========================================================================
+  const finalSegments: Segment[] = resolvedSegments.map((seg) => {
+    const fullText = seg.words.map((w) => w.text).join('').trim();
+    const segIssues = Array.from(issueMap.get(seg.id) || []);
+    const notes = noteMap.get(seg.id) || [];
+
+    let score = 96;
+    if (DANGLING_TAIL_VERB_PREP_ADVERB_REGEX.test(fullText)) {
+      score -= 18;
+      if (!segIssues.includes('INCOMPLETE_SYNTAX')) {
+        segIssues.push('INCOMPLETE_SYNTAX');
+        notes.push('句尾仍為及物動詞或介詞，待後文補齊賓語');
+      }
+    }
+    if (fullText.length <= 2 && !/^(好|對|是|沒錯|謝謝|了解|可以)[。！？,.!?]*$/.test(fullText)) {
+      score -= 15;
+    }
+    if (!/[。！？，、,.!?]$/.test(fullText) && fullText.length >= 6) {
+      score -= 4;
+    }
+    if (segIssues.length > 0 && notes.some((n) => n.includes('已自動'))) {
+      // 已自動完成修復之句子恢復高完整度評分
+      score = Math.max(score, 92);
+    }
+    score = Math.max(45, Math.min(100, score));
+
+    const diag: SentenceIntegrityDiagnostic = {
+      segmentId: seg.id,
+      score,
+      issues: segIssues.length > 0 ? segIssues : ['NONE', 'none'],
+      autoRepaired: segIssues.length > 0 && notes.some((n) => n.includes('已')),
+      diagnosticNote: notes.join('；') || '句子語意結構完整',
+      suggestedRepair: notes.join('；') || undefined,
+      suggestedRepairHint: notes.join('；') || undefined,
+    };
+    diagnostics[seg.id] = diag;
+
+    return syncSegmentDerivedFields({
+      ...seg,
+      sentenceIntegrity: diag,
+      sentenceIntegrityScore: score,
+      sentenceIntegrityIssues: diag.issues,
+    });
+  });
+
+  return {
+    repairedSegments: finalSegments,
+    repairs,
+    diagnostics,
+    flaggedForRelistenIds,
+  };
+}
+
 export function mineAdaptiveHighFreqTerms(
   allSegments: Segment[],
   dictionary: DictEntry[],
@@ -1343,6 +2012,10 @@ export function applySentenceLevelLocalCorrection(
   const patches: CorrectionPatchItem[] = [];
 
   const state = useAppStore.getState();
+  // 【方向二 先句後詞】：在進入單詞與同音詞檢查前，先執行 Stage 1 跨句語意完整性檢核與 WordSpan 無損結構修復
+  const { repairedSegments: stage1RepairedSegments } =
+    runStage1SentenceIntegrityCheckAndRepair(targetSegments, state.speakers);
+  targetSegments = stage1RepairedSegments;
   const allSegs = state.segments.length > 0 ? state.segments : targetSegments;
   const evidenceMap = analyzeCorpusStatisticalEvidence(
     allSegs,
@@ -1367,24 +2040,25 @@ export function applySentenceLevelLocalCorrection(
   const dynamicRules: Array<{ wrong: string; right: string; reason: string }> =
     [];
   for (const entry of dictionary) {
-    if (entry.aliases && entry.aliases.length > 0) {
+    const { typoAliases } = classifyDictEntryAliases(entry);
+    if (typoAliases.length > 0) {
       const scopeLabel =
         entry.scope === 'public' || entry.scope === 'global'
           ? '公共字典'
           : entry.scope === 'personal'
           ? '個人字典'
           : '會議字典';
-      for (const alias of entry.aliases) {
-        if (alias && alias !== entry.term) {
-          dynamicRules.push({
-            wrong: alias,
-            right: entry.term,
-            reason: `Pass 0 依${scopeLabel}同音別名自動修正`,
-          });
-        }
+      for (const alias of typoAliases) {
+        dynamicRules.push({
+          wrong: alias,
+          right: entry.term.trim(),
+          reason: `Pass 0 依${scopeLabel}同音別名自動修正`,
+        });
       }
     }
   }
+  // 依錯字長度由長到短排序，避免短別名先破壞長詞
+  dynamicRules.sort((a, b) => b.wrong.length - a.wrong.length);
 
   const exactDominantMap = new Map<string, StatisticalTermEvidence>();
   const fuzzyDominantMap = new Map<string, StatisticalTermEvidence>();
@@ -1440,8 +2114,29 @@ export function applySentenceLevelLocalCorrection(
       }
     }
 
+    // 【通用語法配價與話題化受詞推論】：當「[雙字形容詞/修飾語][，]?如果」後方緊接「我們/你們 + 再/就 + 寄給/送給/發給/交給/給 + 人稱代詞」且無後件子句時，
+    // 自動辨識該「如果 (rú-guǒ)」為話題化直接受詞「禮物 (lǐ-wù)」之快速連讀弱化並予以修復！
+    refinedSentence = refinedSentence.replace(
+      /([\u4e00-\u9fa5]{2})([，、\s]*)(如果|盧果|如過)(?=(?:我們|你們|他們|我|你|他|再|就|先|會|可以|幫){1,3}(?:寄給|送給|發給|傳給|交給|買給|帶給|補給|提供給|留給|給)(?:他|她|你|你們|他們|大家|委員|老師|長官)[。，！？!?\s]*$)/g,
+      (fullMatch, modWord: string, _punct: string, conjWord: string) => {
+        if (COMMON_STOP_WORDS.has(modWord) || BAD_GRAMMATICAL_EDGE_REGEX.test(modWord)) {
+          return fullMatch;
+        }
+        const replacement = `${modWord}禮物`;
+        hitReasons.push({
+          wrong: fullMatch,
+          right: replacement,
+          reason: `Stage 2 依話題化受詞與雙及物動詞「寄給/送給」語法配價及流音連讀模型修正「${conjWord} -> 禮物」`,
+        });
+        return replacement;
+      }
+    );
+
     for (const dRule of dynamicRules) {
-      if (refinedSentence.includes(dRule.wrong)) {
+      if (
+        refinedSentence.includes(dRule.wrong) &&
+        !refinedSentence.includes(dRule.right)
+      ) {
         refinedSentence = refinedSentence.split(dRule.wrong).join(dRule.right);
         hitReasons.push(dRule);
       }
@@ -1547,10 +2242,7 @@ export function applySentenceLevelLocalCorrection(
       seg.words.reduce((acc, w) => acc + w.confidence, 0) /
       Math.max(1, seg.words.length);
 
-    const tokens =
-      refinedSentence.match(
-        /[\u4e00-\u9fa5]{1,2}|[\u3040-\u30ff]{1,3}|[a-zA-Z0-9']+\s*|[^\s\u4e00-\u9fa5\u3040-\u30ffa-zA-Z0-9]/g
-      ) || [refinedSentence];
+    const tokens = segmentNaturalLanguageTokens(refinedSentence);
     const dur = Math.max(0.2, seg.end - seg.start);
     const step = dur / Math.max(1, tokens.length);
 
@@ -1632,14 +2324,14 @@ export function applySentenceLevelLocalCorrection(
       };
     });
 
-    return {
+    return syncSegmentDerivedFields({
       ...seg,
       words: newWords,
       isCorrected: true,
-    };
+    });
   });
 
-  return { updatedSegments, patches };
+  return { updatedSegments: updatedSegments.map(syncSegmentDerivedFields), patches };
 }
 
 /**
@@ -1713,16 +2405,23 @@ export async function runTriLevelWindowCorrection(params: {
     onApplyPatches,
   } = params;
 
-  const { updatedSegments: step1Segments, patches: localPatches } =
+  const state = useAppStore.getState();
+  // 【方向二 Stage 1】：先執行跨句語意完整性檢核與結構修復（尾字掉落歸還、前段搶字、換氣斷句合併、自問自答拆解）
+  const {
+    repairedSegments: stage1Segments,
+    flaggedForRelistenIds,
+  } = runStage1SentenceIntegrityCheckAndRepair(
+    payload.highAttentionTargetSegments,
+    state.speakers
+  );
+
+  // 【方向二 Stage 2】：在句子語意完整的前提下，執行單詞主權收斂與 #S1..#S5 懷疑槽位標記
+  const { updatedSegments: resolvedSegments, patches: localPatches } =
     applySentenceLevelLocalCorrection(
-      payload.highAttentionTargetSegments,
+      stage1Segments,
       payload.lowAttentionGlobalMemory.verifiedTerms,
       dictionary
     );
-
-  const state = useAppStore.getState();
-  const { resolvedSegments, flaggedForRelistenIds } =
-    resolveUnreasonableSelfQAAndTransferSpeaker(step1Segments, state.speakers);
 
   useAppStore.getState().replaceBatchSegments(resolvedSegments);
 

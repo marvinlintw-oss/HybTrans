@@ -1,12 +1,15 @@
 // src/store/useAppStore.ts
 // 升級與根因修正重點：
-// 1. [解決句子順序錯位與跨語者黏合]：在 smartConsolidateSegments 中嚴格檢查兩段落之間是否夾有其他語者的插話，且將合併間隙收緊至 <= 0.55 秒 (原本 2.8 秒會把前後不同輪次的發言跨越插話強行合併為一大段！)。
-// 2. [解決 localStorage 舊快取強制開啟「專屬音軌轉寫」問題]：將 Zustand persist 儲存鍵升級為 'hybrid-transcriber-storage-v7' 並加入自動遷移 (merge)，強制預設關閉 enableVirtualSpeakerTrackStitching，直接走 12~20s 靜音谷底視窗 + 字級 Viterbi 對齊！
+// 1. [解決句子順序錯位與跨語者黏合]：在 smartConsolidateSegments 中嚴格檢查兩段落之間是否夾有其他語者的插話，且將合併間隙收緊至 <= 0.55 秒。
+// 2. [解決 localStorage 舊快取強制開啟「專屬音軌轉寫」問題]：將 Zustand persist 儲存鍵升級為 'hybrid-transcriber-storage-v9' 並加入自動遷移 (merge)，強制預設關閉 enableVirtualSpeakerTrackStitching，直接走 12~20s 靜音谷底視窗 + 字級 Viterbi 對齊。
+// 3. [方向一 + 方向二 SSOT 雙向相容擴充]：同步維護 AudioPreAnalysisProfile、推薦方案套用 (applyRecommendedPreset)、Segment 衍生欄位 (text/rawText/polishedText/sentenceIntegrity) 與完整雙向別名。
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import {
   AtomicCharToken,
+  AudioPreAnalysisProfile,
+  AudioRecommendationOption,
   CorrectionPatchItem,
   DiarizationConfig,
   DictEntry,
@@ -16,6 +19,7 @@ import {
   MacroChunkState,
   ModelDownloadStatus,
   PhoneticMatchCandidate,
+  PipelineProgress,
   Segment,
   Speaker,
   SuspectSpanNode,
@@ -26,6 +30,41 @@ import {
 import { TIER_PRESET_SPECS } from '../services/modelCacheManager';
 import { DEFAULT_PUBLIC_DICTIONARY, mergeDictLists } from '../utils/dictIO';
 import { toTaiwanFuzzyPhoneticSyllables } from '../utils/phoneticMatcher';
+
+export function syncSegmentDerivedFields(seg: Segment): Segment {
+  const syncedWords: WordSpan[] = (seg.words || []).map((w) => ({
+    ...w,
+    word: w.text,
+    originalWord: w.originalText,
+    isPatched: w.status === 'auto_corrected',
+    isCorrected: w.status === 'auto_corrected',
+  }));
+  const joinedText = syncedWords.map((w) => w.text).join('');
+  const joinedRaw =
+    seg.rawText ||
+    syncedWords.map((w) => w.originalText || w.text).join('') ||
+    joinedText;
+  const integrityScore =
+    seg.sentenceIntegrity?.score ?? seg.sentenceIntegrityScore ?? 100;
+  const integrityIssues =
+    seg.sentenceIntegrity?.issues ?? seg.sentenceIntegrityIssues ?? [];
+
+  return {
+    ...seg,
+    words: syncedWords,
+    text: joinedText,
+    rawText: joinedRaw,
+    polishedText: joinedText,
+    isPolished: seg.isCorrected,
+    ispolished: seg.isCorrected,
+    overlapWarning:
+      seg.overlapWarning ??
+      ((seg.overlapRatio ?? 0) >= 0.25 ||
+        seg.slotTier === 'tier3_overlap_split'),
+    sentenceIntegrityScore: integrityScore,
+    sentenceIntegrityIssues: integrityIssues,
+  };
+}
 
 export function applySeamlessSpanReplacement(
   utterance: UtteranceNode,
@@ -378,14 +417,18 @@ export function applySeamlessWordSpanReplacement(
       ...words[absorbedWordStart],
       id: `${words[absorbedWordStart].id}_pre`,
       text: prefixKeep,
+      word: prefixKeep,
       end: newStartSec,
     });
   }
 
+  const finalTxt = effectiveText || replacementText;
   resultWords.push({
     ...targetAnchorWord,
-    text: effectiveText || replacementText,
+    text: finalTxt,
+    word: finalTxt,
     originalText: preservedOriginal,
+    originalWord: preservedOriginal,
     start: newStartSec,
     end: newEndSec,
     confidence:
@@ -393,6 +436,8 @@ export function applySeamlessWordSpanReplacement(
         ? 0.96
         : targetAnchorWord.confidence,
     status: options?.status ?? 'normal',
+    isPatched: options?.status === 'auto_corrected',
+    isCorrected: options?.status === 'auto_corrected',
     reason: options?.reason ?? targetAnchorWord.reason,
     candidates: options?.candidates ?? targetAnchorWord.candidates,
     userLocked: options?.userLocked ?? targetAnchorWord.userLocked,
@@ -403,6 +448,7 @@ export function applySeamlessWordSpanReplacement(
       ...words[absorbedWordEnd - 1],
       id: `${words[absorbedWordEnd - 1].id}_suf`,
       text: suffixKeep,
+      word: suffixKeep,
       start: newEndSec,
     });
   }
@@ -414,19 +460,152 @@ export function applySeamlessWordSpanReplacement(
   return resultWords;
 }
 
+const DISCOURSE_TOPIC_SHIFT_REGEX =
+  /^(?:然後|那|另外|再來|此外|同時|最後)?(?:第[二三四五六七八九十][個點項部分步]|另外一個(?:部分|問題|重點|面向)|再來(?:就是|是|一個)|那另外(?:就是|一個)|接下來(?:我們|就是)|至於(?:在|說)?)/;
+
 /**
- * 【根因修正 10】：依原始會議絕對時間軸排序並安全合併同語者緊鄰碎片。
- * 1. 若兩段同語者發言中間存在任何其他語者之插話或重疊，絕對禁止跨越插話合併！
- * 2. 將允許合併的最大停頓由 2.8s 收緊為 0.55s，確保不同句的對話保持獨立時間戳記與正確順序！
+ * 檢查兩段同語者連續發言的交界處是否屬於「句中跨視窗斷裂」(例如：「今年預算的。」+「狀況。」、「要能夠。」+「就是比較主導性」、「例如說。」+「假設...」)
+ * 若是，回傳應如何縫合前段最後一詞之標點 ('strip' = 移除句末標點直連, 'comma' = 將句號改為逗號, 'keep' = 維持原標點)
+ */
+function analyzeCrossWindowBoundaryStitchMode(
+  prevLastWordText: string,
+  currFirstWordText: string
+): 'strip' | 'comma' | 'keep' {
+  const prevClean = prevLastWordText.replace(/[，。？！、；：,.?!\s]+$/g, '');
+  const currClean = currFirstWordText.replace(/^[，。？！、；：,.?!\s]+/g, '');
+  if (!prevClean || !currClean) return 'keep';
+
+  // 1. 緊密定語/介詞/比較級/動詞結構被視窗切斷（如：「今年預算的。」+「狀況」、「預算是比。」+「另外一個」、「我在。」+「白姐報價之前」、「跟那個。」+「曉玲」） -> 直接剝除假句號無縫連接！
+  if (
+    /(?:[的之比在跟對向把被讓給為從到]|那個|這個|一些|一個|我們有|他們有)$/.test(
+      prevClean
+    ) ||
+    (/^[的之得地了嗎呢吧啊呀喔哦啦囉嘛齁吼]/.test(currClean) &&
+      currClean.length <= 3) ||
+    (/(?:預算|報價|規模|問題|部分|角色|活動|合作|費用)的$/.test(prevClean) &&
+      /^(?:狀況|部分|問題|規模|方式|費用|做法)/.test(currClean))
+  ) {
+    return 'strip';
+  }
+
+  // 2. 助動詞/連接詞/舉例引導詞跨視窗子句過渡（如：「要求我們的角色要能夠。」+「就是比較主導性」、「我們看看，例如說。」+「假設你們期待的是」） -> 將句號改為逗號！
+  if (
+    /(?:要能夠|能夠|可以|應該|就是|因為|所以|而且|然後|例如說|比方說|像是|主要是|或者是|但如果)$/.test(
+      prevClean
+    ) ||
+    /^(?:就是|因為|所以|而且|但是|可是|不過|假設|如果|例如|比方|那目前|或者是)/.test(
+      currClean
+    )
+  ) {
+    return 'comma';
+  }
+
+  return 'keep';
+}
+
+/**
+ * 針對已無縫合併之同語者長獨白（>= 200字），自動偵測內部明確的「語意主題轉折點」（如「...這是第一個。然後第二個就是說...」、「...再來就是...」），
+ * 在不切斷任何完整句子的前提下，將過長的多主題獨白拆分為語意清晰的段落！
+ */
+function splitLongMonologueAtSemanticBoundaries(
+  segments: Segment[]
+): Segment[] {
+  const result: Segment[] = [];
+
+  for (const seg of segments) {
+    const totalChars = seg.words.reduce((acc, w) => acc + w.text.length, 0);
+    if (totalChars < 200 || seg.words.length < 12) {
+      result.push(seg);
+      continue;
+    }
+
+    // 尋找距離段首 >= 70 字且距離段尾 >= 60 字之明確語意轉折句邊界
+    let splitWordIdx = -1;
+    let accChars = 0;
+
+    for (let i = 0; i < seg.words.length - 3; i++) {
+      accChars += seg.words[i].text.length;
+      const remChars = totalChars - accChars;
+      if (accChars < 70 || remChars < 60) continue;
+
+      const currW = seg.words[i].text.trim();
+      const lookaheadText = seg.words
+        .slice(i + 1, Math.min(seg.words.length, i + 5))
+        .map((w) => w.text)
+        .join('')
+        .trim();
+
+      const prevEndsSentence = /[。？！.?!]$/.test(currW);
+      const prevEndsTopicSummary =
+        /(?:這是第[一二三]個|這是另一個|有點不太一樣|比較好|標示出來|先說明一下)[，。？！.?!]*$/.test(
+          seg.words
+            .slice(Math.max(0, i - 2), i + 1)
+            .map((w) => w.text)
+            .join('')
+        );
+
+      if (
+        (prevEndsSentence || prevEndsTopicSummary) &&
+        DISCOURSE_TOPIC_SHIFT_REGEX.test(lookaheadText)
+      ) {
+        splitWordIdx = i + 1;
+        break;
+      }
+    }
+
+    if (splitWordIdx > 0 && splitWordIdx < seg.words.length) {
+      const firstWords = seg.words.slice(0, splitWordIdx).map((w, idx, arr) => {
+        if (idx === arr.length - 1 && !/[。？！.?!]$/.test(w.text)) {
+          const clean = w.text.replace(/[，、；：,:;\s]+$/g, '');
+          return { ...w, text: `${clean}。`, word: `${clean}。` };
+        }
+        return w;
+      });
+      const secondWords = seg.words.slice(splitWordIdx);
+      const splitTime = Number(secondWords[0].start.toFixed(2));
+
+      const firstSeg = syncSegmentDerivedFields({
+        ...seg,
+        id: `${seg.id}_p1`,
+        end: Math.max(seg.start + 0.2, splitTime),
+        words: firstWords,
+      });
+      const secondSeg = syncSegmentDerivedFields({
+        ...seg,
+        id: `${seg.id}_p2`,
+        start: splitTime,
+        words: secondWords,
+      });
+
+      result.push(
+        ...splitLongMonologueAtSemanticBoundaries([firstSeg, secondSeg])
+      );
+    } else {
+      result.push(seg);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * 【同語者無插話智慧合併與語意分段引擎】：
+ * 1. 若兩段同語者發言中間存在任何其他語者之插話或重疊 (`hasInterveningOtherSpeaker`)，絕對禁止跨越插話合併，100% 保護對話交鋒順序！
+ * 2. 若同一位語者連續發言且中間沒有任何其他人講話 (`!hasInterveningOtherSpeaker`)：
+ *    - 自動跨越 ASR 12~20s 視窗邊界將其合併為同一段，並自動修復視窗切點處的假句號（如「今年預算的。」+「狀況。」->「今年預算的狀況。」）！
+ *    - 僅當累積字數已長且遇到明確的「語意主題分段轉折（如：然後第二個就是說...）」或長停頓換題時，才拆分為新段落！
  */
 function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
-  if (allSegments.length <= 1) return allSegments;
+  if (allSegments.length === 0) return [];
+  if (allSegments.length === 1) return [syncSegmentDerivedFields(allSegments[0])];
 
   const sorted: Segment[] = allSegments
-    .map((s) => ({
-      ...s,
-      words: [...s.words],
-    }))
+    .map((s) =>
+      syncSegmentDerivedFields({
+        ...s,
+        words: [...s.words],
+      })
+    )
     .sort((a, b) => {
       if (Math.abs(a.start - b.start) > 0.08) return a.start - b.start;
       return a.end - b.end;
@@ -442,7 +621,6 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
       : 0;
     const currChars = seg.words.reduce((acc, w) => acc + w.text.length, 0);
 
-    // 檢查 prev 與 seg 之間是否有其他語者發言介入
     let hasInterveningOtherSpeaker = false;
     if (prev && prev.speakerId === seg.speakerId) {
       for (let j = 0; j < sorted.length; j++) {
@@ -459,22 +637,57 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
       }
     }
 
+    const pauseGap = prev ? seg.start - prev.end : 999;
+    const prevLastText =
+      prev && prev.words.length > 0
+        ? prev.words[prev.words.length - 1].text
+        : '';
+    const currFullText = seg.words.map((w) => w.text).join('');
+    const currFirstText = seg.words[0]?.text || '';
+
+    const stitchMode = prev
+      ? analyzeCrossWindowBoundaryStitchMode(prevLastText, currFirstText)
+      : 'keep';
+    const isMidSentenceCut = stitchMode === 'strip' || stitchMode === 'comma';
+
+    // 判斷是否為同語者長獨白之明確語意分段點
+    const isSemanticTopicBreak =
+      !isMidSentenceCut &&
+      prevChars >= 140 &&
+      (DISCOURSE_TOPIC_SHIFT_REGEX.test(currFullText.trim()) ||
+        (prevChars >= 240 && pauseGap >= 2.2) ||
+        prevChars + currChars > 380);
+
     if (
       prev &&
       !hasInterveningOtherSpeaker &&
       prev.chunkIndex === seg.chunkIndex &&
       prev.speakerId === seg.speakerId &&
-      seg.start >= prev.end - 0.12 &&
-      seg.start - prev.end <= 0.55 &&
-      prevChars + currChars <= 160
+      seg.start >= prev.end - 0.25 &&
+      pauseGap <= 12.0 &&
+      (isMidSentenceCut || !isSemanticTopicBreak)
     ) {
       const prevWords = [...prev.words];
       if (prevWords.length > 0) {
         const lastW = prevWords[prevWords.length - 1];
-        if (!/[，。？！、；：,.?!]$/.test(lastW.text)) {
+        const cleanLast = lastW.text.replace(/[，。？！、；：,.?!\s]+$/g, '');
+        if (stitchMode === 'strip') {
+          prevWords[prevWords.length - 1] = {
+            ...lastW,
+            text: cleanLast,
+            word: cleanLast,
+          };
+        } else if (stitchMode === 'comma') {
+          prevWords[prevWords.length - 1] = {
+            ...lastW,
+            text: `${cleanLast}，`,
+            word: `${cleanLast}，`,
+          };
+        } else if (!/[，。？！、；：,.?!]$/.test(lastW.text)) {
           prevWords[prevWords.length - 1] = {
             ...lastW,
             text: `${lastW.text}，`,
+            word: `${lastW.text}，`,
           };
         }
       }
@@ -484,19 +697,25 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
         prev.acousticMargin ?? 0.15,
         seg.acousticMargin ?? 0.15
       );
+      merged[merged.length - 1] = syncSegmentDerivedFields(prev);
     } else {
-      merged.push(seg);
+      merged.push(syncSegmentDerivedFields(seg));
     }
   }
 
-  return merged;
+  // 對合併後的長獨白執行語意轉折點自動分段（例如將 02:25~04:10 之長獨白精準在「然後第二個就是說...」處拆為兩段）
+  return splitLongMonologueAtSemanticBoundaries(merged);
 }
 
 const DEFAULT_DIARIZATION_CONFIG: DiarizationConfig = {
   engineMode: 'mode_0_heritage_classic',
+  strategyMode: 'MODE_0_GOLDEN_TWO_STAGE',
   clusterMethod: 'ahc_cosine',
+  clusteringMethod: 'ahc_cosine',
   executionBackend: 'wasm',
+  backend: 'wasm',
   onnxModelFilename: 'wespeaker_voxceleb_resnet34_int8.onnx',
+  embeddingModel: 'wespeaker_voxceleb_resnet34_int8.onnx',
   localWasmBasePath: './wasm/',
   localModelBasePath: './models/',
   yieldEveryNUnits: 14,
@@ -512,34 +731,72 @@ const DEFAULT_DIARIZATION_CONFIG: DiarizationConfig = {
   embeddingExcludeOverlap: true,
 };
 
-interface AppState {
+export interface AppState {
   config: EngineConfig;
+  engineConfig: EngineConfig;
+  diarizationConfig: DiarizationConfig;
+  activeDiarizationBackend: string;
+  audioFile: File | null;
+  audioUrl: string | null;
+  duration: number;
+  currentTime: number;
+  isPlaying: boolean;
   chunks: MacroChunkState[];
+  isRunning: boolean;
+  progress: PipelineProgress;
   segments: Segment[];
+  activeSegmentId: string | null;
   speakers: Record<string, Speaker>;
   dictionary: DictEntry[];
   docContextSummary: string;
   rollingMeetingSummary: string;
-  currentTime: number;
+  briefingSummary: string;
   phoneticCandidates: PhoneticMatchCandidate[];
   modelDownload: ModelDownloadStatus;
+  audioPreAnalysis: AudioPreAnalysisProfile | null;
+  isPreAnalyzingAudio: boolean;
+  preAnalysisProgress: { percent: number; detailText: string };
+  selectedPresetId: string;
 
   updateConfig: (partial: Partial<EngineConfig>) => void;
+  setEngineConfig: (partial: Partial<EngineConfig>) => void;
   updateDiarizationConfig: (partial: Partial<DiarizationConfig>) => void;
+  setDiarizationConfig: (partial: Partial<DiarizationConfig>) => void;
+  setActiveDiarizationBackend: (backend: string) => void;
   applyGranularityTier: (tier: GranularityTier) => void;
+  applyRecommendedPreset: (preset: AudioRecommendationOption | string) => void;
+
+  setAudioFile: (file: File | null, url?: string | null) => void;
+  setDuration: (sec: number) => void;
+  setCurrentTime: (sec: number) => void;
+  setIsPlaying: (playing: boolean) => void;
+  setAudioPreAnalysis: (profile: AudioPreAnalysisProfile | null) => void;
+  setIsPreAnalyzingAudio: (analyzing: boolean) => void;
+  setPreAnalysisProgress: (percent: number, detailText: string) => void;
+
   initChunks: (totalDurationSec: number) => void;
   updateChunkState: (index: number, partial: Partial<MacroChunkState>) => void;
+  setIsRunning: (running: boolean) => void;
+  setProgress: (partial: Partial<PipelineProgress>) => void;
   setModelDownload: (status: Partial<ModelDownloadStatus>) => void;
+
   appendSegments: (newSegments: Segment[]) => void;
+  appendSegment: (newSegment: Segment) => void;
   replaceBatchSegments: (updatedSegments: Segment[]) => void;
-  clearTranscript: (clearSessionDictOrEvent?: boolean | unknown) => void;
+  updateSegment: (segmentId: string, partial: Partial<Segment>) => void;
+  updateSegmentText: (segmentId: string, newText: string) => void;
+  updateSegmentSpeaker: (segmentId: string, newSpeakerId: string) => void;
+  toggleSegmentLock: (segmentId: string) => void;
   applyCorrectionPatches: (
     patches: CorrectionPatchItem[],
     markSegmentIdsCorrected?: string[]
   ) => void;
   replaceSegmentAfterRelisten: (segmentId: string, newWords: WordSpan[]) => void;
   revertWord: (segmentId: string, wordIndex: number, newText?: string) => void;
-  upsertSpeakers: (list: Speaker[]) => void;
+  setActiveSegmentId: (segmentId: string | null) => void;
+  clearTranscript: (clearSessionDictOrEvent?: boolean | unknown) => void;
+
+  upsertSpeakers: (list: Speaker[] | Record<string, Speaker>) => void;
   mergeSpeakers: (sourceId: string, targetId: string) => void;
   renameSpeaker: (speakerId: string, newName: string) => void;
   setPhoneticCandidates: (candidates: PhoneticMatchCandidate[]) => void;
@@ -549,41 +806,62 @@ interface AppState {
   promoteDictEntryScope: (id: string, targetScope: DictScope) => void;
   setDocContextSummary: (summary: string) => void;
   setRollingMeetingSummary: (summary: string) => void;
-  setCurrentTime: (sec: number) => void;
+  setBriefingSummary: (summary: string) => void;
 }
 
 const defaultTierSpec =
   TIER_PRESET_SPECS.balanced_pro || TIER_PRESET_SPECS.eco_safe;
 
+const INITIAL_ENGINE_CONFIG: EngineConfig = {
+  mode: 'local_webgpu',
+  granularityTier: 'balanced_pro',
+  localAsrModel: 'Whisper-Large-v3-Turbo',
+  localLlmModel: defaultTierSpec.recommendedLlm,
+  groqApiKey: '',
+  geminiApiKey: '',
+  minSpeakers: 2,
+  maxSpeakers: 6,
+  acousticThreshold: 0.72,
+  chunkDurationSec: defaultTierSpec.chunkDurationSec,
+  keepModelsCoResident: defaultTierSpec.keepModelsCoResident,
+  asrBeamSize: defaultTierSpec.asrBeamSize,
+  highAttentionChars: defaultTierSpec.highAttentionChars,
+  mediumAttentionChars: defaultTierSpec.mediumAttentionChars,
+  maxRelistenQuota: defaultTierSpec.maxRelistenQuotaPerChunk,
+  relistenPaddingSec: defaultTierSpec.relistenPaddingSec,
+  diarizationConfig: DEFAULT_DIARIZATION_CONFIG,
+  diarization: DEFAULT_DIARIZATION_CONFIG,
+};
+
 export const useAppStore = create<AppState>()(
   persist(
     (set, get) => ({
-      config: {
-        mode: 'local_webgpu',
-        granularityTier: 'balanced_pro',
-        localAsrModel: 'Whisper-Large-v3-Turbo',
-        localLlmModel: defaultTierSpec.recommendedLlm,
-        groqApiKey: '',
-        geminiApiKey: '',
-        minSpeakers: 2,
-        maxSpeakers: 6,
-        acousticThreshold: 0.72,
-        chunkDurationSec: defaultTierSpec.chunkDurationSec,
-        keepModelsCoResident: defaultTierSpec.keepModelsCoResident,
-        asrBeamSize: defaultTierSpec.asrBeamSize,
-        highAttentionChars: defaultTierSpec.highAttentionChars,
-        mediumAttentionChars: defaultTierSpec.mediumAttentionChars,
-        maxRelistenQuota: defaultTierSpec.maxRelistenQuotaPerChunk,
-        relistenPaddingSec: defaultTierSpec.relistenPaddingSec,
-        diarizationConfig: DEFAULT_DIARIZATION_CONFIG,
-      },
+      config: INITIAL_ENGINE_CONFIG,
+      engineConfig: INITIAL_ENGINE_CONFIG,
+      diarizationConfig: DEFAULT_DIARIZATION_CONFIG,
+      activeDiarizationBackend: 'WeSpeaker 256D + Dual-Stage Anchor',
+      audioFile: null,
+      audioUrl: null,
+      duration: 0,
+      currentTime: 0,
+      isPlaying: false,
       chunks: [],
+      isRunning: false,
+      progress: {
+        active: false,
+        currentChunkIndex: 0,
+        totalChunks: 0,
+        stage: 'idle',
+        overallProgress: 0,
+        detailText: '等待載入音檔',
+      },
       segments: [],
+      activeSegmentId: null,
       speakers: {},
       dictionary: DEFAULT_PUBLIC_DICTIONARY,
       docContextSummary: '',
       rollingMeetingSummary: '',
-      currentTime: 0,
+      briefingSummary: '',
       phoneticCandidates: [],
       modelDownload: {
         active: false,
@@ -592,22 +870,59 @@ export const useAppStore = create<AppState>()(
         progress: 0,
         statusText: '',
       },
+      audioPreAnalysis: null,
+      isPreAnalyzingAudio: false,
+      preAnalysisProgress: {
+        percent: 0,
+        detailText: '',
+      },
+      selectedPresetId: 'preset_a_balanced',
 
       updateConfig: (partial) =>
-        set((state) => ({
-          config: { ...state.config, ...partial },
-        })),
+        set((state) => {
+          const nextDiar = partial.diarizationConfig
+            ? {
+                ...state.config.diarizationConfig,
+                ...partial.diarizationConfig,
+              }
+            : state.config.diarizationConfig;
+          const nextConfig: EngineConfig = {
+            ...state.config,
+            ...partial,
+            diarizationConfig: nextDiar,
+            diarization: nextDiar,
+          };
+          return {
+            config: nextConfig,
+            engineConfig: nextConfig,
+            diarizationConfig: nextDiar,
+          };
+        }),
+
+      setEngineConfig: (partial) => get().updateConfig(partial),
 
       updateDiarizationConfig: (partial) =>
-        set((state) => ({
-          config: {
+        set((state) => {
+          const nextDiar: DiarizationConfig = {
+            ...(state.config.diarizationConfig || DEFAULT_DIARIZATION_CONFIG),
+            ...partial,
+          };
+          const nextConfig: EngineConfig = {
             ...state.config,
-            diarizationConfig: {
-              ...(state.config.diarizationConfig || DEFAULT_DIARIZATION_CONFIG),
-              ...partial,
-            },
-          },
-        })),
+            diarizationConfig: nextDiar,
+            diarization: nextDiar,
+          };
+          return {
+            config: nextConfig,
+            engineConfig: nextConfig,
+            diarizationConfig: nextDiar,
+          };
+        }),
+
+      setDiarizationConfig: (partial) => get().updateDiarizationConfig(partial),
+
+      setActiveDiarizationBackend: (backend) =>
+        set({ activeDiarizationBackend: backend }),
 
       applyGranularityTier: (tier) => {
         const spec = TIER_PRESET_SPECS[tier];
@@ -618,6 +933,7 @@ export const useAppStore = create<AppState>()(
           tier === 'eco_safe'
             ? {
                 engineMode: 'mode_a_classic',
+                strategyMode: 'MODE_A_CLASSIC_DSP',
                 clusterMethod: 'ahc_cosine',
                 yieldEveryNUnits: 8,
                 scdPeakThreshold: 0.28,
@@ -630,6 +946,7 @@ export const useAppStore = create<AppState>()(
             : tier === 'balanced_pro'
             ? {
                 engineMode: 'mode_0_heritage_classic',
+                strategyMode: 'MODE_0_GOLDEN_TWO_STAGE',
                 clusterMethod: 'ahc_cosine',
                 yieldEveryNUnits: 14,
                 scdPeakThreshold: 0.22,
@@ -641,6 +958,7 @@ export const useAppStore = create<AppState>()(
               }
             : {
                 engineMode: 'mode_c_onnx_neural',
+                strategyMode: 'MODE_C_ONNX_NEURAL',
                 clusterMethod: 'ahc_cosine',
                 yieldEveryNUnits: 24,
                 scdPeakThreshold: 0.19,
@@ -651,8 +969,13 @@ export const useAppStore = create<AppState>()(
                 enableVirtualSpeakerTrackStitching: false,
               };
 
-        set((state) => ({
-          config: {
+        const nextDiar: DiarizationConfig = {
+          ...currentDiar,
+          ...tierDiarPatch,
+        };
+
+        set((state) => {
+          const nextConfig: EngineConfig = {
             ...state.config,
             granularityTier: tier,
             localLlmModel: spec.recommendedLlm,
@@ -663,13 +986,85 @@ export const useAppStore = create<AppState>()(
             mediumAttentionChars: spec.mediumAttentionChars,
             maxRelistenQuota: spec.maxRelistenQuotaPerChunk,
             relistenPaddingSec: spec.relistenPaddingSec,
-            diarizationConfig: {
-              ...currentDiar,
-              ...tierDiarPatch,
-            },
-          },
-        }));
+            diarizationConfig: nextDiar,
+            diarization: nextDiar,
+          };
+          return {
+            config: nextConfig,
+            engineConfig: nextConfig,
+            diarizationConfig: nextDiar,
+          };
+        });
       },
+
+      applyRecommendedPreset: (presetOrId) => {
+        const state = get();
+        const resolvedPreset: AudioRecommendationOption | undefined =
+          typeof presetOrId === 'string'
+            ? state.audioPreAnalysis?.recommendations.find(
+                (r) => r.id === presetOrId
+              )
+            : presetOrId;
+
+        if (!resolvedPreset) return;
+
+        const nextDiar: DiarizationConfig = {
+          ...(state.config.diarizationConfig || DEFAULT_DIARIZATION_CONFIG),
+          ...resolvedPreset.diarizationPatch,
+        };
+        const nextConfig: EngineConfig = {
+          ...state.config,
+          ...(resolvedPreset.enginePatch || {}),
+          minSpeakers: resolvedPreset.recommendedMinSpeakers,
+          maxSpeakers: resolvedPreset.recommendedMaxSpeakers,
+          diarizationConfig: nextDiar,
+          diarization: nextDiar,
+        };
+
+        set({
+          config: nextConfig,
+          engineConfig: nextConfig,
+          diarizationConfig: nextDiar,
+          selectedPresetId: resolvedPreset.id,
+        });
+      },
+
+      setAudioFile: (file, url) =>
+        set((state) => {
+          if (state.audioUrl && state.audioUrl !== url) {
+            try {
+              URL.revokeObjectURL(state.audioUrl);
+            } catch {
+              // ignore
+            }
+          }
+          const nextUrl =
+            url !== undefined
+              ? url
+              : file
+              ? URL.createObjectURL(file)
+              : null;
+          return {
+            audioFile: file,
+            audioUrl: nextUrl,
+          };
+        }),
+
+      setDuration: (sec) => set({ duration: sec }),
+      setCurrentTime: (sec) => set({ currentTime: sec }),
+      setIsPlaying: (playing) => set({ isPlaying: playing }),
+      setAudioPreAnalysis: (profile) =>
+        set({
+          audioPreAnalysis: profile,
+          selectedPresetId:
+            profile?.recommendedPresetId || get().selectedPresetId,
+        }),
+      setIsPreAnalyzingAudio: (analyzing) =>
+        set({ isPreAnalyzingAudio: analyzing }),
+      setPreAnalysisProgress: (percent, detailText) =>
+        set({
+          preAnalysisProgress: { percent, detailText },
+        }),
 
       initChunks: (totalDurationSec) => {
         const chunkSec = get().config.chunkDurationSec || 300;
@@ -688,14 +1083,61 @@ export const useAppStore = create<AppState>()(
             relistenUsed: 0,
           })
         );
-        set({ chunks });
+        set({
+          chunks,
+          duration: totalDurationSec,
+          progress: {
+            active: true,
+            currentChunkIndex: 0,
+            totalChunks: count,
+            stage: 'idle',
+            overallProgress: 0,
+            detailText: '準備開始微批次處理',
+          },
+        });
       },
 
       updateChunkState: (index, partial) =>
-        set((state) => ({
-          chunks: state.chunks.map((c) =>
+        set((state) => {
+          const nextChunks = state.chunks.map((c) =>
             c.index === index ? { ...c, ...partial } : c
-          ),
+          );
+          const total = Math.max(1, nextChunks.length);
+          const completed = nextChunks.filter(
+            (c) => c.stage === 'completed' || c.stage === 'COMPLETED'
+          ).length;
+          const active = nextChunks[index];
+          const overallProgress = Math.min(
+            100,
+            Math.round(
+              ((completed * 100 +
+                (active &&
+                active.stage !== 'completed' &&
+                active.stage !== 'COMPLETED'
+                  ? active.progress
+                  : 0)) /
+                (total * 100)) *
+                100
+            )
+          );
+          return {
+            chunks: nextChunks,
+            progress: {
+              active: completed < total,
+              currentChunkIndex: index,
+              totalChunks: total,
+              stage: partial.stage || active?.stage || 'idle',
+              overallProgress,
+              detailText:
+                partial.detailText || active?.detailText || '處理中...',
+            },
+          };
+        }),
+
+      setIsRunning: (running) => set({ isRunning: running }),
+      setProgress: (partial) =>
+        set((state) => ({
+          progress: { ...state.progress, ...partial },
         })),
 
       setModelDownload: (partial) =>
@@ -707,18 +1149,75 @@ export const useAppStore = create<AppState>()(
         set((state) => ({
           segments: smartConsolidateSegments([
             ...state.segments,
-            ...newSegments,
+            ...newSegments.map(syncSegmentDerivedFields),
           ]),
         })),
 
+      appendSegment: (newSegment) =>
+        get().appendSegments([syncSegmentDerivedFields(newSegment)]),
+
       replaceBatchSegments: (updatedSegments) =>
         set((state) => {
-          const map = new Map(updatedSegments.map((s) => [s.id, s]));
+          const syncedList = updatedSegments.map(syncSegmentDerivedFields);
+          const map = new Map(syncedList.map((s) => [s.id, s]));
+          const existingIdSet = new Set(state.segments.map((s) => s.id));
           const replaced = state.segments.map((s) => map.get(s.id) || s);
+          const brandNew = syncedList.filter((s) => !existingIdSet.has(s.id));
           return {
-            segments: replaced,
+            segments:
+              brandNew.length > 0
+                ? smartConsolidateSegments([...replaced, ...brandNew])
+                : replaced,
           };
         }),
+
+      updateSegment: (segmentId, partial) =>
+        set((state) => ({
+          segments: state.segments.map((seg) =>
+            seg.id === segmentId
+              ? syncSegmentDerivedFields({ ...seg, ...partial })
+              : seg
+          ),
+        })),
+
+      updateSegmentText: (segmentId, newText) =>
+        set((state) => ({
+          segments: state.segments.map((seg) => {
+            if (seg.id !== segmentId) return seg;
+            const replacedWords = applySeamlessWordSpanReplacement(
+              seg.words,
+              0,
+              seg.words.length,
+              newText,
+              { status: 'normal', userLocked: true }
+            );
+            return syncSegmentDerivedFields({
+              ...seg,
+              words: replacedWords,
+              isCorrected: true,
+            });
+          }),
+        })),
+
+      updateSegmentSpeaker: (segmentId, newSpeakerId) =>
+        set((state) => ({
+          segments: state.segments.map((seg) =>
+            seg.id === segmentId
+              ? syncSegmentDerivedFields({ ...seg, speakerId: newSpeakerId })
+              : seg
+          ),
+        })),
+
+      toggleSegmentLock: (segmentId) =>
+        set((state) => ({
+          segments: state.segments.map((seg) =>
+            seg.id === segmentId
+              ? syncSegmentDerivedFields({ ...seg, isLocked: !seg.isLocked })
+              : seg
+          ),
+        })),
+
+      setActiveSegmentId: (segmentId) => set({ activeSegmentId: segmentId }),
 
       clearTranscript: (clearSessionDictOrEvent) => {
         const shouldClearSession = clearSessionDictOrEvent === true;
@@ -728,6 +1227,7 @@ export const useAppStore = create<AppState>()(
           speakers: {},
           phoneticCandidates: [],
           rollingMeetingSummary: '',
+          briefingSummary: '',
           currentTime: 0,
           modelDownload: {
             active: false,
@@ -792,13 +1292,13 @@ export const useAppStore = create<AppState>()(
                       beforeWords[beforeWords.length - 1].end.toFixed(2)
                     );
                     updatedSegments.push(
-                      {
+                      syncSegmentDerivedFields({
                         ...seg,
                         end: splitTime,
                         words: beforeWords,
                         isCorrected: true,
-                      },
-                      {
+                      }),
+                      syncSegmentDerivedFields({
                         ...seg,
                         id: `${seg.id}_tpst`,
                         speakerId: speakerPatch.newSpeakerId,
@@ -817,7 +1317,7 @@ export const useAppStore = create<AppState>()(
                             : w
                         ),
                         isCorrected: true,
-                      }
+                      })
                     );
                     continue;
                   }
@@ -868,12 +1368,14 @@ export const useAppStore = create<AppState>()(
               }
             }
 
-            updatedSegments.push({
-              ...seg,
-              speakerId: nextSpeakerId,
-              words: currentWords,
-              isCorrected: seg.isCorrected || shouldMarkCorrected,
-            });
+            updatedSegments.push(
+              syncSegmentDerivedFields({
+                ...seg,
+                speakerId: nextSpeakerId,
+                words: currentWords,
+                isCorrected: seg.isCorrected || shouldMarkCorrected,
+              })
+            );
           }
 
           return {
@@ -887,12 +1389,12 @@ export const useAppStore = create<AppState>()(
         set((state) => ({
           segments: state.segments.map((seg) =>
             seg.id === segmentId
-              ? {
+              ? syncSegmentDerivedFields({
                   ...seg,
                   words: newWords,
                   isCorrected: true,
                   relistenCount: (seg.relistenCount || 0) + 1,
-                }
+                })
               : seg
           ),
         })),
@@ -920,12 +1422,15 @@ export const useAppStore = create<AppState>()(
               }
             );
 
-            return { ...seg, words: newWords };
+            return syncSegmentDerivedFields({ ...seg, words: newWords });
           }),
         })),
 
-      upsertSpeakers: (list) =>
+      upsertSpeakers: (listOrRecord) =>
         set((state) => {
+          const list = Array.isArray(listOrRecord)
+            ? listOrRecord
+            : Object.values(listOrRecord || {});
           const next = { ...state.speakers };
           for (const sp of list) {
             if (!next[sp.id]) {
@@ -958,7 +1463,9 @@ export const useAppStore = create<AppState>()(
           delete nextSpeakers[sourceId];
 
           const nextSegments = state.segments.map((seg) =>
-            seg.speakerId === sourceId ? { ...seg, speakerId: targetId } : seg
+            seg.speakerId === sourceId
+              ? syncSegmentDerivedFields({ ...seg, speakerId: targetId })
+              : seg
           );
           return {
             speakers: nextSpeakers,
@@ -995,12 +1502,16 @@ export const useAppStore = create<AppState>()(
               return {
                 ...w,
                 originalText: w.originalText ?? w.text,
+                originalWord: w.originalText ?? w.text,
                 text: m.targetSpeakerName,
+                word: m.targetSpeakerName,
                 status: 'auto_corrected' as const,
+                isPatched: true,
+                isCorrected: true,
                 reason: '語者姓名同音連動修正',
               };
             });
-            return { ...seg, words };
+            return syncSegmentDerivedFields({ ...seg, words });
           });
 
           return {
@@ -1030,11 +1541,12 @@ export const useAppStore = create<AppState>()(
 
       setDocContextSummary: (summary) => set({ docContextSummary: summary }),
       setRollingMeetingSummary: (summary) =>
-        set({ rollingMeetingSummary: summary }),
-      setCurrentTime: (sec: number) => set({ currentTime: sec }),
+        set({ rollingMeetingSummary: summary, briefingSummary: summary }),
+      setBriefingSummary: (summary) =>
+        set({ rollingMeetingSummary: summary, briefingSummary: summary }),
     }),
     {
-      name: 'hybrid-transcriber-storage-v7',
+      name: 'hybrid-transcriber-storage-v9',
       partialize: (state) => ({
         config: state.config,
         dictionary: mergeDictLists(
@@ -1044,19 +1556,23 @@ export const useAppStore = create<AppState>()(
       }),
       merge: (persistedState, currentState) => {
         const p = (persistedState || {}) as Partial<AppState>;
+        const mergedDiar: DiarizationConfig = {
+          ...DEFAULT_DIARIZATION_CONFIG,
+          ...(p.config?.diarizationConfig || {}),
+          enableVirtualSpeakerTrackStitching: false,
+        };
+        const mergedConfig: EngineConfig = {
+          ...currentState.config,
+          ...(p.config || {}),
+          diarizationConfig: mergedDiar,
+          diarization: mergedDiar,
+        };
         return {
           ...currentState,
           ...p,
-          config: {
-            ...currentState.config,
-            ...(p.config || {}),
-            diarizationConfig: {
-              ...DEFAULT_DIARIZATION_CONFIG,
-              ...(p.config?.diarizationConfig || {}),
-              // 強制預設關閉舊版會造成句子順序錯位的 Virtual Speaker-Track Stitching
-              enableVirtualSpeakerTrackStitching: false,
-            },
-          },
+          config: mergedConfig,
+          engineConfig: mergedConfig,
+          diarizationConfig: mergedDiar,
         };
       },
     }

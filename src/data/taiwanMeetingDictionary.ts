@@ -1,11 +1,14 @@
 // src/data/taiwanMeetingDictionary.ts
 // ============================================================================
-// 台灣商業、政府公務、採購標案、學術研發與科技專案內建大詞典 (獨立維護檔)
+// 台灣商業、政府公務、地方創生、採購標案、學術研發與科技專案內建大詞典 (獨立維護檔)
 // ----------------------------------------------------------------------------
 // 設計目的：
 // 1. 獨立於核心邏輯之外，方便日後直接新增、修改或匯出台灣在地會議常用詞彙。
-// 2. 每個詞條可配置常見的「台灣國語口音/同音誤聽別名 (aliases)」，
-//    供 Whisper 提示詞 (Prompt Hint) 與語境校正引擎高速對齊。
+// 2. 每個詞條僅配置真正的「台灣國語口音/快速連讀同音誤聽別名 (aliases)」，
+//    杜絕將不同語意詞彙混入 aliases 造成誤替換。
+// 3. 針對特定領域之千詞級完整名單（如 1,394 筆之《HybTransPlus 地方創生字典》），
+//    系統支援透過網址參數 `?dict=1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E` 動態載入，
+//    本內建詞庫則精選高頻、零碰撞風險之核心機構、計畫、專詞與常駐與會者。
 // ============================================================================
 
 import { DictCategory, DictEntry } from '../types';
@@ -21,19 +24,52 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   // 一、 政府機關、部會簡稱與公務組織稱謂
   // ==========================================================================
   {
+    term: '國家發展委員會',
+    category: 'project',
+    aliases: ['國家發展委員匯', '國家發展委原會'],
+  },
+  {
     term: '國發會',
     category: 'person',
-    aliases: ['國法會', '過發會', '果發會', '國發匯'],
+    aliases: ['國法會', '過發會', '果發會', '國發匯', '廣發會'],
+  },
+  {
+    term: '國土區域離島發展處',
+    category: 'project',
+    aliases: ['國土區域離島發展室', '國土區域離島發展署'],
+  },
+  {
+    term: '國土處',
+    category: 'person',
+    aliases: ['國土室', '國土署', '國土觸'],
   },
   {
     term: '中小企業署',
     category: 'person',
-    aliases: ['中央企業師', '中小企業處', '中小企業屬', '中央切屬', '中小企署'],
+    aliases: [
+      '中央企業師',
+      '中小企業處',
+      '中小企業屬',
+      '中央切屬',
+      '中小企署',
+      '中小企業絲',
+      '中小企業司',
+      '中小企業師',
+    ],
   },
   {
     term: '商業署',
     category: 'person',
-    aliases: ['商業室', '商業司', '商業屬', '商業處'],
+    aliases: [
+      '商業室',
+      '商業司',
+      '商業屬',
+      '商業處',
+      '商業絲',
+      '商業師',
+      '商業業絲',
+      '商業業師',
+    ],
   },
   {
     term: '產業發展署',
@@ -41,9 +77,14 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
     aliases: ['產發署', '產發室', '產業發展室', '產發屬'],
   },
   {
+    term: '青年發展署',
+    category: 'person',
+    aliases: ['青發署', '青年發展室', '青年發展處', '清發署'],
+  },
+  {
     term: '數位發展部',
     category: 'person',
-    aliases: ['數發部', '速發部', '數位部'],
+    aliases: ['數位發展處', '數位部'],
   },
   {
     term: '數發部',
@@ -53,7 +94,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '國科會',
     category: 'person',
-    aliases: ['國科匯', '過科會', '科技部'],
+    aliases: ['國科匯', '過科會'],
   },
   {
     term: '經濟部',
@@ -63,7 +104,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '勞動部',
     category: 'person',
-    aliases: ['勞工部', '勞動力發展署'],
+    aliases: ['勞工部'],
   },
   {
     term: '農業部',
@@ -73,12 +114,12 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '文化部',
     category: 'person',
-    aliases: ['文化局', '文化處'],
+    aliases: ['文化處'],
   },
   {
     term: '環境部',
     category: 'person',
-    aliases: ['環保署', '環評會'],
+    aliases: ['環保署'],
   },
   {
     term: '金管會',
@@ -98,12 +139,22 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '立法院',
     category: 'person',
-    aliases: ['立法委員', '國會聯絡'],
+    aliases: ['利法院', '立法院會'],
+  },
+  {
+    term: '立法委員',
+    category: 'person',
+    aliases: ['利法委員', '立院委員'],
+  },
+  {
+    term: '委員',
+    category: 'person',
+    aliases: ['委原', '偉員', '尾員', '緯員'],
   },
   {
     term: '行政院',
     category: 'person',
-    aliases: ['政院', '院本部'],
+    aliases: ['行正院'],
   },
   {
     term: '處內',
@@ -118,17 +169,17 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '局處',
     category: 'jargon',
-    aliases: ['局室', '菊處', '各局處'],
+    aliases: ['局室', '菊處'],
   },
   {
     term: '承辦人',
     category: 'person',
-    aliases: ['成辦人', '承辦同仁', '承辦科'],
+    aliases: ['成辦人', '陳辦人'],
   },
   {
     term: '長官',
     category: 'person',
-    aliases: ['掌官', '場官'],
+    aliases: ['掌官', '場官', '常官'],
   },
 
   // ==========================================================================
@@ -137,7 +188,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '開新標',
     category: 'project',
-    aliases: ['開心不要', '開新表', '開心標', '開星標', '一個新表'],
+    aliases: ['開心不要', '開新表', '開心標', '開星標', '一個新表', '改開新標'],
   },
   {
     term: '新標',
@@ -145,9 +196,14 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
     aliases: ['星標', '心標', '欣標', '新表'],
   },
   {
+    term: '工項',
+    category: 'project',
+    aliases: ['功項', '工象', '攻項', '公項', '工向', '功象', '供項'],
+  },
+  {
     term: '後續擴充',
     category: 'project',
-    aliases: ['擴充套件', '後擴', '後續過充', '再去過充'],
+    aliases: ['擴充套件', '後續過充', '再去過充'],
   },
   {
     term: '擴充',
@@ -162,17 +218,22 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '評選',
     category: 'project',
-    aliases: ['平選', '瓶選', '評選會', '評選委員'],
+    aliases: ['平選', '瓶選', '憑選'],
   },
   {
     term: '審查會',
     category: 'project',
-    aliases: ['省查會', '審核會', '期中審查', '期末審查'],
+    aliases: ['省查會', '審核會'],
+  },
+  {
+    term: '審查委員',
+    category: 'person',
+    aliases: ['省查委員', '審查委原'],
   },
   {
     term: '徵件',
     category: 'project',
-    aliases: ['成見', '針見', '真見', '政見', '爭件', '徵見'],
+    aliases: ['成見', '針見', '真見', '政見', '爭件', '徵見', '真劍'],
   },
   {
     term: '時程',
@@ -187,67 +248,142 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '專案組',
     category: 'project',
-    aliases: ['專案族', '專安組'],
+    aliases: ['專案族', '專安組', '專案主'],
   },
   {
     term: '獎勵金',
     category: 'project',
-    aliases: ['講歷經', '獎勵劍', '講利金', '獎力金'],
+    aliases: ['講歷經', '獎勵劍', '講利金', '獎力金', '獎勵計'],
   },
   {
     term: '補助金',
     category: 'project',
-    aliases: ['捕助金', '補助款', '補助經費'],
+    aliases: ['捕助金', '補住金'],
   },
   {
     term: '配合款',
     category: 'project',
-    aliases: ['自籌款', '地方配合款'],
+    aliases: ['配何款', '配合館'],
   },
   {
     term: '驗收',
     category: 'project',
-    aliases: ['燕收', '驗收款', '結案驗收'],
+    aliases: ['燕收', '厭收', '驗收款'],
   },
   {
     term: '核銷',
     category: 'project',
-    aliases: ['合銷', '核消', '經費核銷', '單據核銷'],
+    aliases: ['合銷', '核消', '河銷', '和銷'],
   },
   {
     term: '流標',
     category: 'project',
-    aliases: ['留標', '劉標', '廢標'],
+    aliases: ['留標', '劉標'],
   },
   {
     term: '決標',
     category: 'project',
-    aliases: ['絕標', '決表', '得標廠商'],
+    aliases: ['絕標', '決表', '覺標'],
   },
   {
     term: '招標文件',
     category: 'project',
-    aliases: ['招標書', '投標須知', '需求說明書', '工作說明書'],
+    aliases: ['招標檔案', '招標文建'],
+  },
+  {
+    term: '服務對象',
+    category: 'project',
+    aliases: ['服務物件', '服務對像'],
   },
   {
     term: '契約變更',
     category: 'project',
-    aliases: ['契變', '氣變', '變更設計'],
+    aliases: ['氣變', '契變'],
   },
   {
     term: '管考',
     category: 'project',
-    aliases: ['館考', '管制考核', '進度管考'],
+    aliases: ['館考', '管烤'],
   },
   {
     term: 'KPI',
     category: 'project',
-    aliases: ['績效指標', '查核點', '量化指標', '質化指標'],
+    aliases: ['K P I', 'kpi'],
   },
 
   // ==========================================================================
-  // 三、 地方創生、商圈輔導、商業經營與創業育成
+  // 三、 地方創生核心計畫、媒體合作與高頻專有名詞（精選自 HybTransPlus 地方創生字典）
   // ==========================================================================
+  {
+    term: '地方創生',
+    category: 'project',
+    aliases: ['地方創身', '地方創聲', '地方創深'],
+  },
+  {
+    term: '地方創生專案辦公室',
+    category: 'project',
+    aliases: ['地方創生專辦', '地創專案辦公室'],
+  },
+  {
+    term: '地創專辦',
+    category: 'project',
+    aliases: ['地創專班', '地創專辦室'],
+  },
+  {
+    term: '台灣經濟研究院',
+    category: 'project',
+    aliases: ['臺灣經濟研究院', '台灣經濟研究苑'],
+  },
+  {
+    term: '台經院',
+    category: 'project',
+    aliases: ['臺經院', '台金院', '台經苑'],
+  },
+  {
+    term: '分區輔導中心',
+    category: 'project',
+    aliases: ['分區輔導中興', '分輔中心'],
+  },
+  {
+    term: '青年培力工作站',
+    category: 'project',
+    aliases: ['青年賠力工作站', '青年陪力工作站'],
+  },
+  {
+    term: '青培站',
+    category: 'project',
+    aliases: ['清陪站', '青賠站', '青陪站', '清培站', '輕培站'],
+  },
+  {
+    term: '青年培力',
+    category: 'project',
+    aliases: ['青年賠力', '青年陪力'],
+  },
+  {
+    term: '中興新村育成村',
+    category: 'project',
+    aliases: ['中興新村預成村', '中興育成村'],
+  },
+  {
+    term: '微笑台灣',
+    category: 'project',
+    aliases: ['微小臺灣', '微小台灣', '微笑臺灣', '微校台灣', '微校臺灣'],
+  },
+  {
+    term: '天下雜誌',
+    category: 'project',
+    aliases: ['天夏雜誌', '天下雜志'],
+  },
+  {
+    term: '神秘禮物',
+    category: 'jargon',
+    aliases: ['神秘如果', '神秘，如果', '神祕禮物', '神祕如果', '神秘里物'],
+  },
+  {
+    term: '馬祖',
+    category: 'jargon',
+    aliases: ['麻祖', '媽祖', '馬組', '麻組'],
+  },
   {
     term: '業師',
     category: 'person',
@@ -261,22 +397,18 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '廊帶',
     category: 'project',
-    aliases: ['狼帶', '郎蛋', '藍帶', '蘭代', '狼袋', '廊代'],
-  },
-  {
-    term: '地方創生',
-    category: 'project',
-    aliases: ['地方創身', '地方創聲', '地方創深', '地創'],
-  },
-  {
-    term: '青年培力',
-    category: 'project',
-    aliases: ['青年賠力', '青年陪力', '青培站', '培力工作站'],
-  },
-  {
-    term: '育成中心',
-    category: 'project',
-    aliases: ['育成計畫', '創新育成', '孵化器', '加速器'],
+    aliases: [
+      '狼帶',
+      '郎蛋',
+      '藍帶',
+      '蘭代',
+      '狼袋',
+      '廊代',
+      '郎單',
+      '囊蛋',
+      '強帶',
+      '郎帶',
+    ],
   },
   {
     term: '店面翻修',
@@ -291,125 +423,135 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '加盟',
     category: 'jargon',
-    aliases: ['加盲', '加忙', '加茫', '直營店'],
-  },
-  {
-    term: '商圈輔導',
-    category: 'project',
-    aliases: ['店家輔導', '商業輔導', '實地訪視', '蹲點輔導'],
-  },
-  {
-    term: '青創貸款',
-    category: 'project',
-    aliases: ['青年創業', '創業輔導', '新創團隊'],
+    aliases: ['加盲', '加忙', '加茫'],
   },
   {
     term: '商業模式',
     category: 'jargon',
-    aliases: ['商模', '傷模', '營收模式', '變現模式'],
+    aliases: ['商業魔式', '商模'],
   },
   {
     term: '淨零碳排',
     category: 'project',
-    aliases: ['淨零轉型', '碳盤查', '探盤查', 'ESG', '永續發展'],
+    aliases: ['淨零探排', '近零碳排'],
   },
   {
-    term: '數位轉型',
+    term: '碳盤查',
     category: 'project',
-    aliases: ['雲端服務', '智慧商業', '行動支付', '電子發票'],
+    aliases: ['探盤查', '炭盤查'],
   },
 
   // ==========================================================================
-  // 四、 學術研究、高教校務與計畫審查常用詞
+  // 四、 國發會與地方創生專案辦公室核心常駐與會人名與稱謂（零碰撞高識別度）
+  // ==========================================================================
+  {
+    term: '葉俊顯',
+    category: 'person',
+    aliases: ['葉俊賢', '葉俊憲', '業俊顯'],
+  },
+  {
+    term: '劉鏡清',
+    category: 'person',
+    aliases: ['劉敬清', '劉靜清'],
+  },
+  {
+    term: '彭立沛',
+    category: 'person',
+    aliases: ['彭立佩', '彭麗沛', '彭立配'],
+  },
+  {
+    term: '陳美伶',
+    category: 'person',
+    aliases: ['陳美玲', '陳美琳'],
+  },
+  {
+    term: '黃文彥',
+    category: 'person',
+    aliases: ['黃文燕', '黃文諺', '黃文彦'],
+  },
+  {
+    term: '林鐘榮',
+    category: 'person',
+    aliases: ['林忠榮', '林中榮', '林宗榮'],
+  },
+  {
+    term: '康廷嶽',
+    category: 'person',
+    aliases: ['康廷岳', '康庭嶽', '康庭岳'],
+  },
+  {
+    term: '黃柏偉',
+    category: 'person',
+    aliases: ['黃博偉', '黃百偉'],
+  },
+  {
+    term: '許芯榆',
+    category: 'person',
+    aliases: ['許心榆', '許欣榆', '許芯瑜', '許心瑜'],
+  },
+  {
+    term: '芯榆',
+    category: 'person',
+    aliases: ['星雲', '星妤', '心榆', '欣榆', '芯瑜', '心瑜', '欣瑜', 'Ciri'],
+  },
+  {
+    term: '葉俊沂',
+    category: 'person',
+    aliases: ['葉俊儀', '葉俊宜', '業俊沂', '葉俊穎'],
+  },
+  {
+    term: '俊沂',
+    category: 'person',
+    aliases: ['俊穎', '俊儀', '俊宜'],
+  },
+  {
+    term: '白佩玉',
+    category: 'person',
+    aliases: ['白珮玉', '白佩鈺'],
+  },
+  {
+    term: '白姐',
+    category: 'person',
+    aliases: ['白姊', '百姐', '白解'],
+  },
+  {
+    term: '曉玲',
+    category: 'person',
+    aliases: ['少林', '小玲', '曉林', '小淋'],
+  },
+
+  // ==========================================================================
+  // 五、 學術研究、企業治理與日常會議高頻詞
   // ==========================================================================
   {
     term: '計畫主持人',
     category: 'person',
-    aliases: ['共同主持人', '協同主持人', '主池人'],
+    aliases: ['計劃主持人', '主池人'],
+  },
+  {
+    term: '協同主持人',
+    category: 'person',
+    aliases: ['協同主池人', '偕同主持人'],
   },
   {
     term: '產學合作',
     category: 'project',
-    aliases: ['產學計畫', '慘學合作', '技轉中心', '技術移轉'],
+    aliases: ['慘學合作', '產學合做'],
   },
   {
     term: '深耕計畫',
     category: 'project',
-    aliases: ['高教深耕', '生根計畫', 'USR計畫', '大學社會責任'],
-  },
-  {
-    term: '研究倫理',
-    category: 'jargon',
-    aliases: ['IRB', '人體試驗', '知情同意書'],
+    aliases: ['生根計畫', '深耕計劃'],
   },
   {
     term: '質性研究',
     category: 'jargon',
-    aliases: ['直線研究', '深度訪談', '焦點團體', '田野調查'],
-  },
-  {
-    term: '量化分析',
-    category: 'jargon',
-    aliases: ['問卷調查', '統計顯著', '迴歸分析', '信效度'],
-  },
-  {
-    term: '文獻探討',
-    category: 'jargon',
-    aliases: ['文獻回顧', '研究方法', '研究架構', '研究假設'],
-  },
-  {
-    term: '專家學者',
-    category: 'person',
-    aliases: ['審查委員', '外審委員', '口試委員', '指導教授'],
-  },
-  {
-    term: '博士後研究員',
-    category: 'person',
-    aliases: ['博後', '專任助理', '兼任助理', '研究助理'],
-  },
-
-  // ==========================================================================
-  // 五、 企業治理、財務會計、科技研發與日常會議高頻詞
-  // ==========================================================================
-  {
-    term: '董事會',
-    category: 'person',
-    aliases: ['股東會', '常務董事', '獨立董事', '獨董', '監察人'],
-  },
-  {
-    term: '損益表',
-    category: 'jargon',
-    aliases: ['資產負債表', '現金流量表', '毛利率', '營業利益率'],
-  },
-  {
-    term: '資本支出',
-    category: 'jargon',
-    aliases: ['費用化', '折舊攤提', '預算編列', '概算表'],
-  },
-  {
-    term: '法說會',
-    category: 'project',
-    aliases: ['法人說明會', '財報公布', '季報', '年報'],
-  },
-  {
-    term: '概念驗證',
-    category: 'project',
-    aliases: ['POC', 'PoC', '場域驗證', '試營運'],
-  },
-  {
-    term: '大型語言模型',
-    category: 'jargon',
-    aliases: ['生成式AI', '語音辨識', '語者分離', '微調模型'],
-  },
-  {
-    term: '資訊安全',
-    category: 'jargon',
-    aliases: ['資安檢測', '弱點掃描', '滲透測試', '個資保護', '去識別化'],
+    aliases: ['直線研究', '執性研究'],
   },
   {
     term: '會議紀錄',
     category: 'project',
-    aliases: ['會議記錄', '逐字稿', '簽到表', '臨時動議', '主席裁示'],
+    aliases: ['會議記錄', '匯議紀錄'],
   },
   {
     term: '儘快',
@@ -424,9 +566,14 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
 export function getBuiltinTaiwanMeetingDictionary(): DictEntry[] {
   return TAIWAN_MEETING_DICTIONARY_SEEDS.map((seed, index) => ({
     id: `tw_builtin_${String(index + 1).padStart(3, '0')}`,
-    term: seed.term,
+    term: seed.term.trim(),
     category: seed.category,
     scope: 'public',
-    aliases: seed.aliases ? [...seed.aliases] : [],
+    aliases: seed.aliases ? seed.aliases.map((a) => a.trim()).filter(Boolean) : [],
   }));
 }
+
+export const DEFAULT_PUBLIC_DICTIONARY: DictEntry[] =
+  getBuiltinTaiwanMeetingDictionary();
+export const TAIWAN_MEETING_DEFAULT_DICTIONARY: DictEntry[] =
+  DEFAULT_PUBLIC_DICTIONARY;

@@ -3,15 +3,195 @@ import { DictCategory, DictEntry, DictScope } from '../types';
 import { getBuiltinTaiwanMeetingDictionary } from '../data/taiwanMeetingDictionary';
 
 /**
- * 預設公共詞庫：直接載入獨立維護之《台灣商業、政府與學術會議內建大詞典》
+ * 預設公共詞庫：直接載入獨立維護之《台灣商業、政府與地方創生會議內建核心詞典》
  */
 export const DEFAULT_PUBLIC_DICTIONARY: DictEntry[] =
   getBuiltinTaiwanMeetingDictionary();
+
+/**
+ * 預設支援快速掛載之《HybTransPlus 地方創生字典》Google Sheet ID 與完整網址
+ */
+export const DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID =
+  '1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E';
+export const DEFAULT_REGIONAL_REVITALIZATION_SHEET_URL =
+  'https://docs.google.com/spreadsheets/d/1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E/edit?gid=0#gid=0';
 
 function safeTrim(val: unknown): string {
   if (typeof val === 'string') return val.trim();
   if (val === null || val === undefined) return '';
   return String(val).trim();
+}
+
+/**
+ * 解析網址列查詢參數 `?dict=...`（同時支援標準 Search Query `?dict=1ra9-...` 與 Hash Routing `#/?dict=1ra9-...`）
+ */
+export function getUrlQueryDictParam(): {
+  dictParam: string;
+  gidParam: string | null;
+} | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const searchParams = new URLSearchParams(window.location.search);
+    let rawDict = safeTrim(
+      searchParams.get('dict') ||
+        searchParams.get('sheet') ||
+        searchParams.get('dictionary')
+    );
+    let rawGid = safeTrim(searchParams.get('gid'));
+
+    if (!rawDict && window.location.hash.includes('?')) {
+      const hashQuery = window.location.hash.slice(
+        window.location.hash.indexOf('?')
+      );
+      const hashParams = new URLSearchParams(hashQuery);
+      rawDict = safeTrim(
+        hashParams.get('dict') ||
+          hashParams.get('sheet') ||
+          hashParams.get('dictionary')
+      );
+      if (!rawGid) {
+        rawGid = safeTrim(hashParams.get('gid'));
+      }
+    }
+
+    if (!rawDict) return null;
+    if (rawDict.toLowerCase() === 'default' || rawDict.toLowerCase() === 'ndc') {
+      rawDict = DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID;
+    }
+
+    return {
+      dictParam: rawDict,
+      gidParam: rawGid || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 將使用者傳入之「純 Google Sheet ID (如 `1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E`)」、
+ * 「完整 Google Sheet 網址」或「遠端 CSV/JSON 網址」解析為標準端點資訊
+ */
+export function resolveGoogleSheetEndpoint(
+  inputUrlOrId: string,
+  explicitGid?: string | null
+): {
+  sheetId: string | null;
+  gid: string;
+  primaryCsvUrl: string;
+  fallbackGvizCsvUrl: string | null;
+  canonicalViewUrl: string;
+  shareParamValue: string;
+} {
+  const trimmed = safeTrim(inputUrlOrId);
+  if (!trimmed) {
+    return {
+      sheetId: null,
+      gid: '0',
+      primaryCsvUrl: '',
+      fallbackGvizCsvUrl: null,
+      canonicalViewUrl: '',
+      shareParamValue: '',
+    };
+  }
+
+  // 情況 1：完整 Google Sheets URL (https://docs.google.com/spreadsheets/d/<ID>/...)
+  const urlMatch = trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+  if (urlMatch && urlMatch[1]) {
+    const sheetId = urlMatch[1];
+    const gidMatch = trimmed.match(/[#&?]gid=([0-9]+)/);
+    const gid = safeTrim(explicitGid) || (gidMatch && gidMatch[1]) || '0';
+    return {
+      sheetId,
+      gid,
+      primaryCsvUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${gid}`,
+      fallbackGvizCsvUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&gid=${gid}`,
+      canonicalViewUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit?gid=${gid}#gid=${gid}`,
+      shareParamValue: gid !== '0' ? `${sheetId}:${gid}` : sheetId,
+    };
+  }
+
+  // 情況 2：純 Google Sheet ID 或 SheetID:gid (如 `1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E` 或 `1ra9-...:0`)
+  const bareIdMatch = trimmed.match(/^([a-zA-Z0-9-_]{20,80})(?:[:#&?]gid=([0-9]+)|:([0-9]+))?$/);
+  if (bareIdMatch && bareIdMatch[1] && !trimmed.includes('/') && !trimmed.includes('.')) {
+    const sheetId = bareIdMatch[1];
+    const gid =
+      safeTrim(explicitGid) || bareIdMatch[2] || bareIdMatch[3] || '0';
+    return {
+      sheetId,
+      gid,
+      primaryCsvUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/export?format=csv&gid=${gid}`,
+      fallbackGvizCsvUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&gid=${gid}`,
+      canonicalViewUrl: `https://docs.google.com/spreadsheets/d/${sheetId}/edit?gid=${gid}#gid=${gid}`,
+      shareParamValue: gid !== '0' ? `${sheetId}:${gid}` : sheetId,
+    };
+  }
+
+  // 情況 3：一般外部 CSV / JSON 直連網址
+  return {
+    sheetId: null,
+    gid: '0',
+    primaryCsvUrl: trimmed,
+    fallbackGvizCsvUrl: null,
+    canonicalViewUrl: trimmed,
+    shareParamValue: trimmed,
+  };
+}
+
+/**
+ * 產生包含 `?dict=<GoogleSheetID>` 的可分享完整網址（例如 `http://xxx.xxx.xxx/HybTransPlus?dict=1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E`）
+ */
+export function buildShareableDictUrl(inputUrlOrId?: string | null): string {
+  const target = safeTrim(inputUrlOrId) || DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID;
+  const resolved = resolveGoogleSheetEndpoint(target);
+  if (typeof window === 'undefined') {
+    return `?dict=${encodeURIComponent(resolved.shareParamValue)}`;
+  }
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set('dict', resolved.sheetId || resolved.shareParamValue);
+    if (resolved.sheetId && resolved.gid && resolved.gid !== '0') {
+      url.searchParams.set('gid', resolved.gid);
+    } else {
+      url.searchParams.delete('gid');
+    }
+    return url.toString();
+  } catch {
+    return `${window.location.origin}${window.location.pathname}?dict=${encodeURIComponent(
+      resolved.shareParamValue
+    )}`;
+  }
+}
+
+/**
+ * RFC-4180 相容之單行 CSV/TSV 解析器（正確處理雙引號包覆之逗號與分號欄位）
+ */
+function parseCsvRowRespectingQuotes(line: string): string[] {
+  if (line.includes('\t') && !line.includes(',')) {
+    return line.split('\t').map((c) => safeTrim(c.replace(/^["']|["']$/g, '')));
+  }
+  const cells: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === ',' && !inQuotes) {
+      cells.push(safeTrim(current));
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  cells.push(safeTrim(current));
+  return cells.map((c) => safeTrim(c.replace(/^["']|["']$/g, '')));
 }
 
 /**
@@ -93,7 +273,8 @@ export function exportDictionaryToJson(
 }
 
 /**
- * 解析使用者上傳或遠端載入之 JSON / CSV / TXT 詞庫文字（具備完整空值防呆）
+ * 解析使用者上傳或遠端 Google Sheet 載入之 JSON / CSV / TSV / TXT 詞庫文字（具備完整空值防呆與 Google Sheet 欄位結構支援）
+ * 支援試算表欄位：A欄=term(正詞), B欄=aliases(以 ; / | / 、 / , 分隔之別名), C欄=category(person/project/jargon), D欄=notes, E欄=source
  */
 export function parseImportedDictionaryText(
   rawContent: unknown,
@@ -121,7 +302,7 @@ export function parseImportedDictionaryText(
           ? r.aliases.map((a) => safeTrim(a)).filter((a) => a && a !== term)
           : typeof r.aliases === 'string'
           ? r.aliases
-              .split(/[|｜/、,，]/)
+              .split(/[|｜/、;；,，]/)
               .map((a) => safeTrim(a))
               .filter((a) => a && a !== term)
           : [];
@@ -152,45 +333,50 @@ export function parseImportedDictionaryText(
         : [parsed];
       return parseImportedDictionaryText(arr, defaultScope);
     } catch {
-      // fallback to line-by-line parsing
+      // fallback to line-by-line CSV parsing
     }
   }
 
-  // 2. 支援 CSV / 純文字格式：每行「正詞,別名1|別名2,分類」
+  // 2. 支援 Google Sheet CSV / TSV / 純文字格式：每行「term,aliases,category,notes,source」
   const lines = trimmed.split(/\r?\n/);
   const entries: DictEntry[] = [];
   lines.forEach((line, idx) => {
     const clean = safeTrim(line);
     if (!clean || clean.startsWith('#')) return;
-    const parts = clean
-      .split(/[,，\t]/)
-      .map((p) => safeTrim(p.replace(/^["']|["']$/g, '')));
-    const term = parts[0];
+    const parts = parseCsvRowRespectingQuotes(clean);
+    const term = safeTrim(parts[0]);
     if (!term) return;
-    // 略過常見 CSV 標題列
+
+    // 略過常見 CSV 標題列 (如 term, 正詞, 詞彙)
     if (
       idx === 0 &&
-      /^(term|正詞|詞彙|專有名詞|名稱|關鍵字|標準詞)$/i.test(term)
+      /^(term|正詞|正確詞彙|詞彙|專有名詞|名稱|關鍵字|標準詞)$/i.test(term)
     ) {
       return;
     }
 
     const aliases = parts[1]
       ? parts[1]
-          .split(/[|｜/、;；]/)
+          .split(/[|｜/、;；,，]/)
           .map((a) => safeTrim(a))
           .filter((a) => a && a !== term)
       : [];
     const catRaw = safeTrim(parts[2]).toLowerCase();
     const category: DictCategory =
-      catRaw === 'person' || catRaw.includes('人') || catRaw.includes('機關')
+      catRaw === 'person' ||
+      catRaw.includes('人') ||
+      catRaw.includes('機關') ||
+      catRaw.includes('組織')
         ? 'person'
-        : catRaw === 'project' || catRaw.includes('案') || catRaw.includes('計畫')
+        : catRaw === 'project' ||
+          catRaw.includes('案') ||
+          catRaw.includes('計畫') ||
+          catRaw.includes('政策')
         ? 'project'
         : 'jargon';
 
     entries.push({
-      id: `txt_${Date.now()}_${idx}`,
+      id: `gsheet_${Date.now()}_${idx}`,
       term,
       category,
       scope: defaultScope,
@@ -261,51 +447,62 @@ export function exportDictionaryToJsonFile(
 export const exportDictionaryAsJson = exportDictionaryToJsonFile;
 
 /**
- * 從公開的 Google Sheet 網址或遠端 CSV/JSON 端點同步詞庫（具備完整空值防呆）
+ * 從公開的 Google Sheet 網址、純 Sheet ID (如 `?dict=1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E`) 或遠端 CSV/JSON 端點同步詞庫
+ * 具備雙端點自動備援 (`/export?format=csv` 與 `/gviz/tq?tqx=out:csv`)！
  */
 export async function syncDictionaryFromGoogleSheet(
-  sheetUrl?: string | null,
-  targetScope: DictScope = 'public'
+  sheetUrlOrId?: string | null,
+  targetScope: DictScope = 'public',
+  explicitGid?: string | null
 ): Promise<DictEntry[]> {
-  const trimmedUrl = safeTrim(sheetUrl);
-  // 若使用者未輸入網址或傳入 undefined，直接回傳內建台灣會議大詞典而不崩潰
-  if (!trimmedUrl) {
+  const trimmedInput = safeTrim(sheetUrlOrId);
+  if (!trimmedInput) {
     return getBuiltinTaiwanMeetingDictionary().map((item) => ({
       ...item,
       scope: targetScope,
     }));
   }
 
-  let fetchUrl = trimmedUrl;
-  const sheetIdMatch = trimmedUrl.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
-  if (sheetIdMatch && sheetIdMatch[1]) {
-    const spreadsheetId = sheetIdMatch[1];
-    const gidMatch = trimmedUrl.match(/[#&?]gid=([0-9]+)/);
-    const gidParam = gidMatch && gidMatch[1] ? `&gid=${gidMatch[1]}` : '';
-    fetchUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv${gidParam}`;
+  const endpoint = resolveGoogleSheetEndpoint(trimmedInput, explicitGid);
+  const candidateUrls = [
+    endpoint.primaryCsvUrl,
+    endpoint.fallbackGvizCsvUrl,
+  ].filter((u): u is string => Boolean(u));
+
+  let lastError: Error | null = null;
+  for (const fetchUrl of candidateUrls) {
+    try {
+      const response = await fetch(fetchUrl, { cache: 'no-cache' });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const rawText = await response.text();
+      if (rawText.trim().startsWith('<!DOCTYPE html') || rawText.includes('<html')) {
+        throw new Error('回傳內容為登入頁面，請確認試算表已設為「知道連結的任何人皆可檢視」');
+      }
+      const parsed = parseImportedDictionaryText(rawText, targetScope);
+      if (parsed.length > 0) {
+        return parsed;
+      }
+    } catch (err) {
+      lastError = err as Error;
+    }
   }
 
-  const response = await fetch(fetchUrl, { cache: 'no-cache' });
-  if (!response.ok) {
-    throw new Error(
-      `無法讀取遠端詞庫 (${response.status})，請確認連結有效且已開啟公開檢視權限`
-    );
-  }
-
-  const rawText = await response.text();
-  const parsed = parseImportedDictionaryText(rawText, targetScope);
-  return parsed.length > 0 ? parsed : getBuiltinTaiwanMeetingDictionary();
+  throw new Error(
+    `無法讀取遠端詞庫 (${lastError?.message || '連線失敗'})，請確認 Google Sheet ID 或連結有效且已開啟公開檢視權限`
+  );
 }
 
 /**
- * 載入或更新公共詞庫（相容無參數呼叫、遠端 URL 或本地預設台灣會議大詞典）
+ * 載入或更新公共詞庫（相容無參數呼叫、遠端 URL、網址 `?dict=` 參數或本地預設台灣會議大詞典）
  */
 export async function fetchRemotePublicDictionary(
-  remoteUrl?: string | null,
+  remoteUrlOrId?: string | null,
   targetScope: DictScope = 'public'
 ): Promise<DictEntry[]> {
-  const cleanUrl = safeTrim(remoteUrl);
-  if (!cleanUrl) {
+  const cleanInput = safeTrim(remoteUrlOrId);
+  if (!cleanInput) {
     return getBuiltinTaiwanMeetingDictionary().map((item) => ({
       ...item,
       scope: targetScope,
@@ -313,7 +510,7 @@ export async function fetchRemotePublicDictionary(
   }
 
   try {
-    return await syncDictionaryFromGoogleSheet(cleanUrl, targetScope);
+    return await syncDictionaryFromGoogleSheet(cleanInput, targetScope);
   } catch (err) {
     console.warn(
       '⚠️ [Dictionary] 遠端詞庫讀取失敗，自動採用內建台灣會議大詞典:',
@@ -324,4 +521,26 @@ export async function fetchRemotePublicDictionary(
       scope: targetScope,
     }));
   }
+}
+
+export function exportProjectStateToJson(
+  segments: unknown,
+  speakers: unknown
+): void {
+  const payload = JSON.stringify(
+    {
+      exportedAt: new Date().toISOString(),
+      speakers,
+      segments,
+    },
+    null,
+    2
+  );
+  const blob = new Blob([payload], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `會議專案備份_${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
 }

@@ -1,12 +1,15 @@
 // src/types/index.ts
-// [SSOT] 專案唯一型別定義來源（含 Deep Research 多階段 AI 語意推敲、免索引槽位協定、不可變 Token 圖譜與次世代字級 Viterbi / Powerset EEND 耦合型別）
+// [SSOT] 專案唯一型別定義來源（含 Deep Research 多階段 AI 語意推敲、方向一 3~5秒深度全文聲學預分析與底層聲學公式動態校準層、方向二 先句後詞兩階段語意修復、免索引槽位協定、不可變 Token 圖譜與次世代字級 Viterbi / Powerset EEND 耦合型別）
 
 export type EngineMode = 'local_webgpu' | 'byok_cloud';
 
 export type LocalAsrModel =
   | 'SenseVoice-Small'
   | 'Whisper-Large-v3-Turbo'
-  | 'Breeze-ASR';
+  | 'Breeze-ASR'
+  | 'whisper-large-v3-turbo'
+  | 'whisper-base'
+  | 'breeze-asr-25';
 
 export type LocalLlmModel =
   | 'Qwen2.5-3B-Instruct-q4f16_1-MLC'
@@ -20,19 +23,38 @@ export type DiarizationEngineMode =
   | 'mode_b_advanced_dsp'
   | 'mode_c_onnx_neural';
 
+export type DiarizationStrategyMode =
+  | 'MODE_0_GOLDEN_TWO_STAGE'
+  | 'MODE_A_CLASSIC_DSP'
+  | 'MODE_B_ADVANCED_SPECTRAL'
+  | 'MODE_C_ONNX_NEURAL'
+  | DiarizationEngineMode;
+
+export type DiarizationStrategy = DiarizationStrategyMode;
+
 export type DiarizationClusterMethod =
   | 'ahc_cosine'
   | 'spectral_cosine'
   | 'vbx_plda'
   | 'e2cp_constrained_spectral';
 
+export type ClusterMethod = DiarizationClusterMethod;
+export type ClusteringMethod = DiarizationClusterMethod;
+
 export type DiarizationExecutionBackend = 'wasm' | 'webgpu';
+export type EmbeddingBackendType = DiarizationExecutionBackend;
+export type EmbeddingBackend = DiarizationExecutionBackend;
 
 export type CompliantOnnxSpeakerModel =
   | 'wespeaker_voxceleb_resnet34_int8.onnx'
-  | 'nemo_en_titanet_small.int8.onnx';
+  | 'nemo_en_titanet_small.int8.onnx'
+  | 'wespeaker_en_voxceleb_cam++.onnx'
+  | 'wespeaker-voxceleb-resnet34-LM.onnx';
+
+export type EmbeddingModelType = CompliantOnnxSpeakerModel;
 
 export type MeetingLanguageHint = 'auto_multilingual' | 'zh' | 'en' | 'ja';
+export type AcousticLanguageProfile = MeetingLanguageHint;
 
 /**
  * 三級聲學信心度閘控等級 (3-Tier Acoustic Confidence Gating Protocol)
@@ -45,11 +67,53 @@ export type AcousticSlotTier =
   | 'tier2_candidate_constrained'
   | 'tier3_overlap_split';
 
+/**
+ * 【方向一深化擴充】：啟動階段 3~5 秒全文聲學預分析下放至「底層聲學公式動態校準層 (Acoustic Formula Calibration Layer)」
+ * 根據單一音檔之真實物理分佈（底噪分位數、有聲母音 P15 諧波清晰度、話輪轉換頻率、基頻跨度）動態校準底層公式閥值，
+ * 解決單一全局預設常數無法同時應對「高頻搶話短句」與「遠距微弱尾音」之痛點。
+ */
+export interface AcousticFormulaCalibration {
+  /** VAD 底噪估計分位數 (預設 0.05，範圍 0.03 ~ 0.08；依全場靜音比例動態校準) */
+  vadNoiseQuantile: number;
+  /** VAD 語音啟動乘數 (預設 1.65，範圍 1.50 ~ 1.95；依全場 SNR 動態校準) */
+  vadSpeechMultiplier: number;
+  /** VAD 動態範圍補償權重 (預設 0.06，範圍 0.04 ~ 0.09) */
+  vadDynamicRangeWeight: number;
+  /** 自相關基頻與有聲母音認定門檻 (預設 0.36，範圍 0.32 ~ 0.45；由全場有聲幀 P15 諧波度自動校準，保護遠距小聲語者如女聲2不被誤判為 0Hz) */
+  harmonicityGateThreshold: number;
+  /** 翻紙與桌面摩擦雜音抑制上限 (預設 0.30，範圍 0.26 ~ 0.38；低於此值之非諧波寬頻噪音壓低 VAD) */
+  frictionHarmonicCeiling: number;
+  /** 邊界曲線之 150ms 音節包絡能量谷底權重 w_dip (預設 0.45，範圍 0.38 ~ 0.52) */
+  boundaryDipWeight: number;
+  /** 邊界曲線之聲紋/基頻/響度跳變複合權重 w_voice (預設 0.55，範圍 0.48 ~ 0.62) */
+  boundaryVoiceWeight: number;
+  /** 左右視窗分貝階躍起算門檻 dB (預設 3.2 dB，捕捉遠距小聲語者切換至近距大聲語者之零停頓換人點) */
+  stepDbDiffFloor: number;
+  /** 有聲母音 F1-F3 共振峰餘弦距離起算門檻 (預設 0.21，排除無聲子音摩擦干擾) */
+  formantCosDistFloor: number;
+  /** Stage 2 微觀話輪邊界波峰切分門檻 finePeakCutoff (預設 0.52，範圍 0.46 ~ 0.58) */
+  scdPeakCutoff: number;
+  /** Stage 2 連續無停頓發聲之微觀切分上限秒數 (預設 1.60s，範圍 1.35s ~ 1.95s；依每分鐘換人頻率自適應) */
+  maxMicroTurnSec: number;
+  /** Stage 1 超球面 AHC 聚類停止合併門檻 (256維 ONNX 預設 0.28，範圍 0.24 ~ 0.33) */
+  ahcStopSimThreshold: number;
+  /** 軟性基頻差異免罰容忍半音數 (預設 3.8 半音，範圍 3.2 ~ 4.4 半音；依全場音域跨度校準) */
+  pitchPenaltySemitoneTolerance: number;
+  /** 核心成員閘控 VBx 變分精煉之逆溫度係數 (預設 22.0，防止少數語者質心被主講人稀釋) */
+  vbxInvTemp: number;
+  /** VBx 質心更新之核心成員責任門檻 (預設 0.45，僅允許責任 >= 0.45 之核心錨點參與該語者質心計算) */
+  vbxCoreResponsibilityGate: number;
+}
+
 export interface DiarizationConfig {
   engineMode: DiarizationEngineMode;
+  strategyMode?: DiarizationStrategyMode;
   clusterMethod: DiarizationClusterMethod;
+  clusteringMethod?: DiarizationClusterMethod;
   executionBackend: DiarizationExecutionBackend;
+  backend?: DiarizationExecutionBackend;
   onnxModelFilename: CompliantOnnxSpeakerModel;
+  embeddingModel?: CompliantOnnxSpeakerModel;
   localWasmBasePath: string;
   localModelBasePath: string;
   yieldEveryNUnits: number;
@@ -71,7 +135,7 @@ export interface DiarizationConfig {
   enableVirtualSpeakerTrackStitching?: boolean;
   /** 啟用重疊幀排除聲紋純化 (embeddingExcludeOverlap: true，剔除 Powerset 類別 4,5,6 重疊幀) */
   embeddingExcludeOverlap?: boolean;
-  /** 啟用 Silero VAD 閘控之零相位前瞻包絡響度正規化 (預設 true) */
+  /** 啟用 Silero VAD 閘控之零相位前瞻包絡響度正規化 (預設 true，僅作用於 Whisper ASR 音軌) */
   enableZeroPhaseLoudnessNorm?: boolean;
   /** Silero VAD 本地模型檔名 (預設 'silero_vad_v5.onnx'，未安裝時自動降級自適應能量 VAD) */
   sileroVadModelFilename?: string;
@@ -83,6 +147,130 @@ export interface DiarizationConfig {
   vbxFa?: number;
   /** VBx 語者先驗正規化因子 Fb (選填) */
   vbxFb?: number;
+  /** 【方向一深化】：由啟動階段 3~5 秒全文聲學預分析自動推導並注入之底層聲學公式動態閥值 */
+  formulaCalibration?: AcousticFormulaCalibration;
+}
+
+/**
+ * 【方向一】：全文深度聲學預分析之情境推薦方案項目
+ * 雙向相容別名：AudioRecommendationOption / RecommendedConfigOption
+ */
+export interface AudioRecommendationOption {
+  id: 'preset_a_balanced' | 'preset_b_sensitive' | 'preset_c_long_speech' | string;
+  badge: string;
+  title: string;
+  label?: string;
+  subtitle: string;
+  whyRecommend: string;
+  bestFor: string;
+  notIdealFor: string;
+  isRecommended: boolean;
+  recommendedMinSpeakers: number;
+  recommendedMaxSpeakers: number;
+  diarizationPatch: Partial<DiarizationConfig>;
+  enginePatch?: Partial<EngineConfig>;
+}
+
+export type RecommendedConfigOption = AudioRecommendationOption;
+
+/**
+ * 【方向一】：取檔後 3~5 秒深度多點全文聲學預分析設定檔
+ * 雙向相容別名：AudioPreAnalysisProfile / AudioAcousticPreAnalysis
+ */
+export interface AudioPreAnalysisProfile {
+  /** 信噪比 (dB) */
+  snrDb: number;
+  /** 環境底噪分貝 (dBFS) */
+  noiseFloorDb: number;
+  /** 噪音等級分類 */
+  noiseLevel: 'LOW' | 'MEDIUM' | 'HIGH';
+  /** 全場語音基頻跨度 (Hz, P90 - P10) */
+  f0SpreadHz: number;
+  /** 全場語音基頻半音跨度 (Semitones, 12 * log2(P90 / P10)) */
+  pitchSpreadSemitones: number;
+  /** 基頻 P10 低頻端點 (Hz) */
+  f0P10Hz: number;
+  /** 基頻 P90 高頻端點 (Hz) */
+  f0P90Hz: number;
+  /** 中位諧波清晰度 (0.0 ~ 1.0) */
+  harmonicityMedian: number;
+  /** 與會者聲線相似度評估 */
+  voiceSimilarity: 'HIGH' | 'MEDIUM' | 'LOW';
+  /** 每分鐘話輪轉換率 (次/分) */
+  turnSwitchRatePerMin: number;
+  /** 重疊搶話比例 (0.0 ~ 1.0) */
+  overlapRatio: number;
+  /** 重疊搶話風險等級 */
+  overlapRisk: 'LOW' | 'MEDIUM' | 'HIGH';
+  /** 預估最少語者人數 */
+  estimatedMinSpeakers: number;
+  /** 預估最多語者人數 */
+  estimatedMaxSpeakers: number;
+  /** 實際抽樣掃描之視窗數量 */
+  sampledWindowsCount: number;
+  /** 實際抽樣分析之語音總秒數 */
+  sampledDurationSec: number;
+  /** 抽樣涵蓋率 (0.0 ~ 1.0) */
+  coverageRatio: number;
+  /** 預分析實際耗時 (ms) */
+  analysisDurationMs: number;
+  /** 白話情境診斷摘要 */
+  plainSummary: string;
+  /** 系統推薦之最佳方案 ID */
+  recommendedPresetId: string;
+  /** 3 組白話情境化建議方案 */
+  recommendations: AudioRecommendationOption[];
+  /** 相容別名：指向同一陣列 */
+  recommendedOptions: RecommendedConfigOption[];
+  /** 【方向一深化】：根據本音檔實測分佈自動校準之底層聲學公式動態閥值 */
+  formulaCalibration?: AcousticFormulaCalibration;
+}
+
+export type AudioAcousticPreAnalysis = AudioPreAnalysisProfile;
+
+/**
+ * 【方向二】：句子語意與結構完整性問題類型（同時支援大小寫枚舉值）
+ */
+export type SentenceIntegrityIssueType =
+  | 'TAIL_DROP_TO_NEXT'
+  | 'HEAD_STOLEN_FROM_PREV'
+  | 'INCOMPLETE_SYNTAX'
+  | 'SEMANTIC_ANOMALY'
+  | 'HALLUCINATION_LOOP'
+  | 'NONE'
+  | 'tail_character_drop'
+  | 'head_stolen_from_prev'
+  | 'broken_syntax_split'
+  | 'repetition_noise_hallucination'
+  | 'unreasonable_self_qa'
+  | 'none';
+
+/**
+ * 【方向二】：單一段落之句子語意與結構完整性診斷紀錄
+ */
+export interface SentenceIntegrityDiagnostic {
+  segmentId: string;
+  /** 句子結構完整度分數 (0 ~ 100) */
+  score: number;
+  issues: SentenceIntegrityIssueType[];
+  /** 是否已在 Stage 1 自動執行結構修補 */
+  autoRepaired: boolean;
+  suggestedRepair?: string;
+  suggestedRepairHint?: string;
+  relatedSegmentId?: string;
+  diagnosticNote?: string;
+}
+
+/**
+ * 【方向二】：Stage 1 跨句結構修復動作紀錄
+ */
+export interface SentenceIntegrityRepair {
+  segmentId: string;
+  relatedSegmentId?: string;
+  issueType: SentenceIntegrityIssueType;
+  beforeText: string;
+  afterText: string;
+  description: string;
 }
 
 /** 語者分離細部時間軸單元 (含 SCD 跳變值、微觀聲紋邊際、對數勝算邊界與重疊指標) */
@@ -106,6 +294,15 @@ export interface FineDiarizationTurn {
   /** 是否為參與第一輪聚類定錨之黃金長句 (Anchor Segment, 純淨非重疊時長 >= 1.2s ~ 1.5s) */
   isAnchorTurn?: boolean;
 }
+
+export type DiarizationTurn = FineDiarizationTurn;
+
+export interface OptimalAsrWindow {
+  start: number;
+  end: number;
+}
+
+export type AsrMacroWindow = OptimalAsrWindow;
 
 /**
  * 經重疊相加 (OLA) 重建後之全域幀級語者後驗機率矩陣封裝
@@ -167,15 +364,22 @@ export interface SpeakerTrackBatch {
   timeMap: VirtualTrackMapItem[];
 }
 
+export type VirtualSpeakerTrackBatch = SpeakerTrackBatch;
+
 export type ChunkStage =
   | 'idle'
   | 'preprocessing'
   | 'diarizing'
   | 'transcribing'
   | 'correcting'
+  | 'refining'
   | 'relistening'
   | 'completed'
-  | 'error';
+  | 'error'
+  | 'DIARIZING'
+  | 'TRANSCRIBING_ASR'
+  | 'LLM_REFINING'
+  | 'COMPLETED';
 
 export type WordUncertaintyStatus =
   | 'normal'
@@ -197,11 +401,16 @@ export interface ModelDownloadStatus {
 export interface WordSpan {
   id: string;
   text: string;
+  /** 相容別名：與 text 同步 */
+  word?: string;
   originalText?: string;
+  originalWord?: string;
   start: number;
   end: number;
   confidence: number;
   status: WordUncertaintyStatus;
+  isPatched?: boolean;
+  isCorrected?: boolean;
   reason?: string;
   candidates?: string[];
   /** 若該 Token 已被使用者手動點選確認，標記為鎖定以維持冪等性 */
@@ -216,6 +425,8 @@ export interface WordSpan {
   overlapRatio?: number;
 }
 
+export type WordTimestamp = WordSpan;
+
 export interface Segment {
   id: string;
   chunkIndex: number;
@@ -223,7 +434,15 @@ export interface Segment {
   start: number;
   end: number;
   words: WordSpan[];
+  /** 雙向相容同步衍生欄位 */
+  text?: string;
+  rawText?: string;
+  polishedText?: string;
   isCorrected: boolean;
+  isPolished?: boolean;
+  ispolished?: boolean;
+  isLocked?: boolean;
+  matchedTerms?: string[];
   relistenCount?: number;
   /** 聲學餘弦邊際 M(u_m)：>= 0.16 且 >= 1.2s 為 LOCKED 錨點，< 0.16 為 REVIEW 候選 */
   acousticMargin?: number;
@@ -231,10 +450,17 @@ export interface Segment {
   logOddsMargin?: number;
   /** 子句內平均重疊語音比例 \bar{\Omega} \in [0, 1] */
   overlapRatio?: number;
+  overlapWarning?: boolean;
   /** 三級聲學信心度閘控等級，供 ISIAL + LG-TPST LLM 決定是否允許變更語者或拆解重疊句 */
   slotTier?: AcousticSlotTier;
   runnerUpSpeakerId?: string;
+  /** 【方向二】：Stage 1 句子語意與結構完整性診斷 */
+  sentenceIntegrity?: SentenceIntegrityDiagnostic;
+  sentenceIntegrityScore?: number;
+  sentenceIntegrityIssues?: SentenceIntegrityIssueType[];
 }
+
+export type TranscriptSegment = Segment;
 
 /**
  * 【問題一 & 問題二】：ISIAL 圈選出之免索引懷疑區段槽位映射項 (SlotMap Entry)
@@ -260,6 +486,8 @@ export interface SuspectSlotItem {
   candidates: string[];
 }
 
+export type SuspectSlot = SuspectSlotItem;
+
 /**
  * 【問題二 2.3】：XGrammar / Gemini 結構化槽位填空與語用拆句輸出格式
  */
@@ -272,6 +500,8 @@ export interface SlotCorrectionOutputItem {
   uncertain_candidates: string[];
 }
 
+export type LlmSlotCorrection = SlotCorrectionOutputItem;
+
 export interface TurnSplitOutputItem {
   utterance_id: string;
   pragmatic_type:
@@ -283,6 +513,9 @@ export interface TurnSplitOutputItem {
   split_before_anchor: string;
   new_speaker_id: string;
 }
+
+export type LlmTurnSplitSuggestion = TurnSplitOutputItem;
+export type LlmTurnSplitProposal = TurnSplitOutputItem;
 
 export interface ContextualFixOutputItem {
   utterance_id: string;
@@ -304,27 +537,26 @@ export interface StructuredSlotGerResponse {
  * 【問題五 5.1】：不可變 Token 圖譜資料結構定義 (Immutable Token Graph)
  */
 export interface AtomicCharToken {
-  readonly tokenId: string; // 唯一不可變 ID，如 "u102_t04"
-  char: string; // 單一漢字或英文單詞
-  pinyinKey: string; // 台式模糊音韻雜湊碼，如 "dian"
-  startTimeMs: number; // 聲學起始時間戳記
-  endTimeMs: number; // 聲學結束時間戳記
-  acousticConf: number; // Whisper 原始信心度
-  speakerId: string; // 經 LG-TPST 對齊後之語者 ID
+  readonly tokenId: string;
+  char: string;
+  pinyinKey: string;
+  startTimeMs: number;
+  endTimeMs: number;
+  acousticConf: number;
+  speakerId: string;
 }
 
 export interface UncertainCandidateOption {
   readonly optionId: string;
-  text: string; // 候選詞字串，如 "店面翻修"
-  pinyinSequence: string[]; // 候選詞各字模糊音韻碼 ["dian", "mian", "fan", "xiu"]
+  text: string;
+  pinyinSequence: string[];
   source: 'ORIGINAL' | 'LLM_PASS2' | 'BOOTSTRAPPED_HOTWORD' | 'DOMAIN_DICT';
   reason?: string;
 }
 
 export interface SuspectSpanNode {
-  readonly spanId: string; // 對應 "#S1"
+  readonly spanId: string;
   status: 'CLEAN' | 'AUTO_CORRECTED' | 'SEMANTIC_UNCERTAIN' | 'USER_LOCKED';
-  // 直接持有當前涵蓋之 AtomicCharToken 陣列，完全不依賴字元整數索引！
   activeTokens: AtomicCharToken[];
   originalTokens: AtomicCharToken[];
   candidates: UncertainCandidateOption[];
@@ -333,7 +565,6 @@ export interface SuspectSpanNode {
 
 export interface UtteranceNode {
   readonly utteranceId: string;
-  // 句子由一般 AtomicCharToken 與 SuspectSpanNode 交錯組成之有序序列
   segments: Array<AtomicCharToken | SuspectSpanNode>;
 }
 
@@ -354,6 +585,8 @@ export interface CorrectionPatchItem {
   reason: string;
   requireRelisten?: boolean;
 }
+
+export type LlmCorrectionPatch = CorrectionPatchItem;
 
 export interface TriLevelContextPayload {
   lowAttentionGlobalMemory: {
@@ -425,7 +658,15 @@ export interface DictEntry {
   category: DictCategory;
   scope: DictScope;
   aliases?: string[];
+  weight?: number;
+  boostWeight?: number;
+  phonetic?: string;
+  phoneticKey?: string;
+  notes?: string;
+  definition?: string;
 }
+
+export type DictionaryEntry = DictEntry;
 
 export interface MacroChunkState {
   index: number;
@@ -437,6 +678,15 @@ export interface MacroChunkState {
   detailText?: string;
   relistenUsed?: number;
   error?: string;
+}
+
+export interface PipelineProgress {
+  active: boolean;
+  currentChunkIndex: number;
+  totalChunks: number;
+  stage: ChunkStage;
+  overallProgress: number;
+  detailText: string;
 }
 
 export interface EngineConfig {
@@ -457,4 +707,6 @@ export interface EngineConfig {
   maxRelistenQuota: number;
   relistenPaddingSec: number;
   diarizationConfig: DiarizationConfig;
+  /** 相容別名：與 diarizationConfig 同步 */
+  diarization?: DiarizationConfig;
 }

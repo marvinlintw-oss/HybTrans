@@ -78,8 +78,7 @@ const ENGINE_STRATEGY_GUIDES: Record<DiarizationEngineMode, ModeScenarioGuide> =
   };
 
 /**
- * 浮出式說明視窗組件 (Hover / Focus Popover)
- * 平時只顯示輕巧圖示或文字標籤，滑鼠移過去時才浮出詳細說明視窗
+ * 浮出式說明視窗組件 (內建於組件內，零外部路徑依賴，避免 ts(2307) 報錯)
  */
 const HoverInfoPopover: React.FC<{
   label?: string;
@@ -101,7 +100,6 @@ const HoverInfoPopover: React.FC<{
         )}
       </button>
 
-      {/* 浮出式說明卡片 */}
       <div
         className={`absolute ${
           align === 'right' ? 'right-0' : 'left-0'
@@ -129,6 +127,9 @@ export const SpeakerSyncPanel: React.FC = () => {
     phoneticCandidates,
     setPhoneticCandidates,
     applyPhoneticReplacements,
+    audioPreAnalysis,
+    selectedPresetId,
+    applyRecommendedPreset,
   } = useAppStore();
 
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -271,6 +272,42 @@ export const SpeakerSyncPanel: React.FC = () => {
           {speakerList.length} 人
         </span>
       </div>
+
+      {/* 0. 全場深度聲學預分析快捷方案切換 */}
+      {audioPreAnalysis && (
+        <div className="bg-indigo-50/70 rounded-lg p-2.5 border border-indigo-200/80 space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold text-indigo-900 flex items-center gap-1">
+              <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+              全場聲學預分析建議方案
+            </span>
+            <span className="text-[10px] text-indigo-700 font-medium">
+              SNR {audioPreAnalysis.snrDb}dB · {audioPreAnalysis.turnSwitchRatePerMin}次/分
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-1">
+            {audioPreAnalysis.recommendations.map((opt) => {
+              const isSelected = selectedPresetId === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => applyRecommendedPreset(opt)}
+                  className={`text-[10px] px-1.5 py-1 rounded border text-center transition-all cursor-pointer truncate ${
+                    isSelected
+                      ? 'bg-indigo-600 text-white border-indigo-600 font-semibold shadow-2xs'
+                      : 'bg-white text-slate-700 border-indigo-200 hover:bg-indigo-100/60'
+                  }`}
+                  title={`${opt.title}：${opt.whyRecommend}`}
+                >
+                  {opt.isRecommended ? '★ ' : ''}
+                  {opt.badge.split('・')[0]}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* 1. 預估會議人數 */}
       <div className="bg-slate-50 rounded-lg p-2.5 border border-slate-200/80 space-y-2">

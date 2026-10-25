@@ -2,20 +2,21 @@
 import { Segment, PhoneticMatchCandidate } from '../types';
 
 /**
- * 台灣會議常見姓氏、領域詞根與職稱之聲韻母同音群組映射表（無平捲舌/前後鼻音模糊容錯）
+ * 台灣會議常見姓氏、領域詞根、職稱與高頻語素之聲韻母同音群組映射表
+ * （涵蓋無平捲舌 z/zh, c/ch, s/sh、前後鼻音 in/ing, en/eng, an/ang、流音滑音弱化 l/r/n/y 與圓唇鬆化）
  */
 const PHONETIC_GROUPS: Record<string, string> = {
   // 常見姓氏與高頻會議字根同音群組
-  '林臨淋琳霖零玲鈴齡': 'LIN',
+  '林臨淋琳霖零玲鈴齡伶翎': 'LIN',
   '陳塵臣辰晨沉成城誠呈承程懲乘': 'CHEN',
   '張章彰璋髒商傷湯': 'ZHANG',
-  '李里理禮裡鯉履': 'LI',
-  '王亡汪網往枉': 'WANG',
-  '吳吾無蕪梧巫務物誤悟霧勿': 'WU',
+  '李里理禮裡鯉履哩': 'LI',
+  '王亡汪網往枉晚碗挽宛婉琬椀灣彎頑丸完玩': 'WAN',
+  '吳吾無蕪梧巫務物誤悟霧勿屋': 'WU',
   '劉留流琉榴瘤': 'LIU',
   '蔡菜採彩踩財材裁才': 'CAI',
   '楊陽揚洋羊佯樣養仰': 'YANG',
-  '許栩詡徐須需虛噓': 'XU',
+  '許栩詡徐須需虛噓詢尋巡': 'XU',
   '鄭正政證症爭徵真針珍診陣鎮振': 'ZHENG',
   '謝械卸屑蟹寫血協脅鞋': 'XIE',
   '郭鍋國果過裹擴闊': 'GUO',
@@ -26,50 +27,60 @@ const PHONETIC_GROUPS: Record<string, string> = {
   '蘇疏輸書舒樞叔屬署鼠數術述束': 'SU',
   '周洲舟州週驟軸': 'ZHOU',
   '葉頁業夜液腋咽謁': 'YE',
-  // 常見職稱、政府標案與會議高頻同音群組 (含前後鼻音/平捲舌/元音鬆化容錯)
+  // 常見職稱、政府標案與會議高頻同音群組 (含前後鼻音/平捲舌/流音滑音/元音鬆化容錯)
   '處觸畜築儲礎楚出初除廚': 'CHU',
   '長場廠掌漲常償嚐腸': 'ZHANG_TITLE',
-  '委偉尾瑋偽緯位未味衛為圍違唯維': 'WEI',
+  '委偉尾瑋偽緯位未味衛為圍違唯維微危薇': 'WEI',
   '員元園原源圓援緣沿延研言嚴岩': 'YUAN',
+  '於余妤魚漁娛逾愚榆瑜渝雲云勻芸': 'YU',
   '科顆棵磕苛課客克刻': 'KE',
-  '主組祖阻煮囑助住注駐祝著': 'ZHU',
+  '主組祖阻詛煮囑助住注駐祝著': 'ZHU',
   '任認韌刃妊人仁忍': 'REN',
   '秘密蜜覓冪密': 'MI',
+  '神什沈審嬸慎滲深身申伸升生聲勝聖盛': 'SHEN',
+  '如儒茹汝乳入辱盧蘆爐': 'RU',
   '總種腫塚中忠終鐘衷眾重': 'ZONG',
-  '經精晶京驚鯨金今津斤禁近進盡勁': 'JING',
-  '博薄搏駁伯帛泊': 'BO',
+  '工功攻公宮弓恭供躬共貢': 'GONG',
+  '項向象像相巷享響想箱廂鄉香': 'XIANG',
+  '馬碼瑪螞麻嘛罵媽抹': 'MA',
+  '經精晶京驚鯨金今津斤禁近進盡勁景警井': 'JING',
+  '俊駿峻浚郡菌軍均君鈞': 'JUN',
+  '穎影營迎贏盈瑩螢沂儀宜疑移姨遺頤': 'YING_YI',
+  '博薄搏駁伯帛泊白百擺柏拍排牌': 'BO',
+  '姐姊解節結潔借界戒介屆街皆接': 'JIE',
   '士事式市試視室是師詩失施獅濕十石時實食識史使始示世勢適釋': 'SHI',
-  '教較校酵覺交郊嬌澆焦礁角腳剿叫轎': 'JIAO',
+  '教較校酵覺交郊嬌澆焦礁角腳剿叫轎笑效肖孝': 'JIAO',
   '授受售瘦獸收手守首壽': 'SHOU',
-  '店電墊殿奠佃甸': 'DIAN',
+  '店電墊殿奠佃甸點典': 'DIAN',
   '面麵棉眠免勉緬': 'MIAN',
   '翻番凡煩繁樊販範犯飯泛': 'FAN',
   '修羞休朽秀袖繡鏽': 'XIU',
   '開揩慨楷凱': 'KAI',
-  '新心辛欣薪馨星興腥': 'XIN',
+  '新心辛欣薪馨星興腥芯': 'XIN',
   '標彪飆錶表裱': 'BIAO',
   '不布步部怖捕補普譜': 'BU',
   '要耀曜藥鑰搖遙謠姚咬': 'YAO',
   '廊狼郎良涼糧梁量藍蘭籃欄': 'LANG',
-  '帶代袋貸待怠殆大太態泰': 'DAI',
-  '件見建健鍵漸踐劍薦鑑間肩堅監兼': 'JIAN',
+  '帶代袋貸待怠殆大太態泰台臺抬苔': 'DAI',
+  '件見建健鍵漸踐劍薦鑑間肩堅監兼簡檢減撿': 'JIAN',
   '群裙尋巡詢循': 'QUN',
   '輔腐府俯釜付負附赴副富復腹覆': 'FU',
   '導島倒禱蹈到道稻盜': 'DAO',
   '央泱秧英應鷹迎營贏盈': 'YANG_YING',
   '切且竊妾企契氣棄汽器': 'QIE',
-  '小曉筱少稍梢': 'XIAO',
+  '小曉筱少稍梢紹哨笑校效': 'XIAO',
   '企起豈啟氣器棄契': 'QI',
   '支之知肢織汁資姿滋諮只指止址紙至志制致置質治炙': 'ZHI',
   '晰析息悉惜昔夕希稀犧吸西膝': 'XI',
   '就舊救舅咎久九酒究糾': 'JIU',
   '加家佳嘉夾挾袈': 'JIA',
   '盟萌蒙濛盲忙茫氓': 'MENG',
-  '議意義藝亦異役疫譯翼億憶益誼一衣醫依壹架價假嫁稼駕': 'YI',
+  '議意義藝亦異役疫譯翼億憶益誼一衣醫依壹架價假嫁稼駕寄記計既際季紀': 'YI',
   '評平瓶憑萍屏貧頻品聘': 'PING',
   '選癬險顯憲縣現限線獻': 'XUAN',
   '核合何河荷盒和禾吉及級即極急集籍': 'HE',
   '銷消宵霄削囂小曉': 'XIAO_2',
+  '給北被備背倍輩貝': 'GEI_BEI',
 };
 
 const charToPhoneticCode = new Map<string, string>();
@@ -83,7 +94,7 @@ Object.entries(PHONETIC_GROUPS).forEach(([chars, code]) => {
 
 /**
  * 細粒度音韻四元組結構 (聲母 Initial, 介音 Medial, 韻腹與韻尾 Nucleus/Coda)
- * 用於問題二 2.1 之動態規劃加權音韻編輯距離與跨音節連音縮讀 (Syllable Contraction)
+ * 用於動態規劃加權音韻編輯距離與跨音節連音縮讀 (Syllable Contraction)
  */
 interface SyllablePhonemeTuple {
   rawCode: string;
@@ -102,7 +113,7 @@ const CODE_TO_TUPLE_MAP: Record<
   ZHANG: { initial: 'z', medial: '', rime: 'an', fuzzyHash: 'zan' },
   ZHANG_TITLE: { initial: 'z', medial: '', rime: 'an', fuzzyHash: 'zan' },
   LI: { initial: 'l', medial: 'i', rime: 'i', fuzzyHash: 'li' },
-  WANG: { initial: 'w', medial: 'u', rime: 'an', fuzzyHash: 'wan' },
+  WAN: { initial: 'w', medial: 'u', rime: 'an', fuzzyHash: 'wan' },
   WU: { initial: 'w', medial: 'u', rime: 'u', fuzzyHash: 'wu' },
   LIU: { initial: 'l', medial: 'i', rime: 'ou', fuzzyHash: 'liou' },
   CAI: { initial: 'c', medial: '', rime: 'ai', fuzzyHash: 'cai' },
@@ -122,13 +133,22 @@ const CODE_TO_TUPLE_MAP: Record<
   CHU: { initial: 'c', medial: 'u', rime: 'u', fuzzyHash: 'cu' },
   WEI: { initial: 'w', medial: 'u', rime: 'ei', fuzzyHash: 'wei' },
   YUAN: { initial: 'y', medial: 'u', rime: 'an', fuzzyHash: 'yuan' },
+  YU: { initial: 'y', medial: 'u', rime: 'u', fuzzyHash: 'yu' },
   KE: { initial: 'k', medial: '', rime: 'e', fuzzyHash: 'ke' },
   ZHU: { initial: 'z', medial: 'u', rime: 'u', fuzzyHash: 'zu' },
   REN: { initial: 'l', medial: '', rime: 'en', fuzzyHash: 'len' },
   MI: { initial: 'm', medial: 'i', rime: 'i', fuzzyHash: 'mi' },
+  SHEN: { initial: 's', medial: '', rime: 'en', fuzzyHash: 'sen' },
+  RU: { initial: 'l', medial: 'u', rime: 'u', fuzzyHash: 'lu' },
   ZONG: { initial: 'z', medial: 'u', rime: 'on', fuzzyHash: 'zon' },
+  GONG: { initial: 'g', medial: 'u', rime: 'on', fuzzyHash: 'gon' },
+  XIANG: { initial: 'x', medial: 'i', rime: 'an', fuzzyHash: 'xian' },
+  MA: { initial: 'm', medial: '', rime: 'a', fuzzyHash: 'ma' },
   JING: { initial: 'j', medial: 'i', rime: 'in', fuzzyHash: 'jin' },
+  JUN: { initial: 'j', medial: 'u', rime: 'un', fuzzyHash: 'jun' },
+  YING_YI: { initial: 'y', medial: 'i', rime: 'i', fuzzyHash: 'yi' },
   BO: { initial: 'b', medial: '', rime: 'o', fuzzyHash: 'bo' },
+  JIE: { initial: 'j', medial: 'i', rime: 'ie', fuzzyHash: 'jie' },
   SHI: { initial: 's', medial: '', rime: 'i', fuzzyHash: 'si' },
   JIAO: { initial: 'j', medial: 'i', rime: 'ao', fuzzyHash: 'jiao' },
   SHOU: { initial: 's', medial: '', rime: 'ou', fuzzyHash: 'sou' },
@@ -160,6 +180,7 @@ const CODE_TO_TUPLE_MAP: Record<
   PING: { initial: 'p', medial: 'i', rime: 'in', fuzzyHash: 'pin' },
   XUAN: { initial: 'x', medial: 'u', rime: 'an', fuzzyHash: 'xuan' },
   HE: { initial: 'h', medial: '', rime: 'e', fuzzyHash: 'he' },
+  GEI_BEI: { initial: 'g', medial: '', rime: 'ei', fuzzyHash: 'gei' },
 };
 
 function charToSyllableTuple(ch: string): SyllablePhonemeTuple {
@@ -190,15 +211,18 @@ export function toPhoneticSignature(text: string): string {
 }
 
 /**
- * 【問題二 2.1】：取得台式華語模糊音韻序列 (供 UncertainCandidateOption.pinyinSequence 與雙向重疊消融使用)
+ * 取得台式華語模糊音韻序列 (供 UncertainCandidateOption.pinyinSequence 與雙向重疊消融使用)
  */
 export function toTaiwanFuzzyPhoneticSyllables(text: string): string[] {
   return Array.from(text).map((ch) => charToSyllableTuple(ch).fuzzyHash);
 }
 
 /**
- * 計算兩個單音節之台式腔調替換成本 c_sub(s_i, t_j) \in [0, 1]
- * 支援：平翹舌零成本、前後鼻音零成本、高元音鬆化 (si <-> su, 如「商業室」與「商業署」) 低成本 0.14
+ * 計算兩個單音節之台式腔調與快速連讀替換成本 c_sub(s_i, t_j) \in [0, 1]
+ * 支援：
+ * 1. 平翹舌零成本、前後鼻音零成本
+ * 2. 高元音鬆化 (si <-> su, 如「商業室」與「商業署」) 低成本 0.14
+ * 3. 快速語流之舌尖流音與圓唇滑音同化 (如「禮 li <-> 如 lu/ru」、「物 wu <-> 果 guo」、「委 wei <-> 晚 wan」、「員 yuan <-> 於 yu」)
  */
 function computeSyllableSubCost(
   a: SyllablePhonemeTuple,
@@ -214,9 +238,22 @@ function computeSyllableSubCost(
   }
   if (
     (a.fuzzyHash === 'zu' && b.fuzzyHash === 'li') ||
-    (a.fuzzyHash === 'li' && b.fuzzyHash === 'zu')
+    (a.fuzzyHash === 'li' && b.fuzzyHash === 'zu') ||
+    (a.fuzzyHash === 'lu' && b.fuzzyHash === 'li') ||
+    (a.fuzzyHash === 'li' && b.fuzzyHash === 'lu')
   ) {
-    return 0.25;
+    return 0.18;
+  }
+  // 快速語流圓唇滑音與軟顎塞音弱化 (如「物 wu <-> 果 guo」、「委 wei <-> 晚 wan」、「員 yuan <-> 於 yu」)
+  if (
+    (a.fuzzyHash === 'wu' && b.fuzzyHash === 'guo') ||
+    (a.fuzzyHash === 'guo' && b.fuzzyHash === 'wu') ||
+    (a.fuzzyHash === 'wei' && b.fuzzyHash === 'wan') ||
+    (a.fuzzyHash === 'wan' && b.fuzzyHash === 'wei') ||
+    (a.fuzzyHash === 'yuan' && b.fuzzyHash === 'yu') ||
+    (a.fuzzyHash === 'yu' && b.fuzzyHash === 'yuan')
+  ) {
+    return 0.22;
   }
 
   let initialCost = 1.0;
@@ -229,12 +266,20 @@ function computeSyllableSubCost(
     (a.initial === 't' && b.initial === 'd') ||
     (a.initial === 'g' && b.initial === 'k') ||
     (a.initial === 'k' && b.initial === 'g') ||
+    (['l', 'r', 'n', 'y'].includes(a.initial) &&
+      ['l', 'r', 'n', 'y'].includes(b.initial)) ||
+    (['w', 'g', 'h'].includes(a.initial) &&
+      ['w', 'g', 'h'].includes(b.initial) &&
+      a.medial === 'u' &&
+      b.medial === 'u') ||
     (['j', 'q', 'x'].includes(a.initial) &&
       ['j', 'q', 'x'].includes(b.initial)) ||
     (['z', 'c', 's'].includes(a.initial) &&
-      ['z', 'c', 's'].includes(b.initial))
+      ['z', 'c', 's'].includes(b.initial)) ||
+    (['j', 'q', 'x', 'z', 'c', 's'].includes(a.initial) &&
+      ['j', 'q', 'x', 'z', 'c', 's'].includes(b.initial))
   ) {
-    initialCost = 0.25;
+    initialCost = 0.24;
   }
 
   let rimeCost = 1.0;
@@ -243,6 +288,14 @@ function computeSyllableSubCost(
   } else if (
     (a.rime === 'an' && b.rime === 'en') ||
     (a.rime === 'en' && b.rime === 'an') ||
+    (a.rime === 'in' && b.rime === 'un') ||
+    (a.rime === 'un' && b.rime === 'in') ||
+    (a.rime === 'in' && b.rime === 'i') ||
+    (a.rime === 'i' && b.rime === 'in') ||
+    (a.rime === 'u' && b.rime === 'o') ||
+    (a.rime === 'o' && b.rime === 'u') ||
+    (a.rime === 'ei' && b.rime === 'an') ||
+    (a.rime === 'an' && b.rime === 'ei') ||
     (a.rime === 'i' && b.rime === 'u') ||
     (a.rime === 'u' && b.rime === 'i') ||
     (a.rime === 'ie' && b.rime === 'i') ||
@@ -251,7 +304,7 @@ function computeSyllableSubCost(
     rimeCost = 0.22;
   }
 
-  const medialCost = a.medial === b.medial ? 0.0 : 0.2;
+  const medialCost = a.medial === b.medial ? 0.0 : 0.18;
   return Math.min(1.0, 0.45 * initialCost + 0.45 * rimeCost + 0.1 * medialCost);
 }
 
@@ -271,19 +324,21 @@ function canContractTwoSyllablesIntoOne(
 }
 
 /**
- * 【問題二 2.1 核心公式】：支援連音縮讀之動態規劃加權音韻編輯距離 d_phon(S, T) \in [0, 1]
+ * 支援連音縮讀與標點忽略之動態規劃加權音韻編輯距離 d_phon(S, T) \in [0, 1]
  */
 export function computeTaiwanPhoneticDistance(
   sourceText: string,
   targetText: string
 ): number {
-  const sChars = Array.from(sourceText.trim());
-  const tChars = Array.from(targetText.trim());
+  const cleanS = sourceText.replace(/[，。？！、；：,.?!\s]/g, '').trim();
+  const cleanT = targetText.replace(/[，。？！、；：,.?!\s]/g, '').trim();
+  const sChars = Array.from(cleanS);
+  const tChars = Array.from(cleanT);
   const n = sChars.length;
   const m = tChars.length;
   if (n === 0 && m === 0) return 0.0;
   if (n === 0 || m === 0) return 1.0;
-  if (sourceText === targetText) return 0.0;
+  if (cleanS === cleanT) return 0.0;
 
   const sTuples = sChars.map(charToSyllableTuple);
   const tTuples = tChars.map(charToSyllableTuple);
@@ -375,4 +430,30 @@ export function scanHomophoneSpeakerMentions(
     }
   }
   return candidates;
+}
+
+export const computePhoneticSignature = toPhoneticSignature;
+export const scanTranscriptForPhoneticMatches = scanHomophoneSpeakerMentions;
+export const findPhoneticCandidates = scanHomophoneSpeakerMentions;
+
+export function toAccentInsensitivePhoneticKey(text: string): string {
+  const syls = toTaiwanFuzzyPhoneticSyllables(text);
+  return syls.join('-');
+}
+
+export function applyPhoneticDictionaryCorrection(
+  text: string,
+  dictionary: Array<{ term: string; aliases?: string[] }>
+): string {
+  let out = text;
+  for (const d of dictionary) {
+    if (d.aliases) {
+      for (const a of d.aliases) {
+        if (a && out.includes(a)) {
+          out = out.split(a).join(d.term);
+        }
+      }
+    }
+  }
+  return out;
 }

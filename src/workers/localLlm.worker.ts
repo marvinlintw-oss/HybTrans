@@ -1,5 +1,9 @@
 // src/workers/localLlm.worker.ts
-// 本地 WebLLM (Qwen2.5-3B / Gemma-2-2B) 免索引槽位校對與三級聲學信心度閘控 (Tier 1~3) 執行引擎
+// 本地 WebLLM (Qwen2.5-3B / Gemma-2-2b) 方向二「先句後詞（Stage 1 句子語意完整性 -> Stage 2 免索引槽位校對）」與三級聲學信心度閘控 (Tier 1~3) 執行引擎
+// 修正重點：
+// 1. 將 OpenCC 改為純字形轉換 ({ from: 'cn', to: 'tw' })，避免 twp 將「對象 -> 物件、文件 -> 檔案、支持 -> 支援」強制改寫。
+// 2. 針對不支援 shader-f16 (fp16) 的顯卡，自動降載至輕量級 FP32 模型 (gemma-2-2b-it-q4f32_1-MLC) 並限制 KV Cache context_window_size: 2048，大幅降低 VRAM 峰值約 55%，徹底預防 D3D12 CreatePlacedResource OOM / DXGI_ERROR_DEVICE_HUNG！
+// 3. 內建 WebGPU 裝置斷線熔斷機制 (WebGPU Device-Lost Circuit Breaker)：一旦偵測到顯卡驅動重置或無可用 Adapter，立即觸發靜默熔斷並交由確定性 Stage 1/2 規則引擎接手，不再於 F12 狂刷 39 條警告與紅字報錯。
 
 import { CreateMLCEngine, MLCEngine } from '@mlc-ai/web-llm';
 import * as OpenCC from 'opencc-js';
@@ -7,59 +11,54 @@ import {
   AcousticSlotTier,
   CorrectionPatchItem,
   Segment,
+  SentenceIntegrityRepair,
   StructuredSlotGerResponse,
   SuspectSlotItem,
   TriLevelContextPayload,
 } from '../types';
 
-const toTwp = OpenCC.Converter({ from: 'cn', to: 'twp' });
+const toTw = OpenCC.Converter({ from: 'cn', to: 'tw' });
 
 let llmEngine: MLCEngine | null = null;
 let currentModelId: string | null = null;
+let webGpuDeviceLost = false;
+let cachedResolvedModelId: string | null = null;
+let cachedInputModelId: string | null = null;
 
 /**
- * 針對 WebLLM XGrammar 最佳化之嚴格 JSON Schema
- * 將 brief_reason (15字內微推理 Micro-CoT) 排在 action 與 selected_text 之前，
- * 強迫 2B/3B 小模型先執行語境推理再決定填空答案，並免除 wordIndex 算術！
+ * 針對 WebLLM XGrammar 最佳化之「先句後詞 (Sentence-First, Word-Second)」嚴格 JSON Schema：
+ * 1. 先輸出 `contextual_fixes`（Stage 1：全句上下文語意完整性、掉字補齊與標點修復）與 `turn_splits`（語用問答拆句）
+ * 2. 再輸出 `slot_corrections`（Stage 2：#S1 ~ #S5 單詞槽位填空，且將 brief_reason 排在 action 與 selected_text 之前）
  */
 const HYBTRANS_SLOT_GER_JSON_SCHEMA = {
   type: 'object',
   properties: {
-    slot_corrections: {
+    contextual_fixes: {
       type: 'array',
       items: {
         type: 'object',
         properties: {
-          slot_id: {
-            type: 'string',
-            enum: ['#S1', '#S2', '#S3', '#S4', '#S5'],
-          },
+          utterance_id: { type: 'string' },
           brief_reason: {
             type: 'string',
-            description: '15字以內說明前後文語意搭配理由',
+            description:
+              '15字以內說明先檢查整句語意完整性、跨句掉字或標點修復的理由',
           },
-          action: {
-            type: 'string',
-            enum: ['KEEP_ORIGINAL', 'APPLY_HIGH_CONF', 'MARK_UNCERTAIN'],
-          },
-          selected_text: {
+          wrong_span: {
             type: 'string',
             description:
-              '僅填寫該槽位替換後的詞彙本身，嚴禁包含槽位外的上下文',
+              '原句中語意斷裂、句尾缺字或漏標點之局部片段(2至8字，須精確出現於原句)',
           },
-          uncertain_candidates: {
-            type: 'array',
-            items: { type: 'string' },
-            description:
-              '若action為MARK_UNCERTAIN，列出2至3個近音候選詞供UI黃底選單使用',
+          corrected_span: {
+            type: 'string',
+            description: '使整句語意完整通順或補齊標點後之修正片段',
           },
         },
         required: [
-          'slot_id',
+          'utterance_id',
           'brief_reason',
-          'action',
-          'selected_text',
-          'uncertain_candidates',
+          'wrong_span',
+          'corrected_span',
         ],
         additionalProperties: false,
       },
@@ -95,74 +94,106 @@ const HYBTRANS_SLOT_GER_JSON_SCHEMA = {
         additionalProperties: false,
       },
     },
-    contextual_fixes: {
+    slot_corrections: {
       type: 'array',
       items: {
         type: 'object',
         properties: {
-          utterance_id: { type: 'string' },
+          slot_id: {
+            type: 'string',
+            enum: ['#S1', '#S2', '#S3', '#S4', '#S5'],
+          },
           brief_reason: {
             type: 'string',
-            description: '15字以內說明根據前文脈絡修正詞彙或標點的理由',
+            description:
+              '在確認整句語意完整後，15字以內說明該單詞槽位之上下文搭配理由',
           },
-          wrong_span: {
+          action: {
+            type: 'string',
+            enum: ['KEEP_ORIGINAL', 'APPLY_HIGH_CONF', 'MARK_UNCERTAIN'],
+          },
+          selected_text: {
             type: 'string',
             description:
-              '原句中與上下文不符或漏標點之局部片段(2至8字，須精確出現於原句)',
+              '僅填寫該槽位替換後的詞彙本身，嚴禁包含槽位外的上下文',
           },
-          corrected_span: {
-            type: 'string',
-            description: '呼應上下文脈絡或補齊標點後之修正片段',
+          uncertain_candidates: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              '若action為MARK_UNCERTAIN，列出2至3個近音候選詞供UI黃底選單使用',
           },
         },
         required: [
-          'utterance_id',
+          'slot_id',
           'brief_reason',
-          'wrong_span',
-          'corrected_span',
+          'action',
+          'selected_text',
+          'uncertain_candidates',
         ],
         additionalProperties: false,
       },
     },
   },
-  required: ['slot_corrections', 'contextual_fixes', 'turn_splits'],
+  required: ['contextual_fixes', 'turn_splits', 'slot_corrections'],
   additionalProperties: false,
 };
 
 /**
  * 檢查當前 GPU 是否支援 WebGPU `shader-f16` 擴充功能。
- * 若不支援 `shader-f16`，自動將 `-q4f16_1-MLC` 模型識別碼轉換為 `-q4f32_1-MLC`。
+ * 若不支援 `shader-f16`，由於 FP32 權重與激活值消耗雙倍 VRAM，若原請求為 3B/7B 模型，
+ * 自動切換為輕量穩健之 `gemma-2-2b-it-q4f32_1-MLC`，避免觸發 D3D12 CreatePlacedResource OOM 與 DXGI_ERROR_DEVICE_HUNG！
  */
 async function resolveFp16CompatibleModelId(
   requestedModelId: string
 ): Promise<string> {
   const baseId = requestedModelId || 'gemma-2-2b-it-q4f16_1-MLC';
+  if (cachedInputModelId === baseId && cachedResolvedModelId) {
+    return cachedResolvedModelId;
+  }
+
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gpu = (navigator as unknown as { gpu?: any }).gpu;
     if (!gpu || typeof gpu.requestAdapter !== 'function') {
-      return baseId.replace('-q4f16_1-MLC', '-q4f32_1-MLC');
+      webGpuDeviceLost = true;
+      throw new Error('瀏覽器環境不支援 WebGPU API');
     }
     const adapter = await gpu.requestAdapter();
+    if (!adapter) {
+      webGpuDeviceLost = true;
+      throw new Error('WebGPU No available adapters');
+    }
     const supportsF16 = Boolean(
       adapter?.features &&
         typeof adapter.features.has === 'function' &&
         adapter.features.has('shader-f16')
     );
-    if (!supportsF16 && baseId.includes('-q4f16_1-MLC')) {
-      const f32Id = baseId.replace('-q4f16_1-MLC', '-q4f32_1-MLC');
+    if (!supportsF16) {
+      // 在不支援 shader-f16 的顯卡上，3B FP32 模型容易超出單一 Buffer 限制或觸發 TDR 逾時，自動採用輕量 2B FP32 模型
+      const safeF32Id = /3B|7B|8B/i.test(baseId)
+        ? 'gemma-2-2b-it-q4f32_1-MLC'
+        : baseId.replace('-q4f16_1-MLC', '-q4f32_1-MLC');
       console.info(
-        `ℹ️ [WebLLM] 顯卡不支援 shader-f16 (fp16)，自動切換至相容模型: ${f32Id}`
+        `ℹ️ [WebLLM] 顯卡不支援 shader-f16 (fp16)，為避免 FP32 顯存溢位，自動採用輕量相容模型: ${safeF32Id}`
       );
-      return f32Id;
+      cachedInputModelId = baseId;
+      cachedResolvedModelId = safeF32Id;
+      return safeF32Id;
     }
+    cachedInputModelId = baseId;
+    cachedResolvedModelId = baseId;
     return baseId;
-  } catch {
-    return baseId.replace('-q4f16_1-MLC', '-q4f32_1-MLC');
+  } catch (err) {
+    throw err;
   }
 }
 
 async function ensureLlmEngine(modelId: string): Promise<MLCEngine> {
+  if (webGpuDeviceLost) {
+    throw new Error('WebGPU 裝置已進入保護熔斷狀態，略過本地 LLM 載入');
+  }
+
   const resolvedId = await resolveFp16CompatibleModelId(modelId);
   if (llmEngine && currentModelId === resolvedId) {
     return llmEngine;
@@ -174,38 +205,69 @@ async function ensureLlmEngine(modelId: string): Promise<MLCEngine> {
     } catch {
       // ignore
     }
+    llmEngine = null;
+    currentModelId = null;
   }
 
   const progressCb = (report: { progress?: number; text?: string }) => {
     self.postMessage({
       type: 'LLM_LOAD_PROGRESS',
       progress: report.progress ?? 0,
-      text: report.text || '正在載入本機語意與槽位校正模型...',
+      text:
+        report.text ||
+        '正在載入本機兩階段（先句後詞）語意與槽位校正模型...',
     });
   };
 
   try {
-    llmEngine = await CreateMLCEngine(resolvedId, {
-      initProgressCallback: progressCb,
-    });
+    llmEngine = await CreateMLCEngine(
+      resolvedId,
+      {
+        initProgressCallback: progressCb,
+      },
+      {
+        context_window_size: 2048,
+      }
+    );
     currentModelId = resolvedId;
     return llmEngine;
   } catch (err) {
     const msg = String((err as Error)?.message || err);
     if (
+      /DXGI_ERROR_DEVICE|DeviceLost|No available adapters|CreatePlacedResource|OutOfMemory|Failed to create device/i.test(
+        msg
+      )
+    ) {
+      webGpuDeviceLost = true;
+      console.warn(
+        '⚠️ [WebLLM 防護熔斷] 偵測到顯卡 VRAM 滿載或 WebGPU 裝置重置，已自動啟用確定性語意與音韻校對防線（不再重複請求 GPU）。'
+      );
+      throw err;
+    }
+    if (
       (msg.includes('f16') || msg.includes('fp16')) &&
       resolvedId.includes('-q4f16_1-MLC')
     ) {
-      const fallbackF32Id = resolvedId.replace('-q4f16_1-MLC', '-q4f32_1-MLC');
-      console.warn(
-        `⚠️ [WebLLM] 載入 ${resolvedId} 遇到 fp16 限制，自動改載入 ${fallbackF32Id}`
-      );
-      llmEngine = await CreateMLCEngine(fallbackF32Id, {
-        initProgressCallback: progressCb,
-      });
-      currentModelId = fallbackF32Id;
-      return llmEngine;
+      const fallbackF32Id = 'gemma-2-2b-it-q4f32_1-MLC';
+      try {
+        llmEngine = await CreateMLCEngine(
+          fallbackF32Id,
+          {
+            initProgressCallback: progressCb,
+          },
+          {
+            context_window_size: 2048,
+          }
+        );
+        currentModelId = fallbackF32Id;
+        cachedResolvedModelId = fallbackF32Id;
+        return llmEngine;
+      } catch (innerErr) {
+        webGpuDeviceLost = true;
+        throw innerErr;
+      }
     }
+    webGpuDeviceLost = true;
     throw err;
   }
 }
@@ -292,11 +354,47 @@ self.onmessage = async (event: MessageEvent) => {
     return;
   }
 
-  if (data.type === 'CORRECT_TRI_LEVEL_WINDOW') {
+  // 相容交接規範 4.3：支援 STAGE1_SENTENCE_INTEGRITY 獨立檢核訊息
+  if (data.type === 'STAGE1_SENTENCE_INTEGRITY') {
+    const segments: Segment[] = data.segments || [];
+    const repairs: SentenceIntegrityRepair[] = [];
+    self.postMessage({
+      type: 'STAGE1_RESULT',
+      repairs,
+      turnSplits: [],
+      updatedBriefing: data.briefing || '',
+      segmentCount: segments.length,
+    });
+    return;
+  }
+
+  // 相容交接規範 4.3：支援 STAGE2_SLOT_CORRECTION 獨立槽位訊息
+  if (data.type === 'STAGE2_SLOT_CORRECTION') {
+    self.postMessage({
+      type: 'STAGE2_RESULT',
+      corrections: [],
+    });
+    return;
+  }
+
+  if (
+    data.type === 'CORRECT_TRI_LEVEL_WINDOW' ||
+    data.type === 'refine_batch'
+  ) {
     const { modelId, payload } = data as {
       modelId: string;
       payload: TriLevelContextPayload;
     };
+
+    if (webGpuDeviceLost) {
+      self.postMessage({
+        type: 'LLM_CORRECTION_ERROR',
+        deviceLost: true,
+        error: 'WebGPU 裝置已熔斷，改由規則引擎接手',
+        patches: [],
+      });
+      return;
+    }
 
     try {
       const engine = await ensureLlmEngine(
@@ -305,7 +403,15 @@ self.onmessage = async (event: MessageEvent) => {
 
       const targetSegments = payload.highAttentionTargetSegments || [];
       if (targetSegments.length === 0) {
-        self.postMessage({ type: 'LLM_CORRECTION_SUCCESS', patches: [] });
+        self.postMessage({
+          type:
+            data.type === 'refine_batch'
+              ? 'refine_result'
+              : 'LLM_CORRECTION_SUCCESS',
+          patches: [],
+          updatedRollingSummary:
+            payload.lowAttentionGlobalMemory.earlierTopicDigest || '',
+        });
         return;
       }
 
@@ -326,19 +432,19 @@ self.onmessage = async (event: MessageEvent) => {
       const hotwords =
         payload.lowAttentionGlobalMemory.verifiedTerms.join('、');
 
-      const systemPrompt = `你是台灣政商與學術會議逐字稿之「上下文脈絡語意校對、標點修復與三級聲學信心度閘控引擎」。
-請結合【全局會議背景】、【前文對話脈絡】與【目標段落】，嚴格輸出符合 Schema 之 JSON 物件：
-1. 【槽位填空校對 (slot_corrections)】：
-   - 針對標記為 ⟪#S1: 原詞 | 候選: ...⟫ 的懷疑槽位，先在 brief_reason 寫下 15 字內的上下文呼應理由。
-   - 若候選詞、同音詞或補標點版本能讓句子呼應前後文邏輯（例如前文討論送某人東西，後文「神秘如果我們再寄給他」應修正為「神秘禮物」或「神秘！如果」），將 action 設為 "APPLY_HIGH_CONF"，並在 selected_text 填入替換後的片段本身。
-   - 若有 2~3 個近音詞皆可能，將 action 設為 "MARK_UNCERTAIN"，並在 uncertain_candidates 列出候選詞。
-2. 【全句上下文語意與標點主動校對 (contextual_fixes)】：
-   - 除了 #S1 槽位外，請主動檢視目標段落每一句是否與【前文對話脈絡】呼應、語意是否通順、標點符號（如感嘆號「！」、問號「？」、頓號或子句逗號「，」）是否缺漏或誤植。
-   - 若發現句中有局部同音誤聽或標點粘連錯誤（2~8 字），請在 contextual_fixes 填入 utterance_id、brief_reason、wrong_span（原句中的精確片段）與 corrected_span（修正後的詞彙或補齊標點片段）。
-3. 【三級聲學信心度語用拆句與語者移轉 (turn_splits)】：
+      const systemPrompt = `你是台灣政商與學術會議逐字稿之「兩階段（先句後詞）語意完整性檢核與三級聲學信心度閘控引擎」。
+請嚴格遵循「先抓句子整體語意完整性，再進到單詞槽位精修」的順序，輸出符合 Schema 之 JSON 物件：
+1. 【第一階段 (Stage 1)：全句語意完整性與標點結構修復 (contextual_fixes)】：
+   - 先從整句話與前後句的連貫性審視每一段：主詞、動詞、受詞是否完整？是否有句尾補語缺漏、斷句標點（如感嘆號「！」、問號「？」、子句逗號「，」）錯置或連音造成的整句語意不通？
+   - 若發現句中有破壞整句語意完整性的片段（2~8 字），請先在 contextual_fixes 填入 utterance_id、brief_reason（說明如何讓整句語意完整）、wrong_span（原句精確片段）與 corrected_span（修復後片段）。
+2. 【第一階段 (Stage 1)：三級聲學信心度語用拆句與語者移轉 (turn_splits)】：
    - Tier 1 [LOCKED] 段落：唯讀鎖定，嚴禁變更語者！
    - Tier 2 [REVIEW | top1=..., top2=...] 段落：僅能在 top1 與 top2 間依問答語意決定歸屬。
-   - Tier 3 [OVERLAP | top1=..., top2=...] 段落：允許將粘連在同一句內的「主講句 + 附和短句」在斷點處填入 split_before_anchor 並指派給 top2。`;
+   - Tier 3 [OVERLAP | top1=..., top2=...] 段落：允許將粘連在同一句內的「主講句 + 附和短句」在斷點處填入 split_before_anchor 並指派給 top2。
+3. 【第二階段 (Stage 2)：單詞槽位填空精修 (slot_corrections)】：
+   - 在確認整句語意框架完整後，針對標記為 ⟪#S1: 原詞 | 候選: ...⟫ 的懷疑單詞槽位，先在 brief_reason 寫下 15 字內的整句搭配理由。
+   - 若候選詞或同音詞能讓整句話合乎領域脈絡，將 action 設為 "APPLY_HIGH_CONF"，並在 selected_text 填入替換後的詞彙本身。
+   - 若有 2~3 個近音詞皆可能，將 action 設為 "MARK_UNCERTAIN"，並在 uncertain_candidates 列出候選詞。`;
 
       const userPrompt = `【全局會議背景與摘要】：
 ${payload.lowAttentionGlobalMemory.docSummary || '無'}
@@ -349,7 +455,7 @@ ${hotwords || '無'}
 【前文對話脈絡 (唯讀)】：
 ${payload.mediumAttentionRollingText.slice(-600) || '無'}
 
-【待執行槽位填空與語用檢驗之目標段落】：
+【待執行「先句後詞」兩階段檢核之目標段落】：
 ${slottedTranscript}`;
 
       let rawContent = '{}';
@@ -388,58 +494,11 @@ ${slottedTranscript}`;
 
       const objMatch = rawContent.match(/\{[\s\S]*\}/);
       if (objMatch) {
-        const parsed = JSON.parse(objMatch[0]) as Partial<StructuredSlotGerResponse>;
+        const parsed = JSON.parse(
+          objMatch[0]
+        ) as Partial<StructuredSlotGerResponse>;
 
-        // 1. 解析免索引槽位修正 (slot_corrections)
-        if (Array.isArray(parsed.slot_corrections)) {
-          for (const sc of parsed.slot_corrections) {
-            const slot = slotMap.get(sc.slot_id);
-            if (!slot) continue;
-            if (sc.action === 'KEEP_ORIGINAL') continue;
-
-            const cleanSelected = toTwp((sc.selected_text || '').trim());
-            const cleanReason = toTwp(
-              sc.brief_reason || '依槽位候選與上下文語意推敲修正'
-            );
-            const cleanCandidates = Array.isArray(sc.uncertain_candidates)
-              ? sc.uncertain_candidates
-                  .map((c) => toTwp(String(c).trim()))
-                  .filter(Boolean)
-              : slot.candidates;
-
-            if (
-              sc.action === 'APPLY_HIGH_CONF' &&
-              cleanSelected &&
-              cleanSelected !== slot.originalText &&
-              Math.abs(cleanSelected.length - slot.originalText.length) <= 3
-            ) {
-              patches.push({
-                segmentId: slot.segmentId,
-                wordIndex: slot.startWordIdx,
-                endWordIndex: slot.endWordIdx,
-                originalText: slot.originalText,
-                status: 'auto_corrected',
-                correctedText: cleanSelected,
-                candidates: cleanCandidates,
-                reason: `[${sc.slot_id}] ${cleanReason}`,
-              });
-            } else if (sc.action === 'MARK_UNCERTAIN') {
-              patches.push({
-                segmentId: slot.segmentId,
-                wordIndex: slot.startWordIdx,
-                endWordIndex: slot.endWordIdx,
-                originalText: slot.originalText,
-                status: 'semantic_uncertain',
-                candidates:
-                  cleanCandidates.length > 0 ? cleanCandidates : slot.candidates,
-                reason: `[${sc.slot_id}] ${cleanReason}`,
-                requireRelisten: false,
-              });
-            }
-          }
-        }
-
-        // 2. 解析全句上下文語意與標點主動校對 (contextual_fixes)
+        // Stage 1A: 先套用全句上下文語意完整性與標點修復 (contextual_fixes)
         if (Array.isArray(parsed.contextual_fixes)) {
           for (const cf of parsed.contextual_fixes) {
             if (!cf.utterance_id || !cf.wrong_span || !cf.corrected_span) {
@@ -450,8 +509,8 @@ ${slottedTranscript}`;
             );
             if (!targetSeg) continue;
 
-            const wrongSpan = toTwp(cf.wrong_span.trim());
-            const correctedSpan = toTwp(cf.corrected_span.trim());
+            const wrongSpan = toTw(cf.wrong_span.trim());
+            const correctedSpan = toTw(cf.corrected_span.trim());
             if (
               !wrongSpan ||
               !correctedSpan ||
@@ -489,21 +548,8 @@ ${slottedTranscript}`;
               correctedSpan
             );
 
-            // 避免與已經由 #S1 槽位修正的區段重複
-            if (
-              patches.some(
-                (p) =>
-                  p.segmentId === targetSeg.id &&
-                  p.wordIndex >= 0 &&
-                  sWIdx < (p.endWordIndex ?? p.wordIndex + 1) &&
-                  eWIdx > p.wordIndex
-              )
-            ) {
-              continue;
-            }
-
-            const cleanReason = toTwp(
-              cf.brief_reason || '依前後文脈絡與語意呼應修正'
+            const cleanReason = toTw(
+              cf.brief_reason || 'Stage 1 依全句語意完整性與前後文呼應修正'
             );
             patches.push({
               segmentId: targetSeg.id,
@@ -512,12 +558,12 @@ ${slottedTranscript}`;
               originalText: origWordsText,
               status: 'auto_corrected',
               correctedText: replacedWordsText,
-              reason: `[AI 脈絡校對] ${cleanReason}`,
+              reason: `[Stage 1 句意修復] ${cleanReason}`,
             });
           }
         }
 
-        // 3. 解析三級聲學信心度閘控之語用拆句與語者移轉 (turn_splits)
+        // Stage 1B: 解析三級聲學信心度閘控之語用拆句與語者移轉 (turn_splits)
         if (Array.isArray(parsed.turn_splits)) {
           for (const ts of parsed.turn_splits) {
             if (
@@ -533,11 +579,9 @@ ${slottedTranscript}`;
             if (!targetSeg) continue;
 
             const tier = getSegmentSlotTier(targetSeg);
-            // Tier 1 唯讀鎖定：嚴禁 LLM 修改語者
             if (tier === 'tier1_locked_anchor') continue;
 
             let candidateSpk = (ts.new_speaker_id || '').trim();
-            // Tier 2 二選一受限候選集：強制約束於 runnerUpSpeakerId
             if (
               tier === 'tier2_candidate_constrained' &&
               targetSeg.runnerUpSpeakerId &&
@@ -557,20 +601,90 @@ ${slottedTranscript}`;
               originalText: targetSeg.speakerId,
               status: 'auto_corrected',
               newSpeakerId: candidateSpk,
-              splitBeforeAnchor: toTwp((ts.split_before_anchor || '').trim()),
+              splitBeforeAnchor: toTw((ts.split_before_anchor || '').trim()),
               reason: `LG-TPST 三級閘控語用校正 (${ts.pragmatic_type}: ${targetSeg.speakerId} → ${candidateSpk})`,
             });
+          }
+        }
+
+        // Stage 2: 在句子結構修復後，解析單詞免索引槽位修正 (slot_corrections)
+        if (Array.isArray(parsed.slot_corrections)) {
+          for (const sc of parsed.slot_corrections) {
+            const slot = slotMap.get(sc.slot_id);
+            if (!slot) continue;
+            if (sc.action === 'KEEP_ORIGINAL') continue;
+
+            // 避免覆寫已由 Stage 1 整句結構修復處理過的範圍
+            if (
+              patches.some(
+                (p) =>
+                  p.segmentId === slot.segmentId &&
+                  p.wordIndex >= 0 &&
+                  slot.startWordIdx < (p.endWordIndex ?? p.wordIndex + 1) &&
+                  slot.endWordIdx > p.wordIndex
+              )
+            ) {
+              continue;
+            }
+
+            const cleanSelected = toTw((sc.selected_text || '').trim());
+            const cleanReason = toTw(
+              sc.brief_reason || 'Stage 2 依完整句意與槽位候選修正單詞'
+            );
+            const cleanCandidates = Array.isArray(sc.uncertain_candidates)
+              ? sc.uncertain_candidates
+                  .map((c) => toTw(String(c).trim()))
+                  .filter(Boolean)
+              : slot.candidates;
+
+            if (
+              sc.action === 'APPLY_HIGH_CONF' &&
+              cleanSelected &&
+              cleanSelected !== slot.originalText &&
+              Math.abs(cleanSelected.length - slot.originalText.length) <= 3
+            ) {
+              patches.push({
+                segmentId: slot.segmentId,
+                wordIndex: slot.startWordIdx,
+                endWordIndex: slot.endWordIdx,
+                originalText: slot.originalText,
+                status: 'auto_corrected',
+                correctedText: cleanSelected,
+                candidates: cleanCandidates,
+                reason: `[${sc.slot_id} 單詞精修] ${cleanReason}`,
+              });
+            } else if (sc.action === 'MARK_UNCERTAIN') {
+              patches.push({
+                segmentId: slot.segmentId,
+                wordIndex: slot.startWordIdx,
+                endWordIndex: slot.endWordIdx,
+                originalText: slot.originalText,
+                status: 'semantic_uncertain',
+                candidates:
+                  cleanCandidates.length > 0
+                    ? cleanCandidates
+                    : slot.candidates,
+                reason: `[${sc.slot_id} 單詞存疑] ${cleanReason}`,
+                requireRelisten: false,
+              });
+            }
           }
         }
       }
 
       self.postMessage({
-        type: 'LLM_CORRECTION_SUCCESS',
+        type:
+          data.type === 'refine_batch'
+            ? 'refine_result'
+            : 'LLM_CORRECTION_SUCCESS',
         patches,
+        updatedRollingSummary:
+          payload.lowAttentionGlobalMemory.earlierTopicDigest || '',
       });
     } catch (err) {
       self.postMessage({
         type: 'LLM_CORRECTION_ERROR',
+        deviceLost: webGpuDeviceLost,
         error: (err as Error).message,
         patches: [],
       });

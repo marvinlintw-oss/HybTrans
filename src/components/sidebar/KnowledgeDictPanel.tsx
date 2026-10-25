@@ -14,14 +14,20 @@ import {
   RefreshCw,
   Link2,
   Info,
+  Share2,
+  Check,
 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import { DictCategory, DictEntry } from '../../types';
 import * as docParserMod from '../../utils/docParser';
 import {
+  DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID,
+  buildShareableDictUrl,
   exportDictionaryToJsonFile,
   fetchRemotePublicDictionary,
+  getUrlQueryDictParam,
   parseDictionaryJsonFile,
+  resolveGoogleSheetEndpoint,
   syncDictionaryFromGoogleSheet,
 } from '../../utils/dictIO';
 
@@ -104,6 +110,10 @@ export const KnowledgeDictPanel: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('public');
   const [sheetUrl, setSheetUrl] = useState<string>(() => {
+    const queryDict = getUrlQueryDictParam();
+    if (queryDict?.dictParam) {
+      return queryDict.dictParam;
+    }
     try {
       return localStorage.getItem(GSHEET_STORAGE_KEY) || '';
     } catch {
@@ -111,6 +121,8 @@ export const KnowledgeDictPanel: React.FC = () => {
     }
   });
   const [isSyncingSheet, setIsSyncingSheet] = useState(false);
+  const [urlMountedSheetId, setUrlMountedSheetId] = useState<string | null>(null);
+  const [copiedShareLink, setCopiedShareLink] = useState(false);
   const [newTerm, setNewTerm] = useState('');
   const [newAliases, setNewAliases] = useState('');
   const [newCategory, setNewCategory] = useState<DictCategory>('jargon');
@@ -121,26 +133,62 @@ export const KnowledgeDictPanel: React.FC = () => {
   const dictJsonInputRef = useRef<HTMLInputElement | null>(null);
 
   const handleSyncGoogleSheet = useCallback(
-    async (targetUrl: string, silent = false) => {
-      const trimmed = targetUrl.trim();
+    async (
+      targetUrlOrId: string,
+      options?: { silent?: boolean; fromUrlQuery?: boolean; explicitGid?: string | null }
+    ) => {
+      const trimmed = targetUrlOrId.trim();
       if (!trimmed) return;
+
+      const silent = Boolean(options?.silent);
+      const fromUrlQuery = Boolean(options?.fromUrlQuery);
 
       setIsSyncingSheet(true);
       if (!silent) setStatusMsg(null);
 
       try {
+        const endpoint = resolveGoogleSheetEndpoint(trimmed, options?.explicitGid);
         localStorage.setItem(GSHEET_STORAGE_KEY, trimmed);
-        const syncedEntries = await syncDictionaryFromGoogleSheet(trimmed);
+
+        if (endpoint.sheetId && typeof window !== 'undefined') {
+          try {
+            const nextUrl = new URL(window.location.href);
+            nextUrl.searchParams.set('dict', endpoint.sheetId);
+            if (endpoint.gid && endpoint.gid !== '0') {
+              nextUrl.searchParams.set('gid', endpoint.gid);
+            } else {
+              nextUrl.searchParams.delete('gid');
+            }
+            window.history.replaceState({}, '', nextUrl.toString());
+          } catch {
+            // ignore history update error in sandboxed iframe
+          }
+        }
+
+        const syncedEntries = await syncDictionaryFromGoogleSheet(
+          trimmed,
+          'public',
+          options?.explicitGid
+        );
         if (syncedEntries.length > 0) {
           addDictEntries(syncedEntries);
-          if (!silent) {
+          if (endpoint.sheetId) {
+            setUrlMountedSheetId(endpoint.sheetId);
+          }
+          if (fromUrlQuery) {
+            setStatusMsg(
+              `🔗 已由網址參數 (?dict=${
+                endpoint.sheetId ? `${endpoint.sheetId.slice(0, 10)}...` : '雲端表單'
+              }) 自動載入 ${syncedEntries.length} 筆共編詞彙！`
+            );
+          } else if (!silent) {
             setStatusMsg(`已從 Google Sheet 同步 ${syncedEntries.length} 筆共編詞彙！`);
           }
         } else if (!silent) {
           setStatusMsg('Google Sheet 中尚無有效詞彙列。');
         }
       } catch (err) {
-        if (!silent) {
+        if (!silent || fromUrlQuery) {
           setStatusMsg((err as Error).message);
         }
       } finally {
@@ -150,7 +198,7 @@ export const KnowledgeDictPanel: React.FC = () => {
     [addDictEntries]
   );
 
-  // 啟動時自動載入預設公共字典，若曾記憶過 Google Sheet 網址則自動背景同步！
+  // 啟動時：1. 先載入內建台灣會議核心字典；2. 若網址帶有 `?dict=1ra9-...` 參數則優先掛載該雲端字典；3. 否則若曾記憶過 Google Sheet 則背景同步
   useEffect(() => {
     fetchRemotePublicDictionary().then((pubEntries) => {
       if (pubEntries.length > 0) {
@@ -158,11 +206,38 @@ export const KnowledgeDictPanel: React.FC = () => {
       }
     });
 
-    const savedUrl = localStorage.getItem(GSHEET_STORAGE_KEY);
-    if (savedUrl && savedUrl.includes('docs.google.com/spreadsheets')) {
-      handleSyncGoogleSheet(savedUrl, true);
+    const queryDict = getUrlQueryDictParam();
+    if (queryDict && queryDict.dictParam) {
+      setSheetUrl(queryDict.dictParam);
+      handleSyncGoogleSheet(queryDict.dictParam, {
+        silent: false,
+        fromUrlQuery: true,
+        explicitGid: queryDict.gidParam,
+      });
+      return;
+    }
+
+    try {
+      const savedUrl = localStorage.getItem(GSHEET_STORAGE_KEY);
+      if (savedUrl && savedUrl.trim()) {
+        handleSyncGoogleSheet(savedUrl, { silent: true });
+      }
+    } catch {
+      // ignore storage error
     }
   }, [addDictEntries, handleSyncGoogleSheet]);
+
+  const handleCopyShareableDictUrl = () => {
+    const shareUrl = buildShareableDictUrl(
+      sheetUrl.trim() || DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID
+    );
+    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+      navigator.clipboard.writeText(shareUrl).catch(() => {});
+    }
+    setCopiedShareLink(true);
+    setStatusMsg(`已複製分享連結：${shareUrl}`);
+    setTimeout(() => setCopiedShareLink(false), 2500);
+  };
 
   const publicList = dictionary.filter((d) => d.scope === 'public' || d.scope === 'global');
   const personalList = dictionary.filter((d) => d.scope === 'personal');
@@ -179,13 +254,15 @@ export const KnowledgeDictPanel: React.FC = () => {
   const isPersonalTab = activeTab === 'personal';
   const isSessionTab = activeTab === 'session';
 
+  const resolvedEndpoint = resolveGoogleSheetEndpoint(sheetUrl);
+
   const handleAddTerm = (e: React.FormEvent) => {
     e.preventDefault();
     const termTrimmed = newTerm.trim();
     if (!termTrimmed) return;
 
     const aliasList = newAliases
-      .split(/[,，、\s]+/)
+      .split(/[,，、;；|｜\s]+/)
       .map((s) => s.trim())
       .filter((s) => s && s !== termTrimmed);
 
@@ -258,7 +335,7 @@ export const KnowledgeDictPanel: React.FC = () => {
           <BookOpen className="w-4 h-4 text-indigo-600" />
           <h3 className="font-semibold text-slate-800 text-sm">智慧字典與會議簡報</h3>
           <span
-            title="公共字典支援 Google Sheet 團隊共編自動同步；個人字典儲存在您的瀏覽器中；單次字典由會議簡報自動萃取"
+            title="支援透過網址參數 ?dict=<GoogleSheetID> 自動掛載團隊共編字典；亦支援手動貼上 Google Sheet 網址或 Sheet ID 同步。"
             className="text-slate-400 hover:text-slate-600 cursor-help"
           >
             <Info className="w-3.5 h-3.5" />
@@ -333,23 +410,23 @@ export const KnowledgeDictPanel: React.FC = () => {
         </button>
       </div>
 
-      {/* 🌐 公共字典專屬：Google Sheet 雲端共編網址自動同步列 */}
+      {/* 🌐 公共字典專屬：Google Sheet 雲端共編網址與 `?dict=` 網址參數自動掛載列 */}
       {isPublicTab && (
         <div className="bg-blue-50/50 border border-blue-200/80 rounded-lg p-2 space-y-1.5">
           <div className="flex items-center justify-between text-[11px] text-blue-900 font-medium">
             <span className="flex items-center gap-1">
               <Link2 className="w-3.5 h-3.5 text-blue-600" />
-              Google Sheet 共編字典同步
+              Google Sheet 共編與 ?dict= 網址掛載
               <span
-                title="將 Google 試算表共用設為「知道連結的任何人皆可檢視」，貼上網址即可自動同步。試算表格式：A欄=正確詞彙、B欄=常見同音錯字(選填)、C欄=分類(人名/計畫/專詞，選填)。網址會自動記憶於瀏覽器中。"
+                title="支援直接貼上 Google Sheet 網址或純 Sheet ID（例如 1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E），亦可透過網址列 ?dict=<SheetID> 讓開啟連結的人自動預設載入該字典！"
                 className="text-blue-400 hover:text-blue-600 cursor-help"
               >
                 <Info className="w-3 h-3" />
               </span>
             </span>
-            {sheetUrl && (
+            {resolvedEndpoint.canonicalViewUrl && (
               <a
-                href={sheetUrl}
+                href={resolvedEndpoint.canonicalViewUrl}
                 target="_blank"
                 rel="noreferrer"
                 className="text-[10px] text-blue-600 hover:underline"
@@ -358,27 +435,36 @@ export const KnowledgeDictPanel: React.FC = () => {
               </a>
             )}
           </div>
+
           <div className="flex gap-1">
             <input
-              type="url"
+              type="text"
               value={sheetUrl}
               onChange={(e) => {
                 const val = e.target.value;
                 setSheetUrl(val);
-                localStorage.setItem(GSHEET_STORAGE_KEY, val.trim());
-              }}
-              onPaste={(e) => {
-                const pasted = e.clipboardData.getData('text');
-                if (pasted && pasted.includes('docs.google.com/spreadsheets')) {
-                  setTimeout(() => handleSyncGoogleSheet(pasted, false), 100);
+                try {
+                  localStorage.setItem(GSHEET_STORAGE_KEY, val.trim());
+                } catch {
+                  // ignore
                 }
               }}
-              placeholder="貼上 Google Sheet 網址自動同步並記憶..."
-              className="text-[11px] px-2 py-1 border border-blue-200 rounded flex-1 bg-white focus:outline-none focus:border-blue-500"
+              onPaste={(e) => {
+                const pasted = e.clipboardData.getData('text').trim();
+                if (
+                  pasted &&
+                  (pasted.includes('docs.google.com/spreadsheets') ||
+                    /^[a-zA-Z0-9-_]{20,80}$/.test(pasted))
+                ) {
+                  setTimeout(() => handleSyncGoogleSheet(pasted, { silent: false }), 100);
+                }
+              }}
+              placeholder="貼上 Google Sheet 網址或 Sheet ID (如 1ra9-ylq...)..."
+              className="text-[11px] px-2 py-1 border border-blue-200 rounded flex-1 bg-white focus:outline-none focus:border-blue-500 min-w-0"
             />
             <button
               type="button"
-              onClick={() => handleSyncGoogleSheet(sheetUrl, false)}
+              onClick={() => handleSyncGoogleSheet(sheetUrl, { silent: false })}
               disabled={isSyncingSheet || !sheetUrl.trim()}
               className="bg-blue-600 text-white px-2 py-1 rounded text-[11px] flex items-center gap-1 hover:bg-blue-700 disabled:opacity-40 shrink-0"
             >
@@ -386,6 +472,51 @@ export const KnowledgeDictPanel: React.FC = () => {
               同步
             </button>
           </div>
+
+          {/* 快捷掛載與產生 `?dict=` 分享連結按鈕列 */}
+          <div className="flex items-center justify-between gap-1 pt-0.5">
+            <button
+              type="button"
+              onClick={() => {
+                setSheetUrl(DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID);
+                handleSyncGoogleSheet(DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID, {
+                  silent: false,
+                });
+              }}
+              disabled={isSyncingSheet}
+              className="text-[10px] px-2 py-0.5 rounded bg-indigo-100/80 text-indigo-800 hover:bg-indigo-200/80 font-medium transition-colors truncate"
+              title="一鍵載入《HybTransPlus 地方創生字典 (1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E)》"
+            >
+              ⚡ 載入地方創生共編字典
+            </button>
+
+            <button
+              type="button"
+              onClick={handleCopyShareableDictUrl}
+              className="text-[10px] px-2 py-0.5 rounded bg-white border border-blue-200 text-blue-700 hover:bg-blue-50 flex items-center gap-1 shrink-0 transition-colors"
+              title="複製帶有 ?dict=<SheetID> 參數的分享連結，別人點開即自動預設載入此字典"
+            >
+              {copiedShareLink ? (
+                <>
+                  <Check className="w-3 h-3 text-emerald-600" />
+                  <span className="text-emerald-700 font-medium">已複製 ?dict= 連結</span>
+                </>
+              ) : (
+                <>
+                  <Share2 className="w-3 h-3" />
+                  <span>複製 ?dict= 分享連結</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {urlMountedSheetId && (
+            <div className="text-[10px] text-blue-700 bg-blue-100/60 px-2 py-0.5 rounded flex items-center justify-between">
+              <span className="truncate">
+                已掛載參數：<code>?dict={urlMountedSheetId}</code>
+              </span>
+            </div>
+          )}
         </div>
       )}
 
@@ -395,7 +526,7 @@ export const KnowledgeDictPanel: React.FC = () => {
           <input
             ref={dictJsonInputRef}
             type="file"
-            accept=".json"
+            accept=".json,.csv,.txt"
             onChange={handleImportJson}
             className="hidden"
           />
@@ -405,7 +536,7 @@ export const KnowledgeDictPanel: React.FC = () => {
             className="px-1.5 py-0.5 hover:bg-slate-100 rounded text-slate-600 flex items-center gap-0.5"
           >
             <Upload className="w-3 h-3" />
-            <span>匯入JSON</span>
+            <span>匯入JSON/CSV</span>
           </button>
           <button
             type="button"
@@ -454,13 +585,13 @@ export const KnowledgeDictPanel: React.FC = () => {
           type="text"
           value={newAliases}
           onChange={(e) => setNewAliases(e.target.value)}
-          placeholder="選填：同音錯字，以逗號分隔 (如：臨處長, 凌處長)"
+          placeholder="選填：同音錯字，以逗號或分號分隔 (如：臨處長; 凌處長)"
           className="w-full text-[11px] px-2 py-1 border border-slate-200 rounded bg-white focus:outline-none focus:border-blue-400"
         />
       </form>
 
       {statusMsg && (
-        <div className="text-[11px] px-2 py-1 bg-emerald-50 text-emerald-800 rounded border border-emerald-200">
+        <div className="text-[11px] px-2 py-1 bg-emerald-50 text-emerald-800 rounded border border-emerald-200 break-all">
           {statusMsg}
         </div>
       )}
@@ -487,7 +618,7 @@ export const KnowledgeDictPanel: React.FC = () => {
                   </div>
                   {hasAliases && (
                     <p className="text-[10px] text-slate-400 truncate mt-0.5">
-                      錯字修正：{item.aliases!.join('、')}
+                      別名/錯字：{item.aliases!.join('、')}
                     </p>
                   )}
                 </div>
