@@ -1,18 +1,12 @@
 // src/components/editor/TranscriptEditor.tsx
-// 修正重點：
-// 1. 解決轉寫結束後「3 張聲學預分析大卡片自動彈出佔滿畫面，導致看不到逐字稿結果」之 UX 問題：
-//    - 僅在「剛選取音檔、尚未開始轉寫 (`segments.length === 0 && !isRunning`)」或使用者主動點擊展開時，才顯示完整 3 方案大面板。
-//    - 一旦進入轉寫或已有逐字稿結果 (`segments.length > 0`)，自動收合為「單行精簡狀態列」，將 85% 以上垂直空間留給逐字稿檢視！
-// 2. 明確區分兩大後續動作，消除「不知道是要重來一次還是要順稿」的混淆：
-//    - 按鈕一：【✨ AI 全文順稿與詞彙統一（不重跑音訊）】 -> 直接針對現有逐字稿執行 Stage 1 跨句修復與同音詞統一（1~2 秒完成，保留所有修改與時間軸）。
-//    - 按鈕二：【⚙️ 換方案重新轉寫（展開聲學體檢卡）】 -> 展開方案 A/B/C 面板，供想切換語者分離參數並從頭重跑音檔的使用者使用。
-
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
+  BookOpen,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Download,
   HelpCircle,
   Info,
   Loader2,
@@ -21,8 +15,11 @@ import {
   RotateCcw,
   ShieldCheck,
   Sparkles,
+  Trash2,
+  Users,
   Volume2,
   Wand2,
+  X,
 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import { usePipelineScheduler } from '../../hooks/usePipelineScheduler';
@@ -37,7 +34,7 @@ import {
 import { AudioRecommendationOption, Segment } from '../../types';
 
 /**
- * 內建浮出式說明視窗組件 (零外部路徑依賴，徹底避免 ts(2307) 找不到 ../common/HoverInfoPopover)
+ * 內建浮出式說明視窗組件（支援電腦滑鼠懸停與手機/平板點擊展開，手機端自動置中防裁切）
  */
 const HoverInfoPopover: React.FC<{
   label?: string;
@@ -46,9 +43,26 @@ const HoverInfoPopover: React.FC<{
   align?: 'left' | 'right';
 }> = ({ label, title, children, align = 'right' }) => {
   const [pinned, setPinned] = useState(false);
+  const popRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!pinned) return;
+    const handleOutside = (e: MouseEvent | TouchEvent) => {
+      if (popRef.current && !popRef.current.contains(e.target as Node)) {
+        setPinned(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('touchstart', handleOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('touchstart', handleOutside);
+    };
+  }, [pinned]);
 
   return (
     <div
+      ref={popRef}
       className="relative inline-flex items-center group"
       onMouseLeave={() => setPinned(false)}
     >
@@ -59,7 +73,7 @@ const HoverInfoPopover: React.FC<{
           setPinned((prev) => !prev);
         }}
         aria-label={title}
-        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-indigo-600 focus:text-indigo-600 transition-colors cursor-pointer focus:outline-none"
+        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-indigo-600 focus:text-indigo-600 transition-colors cursor-pointer focus:outline-none p-0.5"
       >
         <HelpCircle className="w-3.5 h-3.5 shrink-0" />
         {label && (
@@ -70,17 +84,31 @@ const HoverInfoPopover: React.FC<{
       </button>
 
       <div
-        className={`absolute ${
-          align === 'right' ? 'right-0' : 'left-0'
-        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
+        className={`max-sm:fixed max-sm:left-3 max-sm:right-3 max-sm:top-16 max-sm:w-auto sm:absolute ${
+          align === 'right' ? 'sm:right-0' : 'sm:left-0'
+        } sm:top-full sm:mt-1.5 z-50 sm:w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
           pinned
             ? 'opacity-100 visible pointer-events-auto'
-            : 'opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
+            : 'opacity-0 invisible pointer-events-none sm:group-hover:opacity-100 sm:group-hover:visible sm:group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
         }`}
       >
-        <div className="font-semibold text-white mb-1 flex items-center gap-1.5 border-b border-slate-700/80 pb-1">
-          <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-          <span>{title}</span>
+        <div className="font-semibold text-white mb-1 flex items-center justify-between gap-1.5 border-b border-slate-700/80 pb-1">
+          <span className="flex items-center gap-1.5">
+            <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+            <span>{title}</span>
+          </span>
+          {pinned && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setPinned(false);
+              }}
+              className="text-slate-400 hover:text-white p-0.5 sm:hidden"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
         <div className="text-slate-300 space-y-1 font-normal">{children}</div>
       </div>
@@ -122,12 +150,12 @@ function renderSentenceIntegrityBadge(seg: Segment) {
   let badgeLabel = '✨ Stage 1 句意已修復';
   if (hasTailDrop) badgeLabel = '✨ 已歸還跨段掉落尾字';
   else if (hasHeadStolen) badgeLabel = '✨ 已取回前段誤搶句首詞';
-  else if (hasSelfQa) badgeLabel = '✨ 已拆解自問自答並移轉語者';
+  else if (hasSelfQa) badgeLabel = '✨ 已校準問答語用與語者';
   else if (hasSyntaxMerge) badgeLabel = '✨ 已合併換氣斷裂殘句';
   else if (hasHallucination) badgeLabel = '✨ 已剝離摩擦重複幻覺';
 
   return (
-    <div className="inline-flex items-center gap-1 mt-1">
+    <div className="inline-flex items-center gap-1 sm:mt-1">
       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-medium">
         <ShieldCheck className="w-3 h-3 shrink-0" />
         {badgeLabel}
@@ -148,7 +176,13 @@ function renderSentenceIntegrityBadge(seg: Segment) {
   );
 }
 
-export const TranscriptEditor: React.FC = () => {
+export interface TranscriptEditorProps {
+  onOpenMobileSettings?: (tab: 'speakers' | 'dictionary') => void;
+}
+
+export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
+  onOpenMobileSettings,
+}) => {
   const {
     segments,
     speakers,
@@ -172,12 +206,31 @@ export const TranscriptEditor: React.FC = () => {
   } = usePipelineScheduler();
   const { audioRef, seekToWord, handleTimeUpdate } = useAudioPlayerSync();
 
-  // 控制「全場聲學體檢與 3 方案大面板」是否手動展開：
-  // 當已有逐字稿結果 (segments.length > 0) 或正在轉寫時，預設自動收合為單行精簡橫條，不遮擋逐字稿！
   const [manualExpandPreAnalysis, setManualExpandPreAnalysis] =
     useState<boolean>(false);
   const [isPolishingText, setIsPolishingText] = useState<boolean>(false);
   const [polishFeedback, setPolishFeedback] = useState<string | null>(null);
+  const [showMobileExportMenu, setShowMobileExportMenu] =
+    useState<boolean>(false);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!showMobileExportMenu) return;
+    const handleOutside = (e: MouseEvent | TouchEvent) => {
+      if (
+        exportMenuRef.current &&
+        !exportMenuRef.current.contains(e.target as Node)
+      ) {
+        setShowMobileExportMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('touchstart', handleOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('touchstart', handleOutside);
+    };
+  }, [showMobileExportMenu]);
 
   const hasTranscript = segments.length > 0;
 
@@ -186,7 +239,6 @@ export const TranscriptEditor: React.FC = () => {
     if (!file) return;
     setManualExpandPreAnalysis(true);
     setPolishFeedback(null);
-    // 【方向一】：取得音檔後立刻進行 3~5 秒全場多點深度聲學預分析，找出最佳參數建議供使用者選擇後再啟動！
     await preAnalyzeAudioFile(file);
   };
 
@@ -202,12 +254,14 @@ export const TranscriptEditor: React.FC = () => {
   const handlePolishOnlyWithoutRerun = async () => {
     if (isPolishingText || isRunning || segments.length === 0) return;
     setIsPolishingText(true);
-    setPolishFeedback('正在執行「Stage 1 跨句結構修復 + Stage 2 全場詞彙統一順稿」（不重跑音訊）...');
+    setPolishFeedback(
+      '正在執行「Stage 1 跨句結構修復 + Stage 2 全場詞彙統一順稿」（不重跑音訊）...'
+    );
     try {
       const fixedCount = await triggerRetroactivePass();
       setPolishFeedback(
         fixedCount > 0
-          ? `✅ 全文順稿完成！共自動修復 ${fixedCount} 處跨句結構與同音詞彙（可直接點擊下方橘底/紅底詞彙微調）。`
+          ? `✅ 全文順稿完成！共自動修復 ${fixedCount} 處跨句結構與同音詞彙（可直接點擊下方綠底/黃底詞彙檢視或微調）。`
           : '✅ 全文順稿檢查完成！目前跨句語意與全場詞彙已全數一致。'
       );
       setTimeout(() => setPolishFeedback(null), 5000);
@@ -216,10 +270,6 @@ export const TranscriptEditor: React.FC = () => {
     }
   };
 
-  // 是否展開完整 3 卡片面板：
-  // 1. 正在執行 3~5 秒預分析時 -> 顯示預分析進度卡
-  // 2. 尚未產生逐字稿 (!hasTranscript) 且未在轉寫中 (!isRunning) -> 自動顯示完整 3 方案卡片供啟動前選擇
-  // 3. 已產生逐字稿 (hasTranscript) 或轉寫中 (isRunning) -> 預設收合為 1 行精簡導覽列，除非使用者主動點「換方案重新轉寫」展開
   const showFullPreAnalysisCards =
     Boolean(audioFile) &&
     (isPreAnalyzingAudio ||
@@ -232,17 +282,17 @@ export const TranscriptEditor: React.FC = () => {
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden">
-      {/* 頂部工具列 */}
-      <div className="flex items-center justify-between px-5 py-2.5 bg-white border-b border-slate-200 gap-2 flex-wrap">
-        <div className="flex items-center gap-2.5 flex-wrap">
-          <label className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold px-3.5 py-1.5 rounded cursor-pointer shadow-xs transition-colors">
+      {/* 頂部工具列 (RWD 自適應：支援手機單手操作、平板與桌機完整並列) */}
+      <div className="flex items-center justify-between px-3 sm:px-5 py-2 sm:py-2.5 bg-white border-b border-slate-200 gap-2 flex-wrap shrink-0">
+        <div className="flex items-center gap-2 flex-wrap w-full sm:w-auto">
+          <label className="bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white text-xs font-semibold px-3 sm:px-3.5 py-1.5 rounded-lg cursor-pointer shadow-xs transition-colors text-center">
             {isRunning
-              ? '微批次流水線轉寫中...'
+              ? '微批次轉寫中...'
               : isPreAnalyzingAudio
-              ? '正在全場聲學深度預分析...'
+              ? '聲學預分析中...'
               : audioFile
-              ? '更換會議錄音檔'
-              : '載入會議錄音檔 (MP3/WAV/M4A)'}
+              ? '更換錄音檔'
+              : '載入會議錄音檔'}
             <input
               type="file"
               accept="audio/*"
@@ -257,47 +307,43 @@ export const TranscriptEditor: React.FC = () => {
             <button
               type="button"
               onClick={() => handleConfirmAndLaunch()}
-              className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold px-3.5 py-1.5 rounded shadow-xs transition-colors cursor-pointer"
+              className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold px-3 sm:px-3.5 py-1.5 rounded-lg shadow-xs transition-colors cursor-pointer"
             >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              套用推薦方案並開始轉寫
+              <Play className="w-3.5 h-3.5 fill-current shrink-0" />
+              <span>套用推薦方案並開始轉寫</span>
             </button>
           )}
 
-          {/* 已有逐字稿結果且非轉寫中時：明確並列「✨ AI 全文順稿 (不重跑音訊)」與「🔄 換方案重新轉寫」 */}
+          {/* 已有逐字稿結果且非轉寫中時：明確並列「✨ AI 全文順稿」與「換方案重跑」 */}
           {hasTranscript && !isRunning && (
             <>
               <button
                 type="button"
                 onClick={handlePolishOnlyWithoutRerun}
                 disabled={isPolishingText}
-                className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-xs font-semibold px-3.5 py-1.5 rounded shadow-xs transition-colors cursor-pointer"
-                title="保留目前逐字稿與時間軸，僅針對文字重新執行 Stage 1 跨句修復與全場詞彙統一順稿（約 1~2 秒）"
+                className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-xs transition-colors cursor-pointer"
               >
                 {isPolishingText ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
                 ) : (
-                  <Wand2 className="w-3.5 h-3.5" />
+                  <Wand2 className="w-3.5 h-3.5 shrink-0" />
                 )}
-                ✨ AI 全文順稿（不重跑音訊）
+                <span>✨ AI 全文順稿</span>
               </button>
 
               <button
                 type="button"
-                onClick={() =>
-                  setManualExpandPreAnalysis((prev) => !prev)
-                }
-                className={`inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded border transition-colors cursor-pointer ${
+                onClick={() => setManualExpandPreAnalysis((prev) => !prev)}
+                className={`inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition-colors cursor-pointer ${
                   manualExpandPreAnalysis
                     ? 'bg-slate-800 text-white border-slate-800'
                     : 'text-slate-700 hover:bg-slate-100 bg-slate-50 border-slate-300'
                 }`}
-                title="展開聲學體檢面板，可改選其他語者分離方案（A/B/C）並重新轉寫音檔"
               >
-                <RotateCcw className="w-3.5 h-3.5" />
-                {manualExpandPreAnalysis
-                  ? '收起方案選擇面板'
-                  : '換方案重新轉寫'}
+                <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                <span>
+                  {manualExpandPreAnalysis ? '收起方案面板' : '換方案重跑'}
+                </span>
                 {manualExpandPreAnalysis ? (
                   <ChevronUp className="w-3.5 h-3.5" />
                 ) : (
@@ -307,74 +353,149 @@ export const TranscriptEditor: React.FC = () => {
             </>
           )}
 
-          {audioUrl && (
+          {/* 右側匯出區 (手機/平板收納於下拉選單，桌機完整展開) */}
+          <div className="flex items-center gap-1.5 ml-auto sm:ml-0">
+            <button
+              type="button"
+              onClick={() => exportAsDocx(segments, speakers)}
+              disabled={!segments.length}
+              className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white text-xs font-semibold px-2.5 sm:px-3 py-1.5 rounded-lg cursor-pointer transition-colors"
+            >
+              📄 <span className="hidden xs:inline">匯出 </span>Word
+            </button>
+
+            {/* 桌機大螢幕 (xl+) 直接展開所有匯出按鈕 */}
+            <div className="hidden xl:flex items-center gap-1.5 text-xs">
+              <button
+                type="button"
+                onClick={() => exportAsMarkdown(segments, speakers)}
+                disabled={!segments.length}
+                className="border border-slate-200 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+              >
+                匯出 Markdown
+              </button>
+              <button
+                type="button"
+                onClick={() => exportAsSrt(segments, speakers)}
+                disabled={!segments.length}
+                className="border border-slate-200 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+              >
+                匯出 SRT
+              </button>
+              <button
+                type="button"
+                onClick={() => exportProjectJson(segments, speakers)}
+                disabled={!segments.length}
+                className="border border-slate-200 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
+              >
+                專案 JSON
+              </button>
+              {segments.length > 0 && (
+                <button
+                  type="button"
+                  onClick={clearTranscript}
+                  className="border border-rose-300 text-rose-600 hover:bg-rose-50 px-2.5 py-1.5 rounded-lg cursor-pointer"
+                >
+                  清空紀錄
+                </button>
+              )}
+            </div>
+
+            {/* 手機與平板 (<xl)：收納為「更多匯出 ▾」選單，節省工具列空間 */}
+            <div ref={exportMenuRef} className="relative xl:hidden">
+              <button
+                type="button"
+                disabled={!segments.length}
+                onClick={() => setShowMobileExportMenu((prev) => !prev)}
+                className="inline-flex items-center gap-1 border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 text-slate-700 text-xs font-medium px-2.5 py-1.5 rounded-lg cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>更多</span>
+                <ChevronDown className="w-3 h-3" />
+              </button>
+
+              {showMobileExportMenu && segments.length > 0 && (
+                <div className="absolute right-0 top-full mt-1.5 w-44 bg-white border border-slate-200 rounded-xl shadow-xl p-1.5 z-40 text-xs space-y-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      exportAsMarkdown(segments, speakers);
+                      setShowMobileExportMenu(false);
+                    }}
+                    className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 font-medium cursor-pointer"
+                  >
+                    📝 匯出 Markdown (.md)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      exportAsSrt(segments, speakers);
+                      setShowMobileExportMenu(false);
+                    }}
+                    className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 font-medium cursor-pointer"
+                  >
+                    🎬 匯出字幕檔 (.srt)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      exportProjectJson(segments, speakers);
+                      setShowMobileExportMenu(false);
+                    }}
+                    className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 font-medium cursor-pointer"
+                  >
+                    💾 匯出專案備份 (.json)
+                  </button>
+                  <div className="border-t border-slate-100 my-1" />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      clearTranscript();
+                      setShowMobileExportMenu(false);
+                    }}
+                    className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-rose-50 text-rose-600 font-medium flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>清空目前逐字稿</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* 音訊播放器：手機端自動滿版寬度方便手指拖曳時間軸，電腦端維持精緻寬度 */}
+        {audioUrl && (
+          <div className="w-full sm:w-auto pt-0.5 sm:pt-0">
             <audio
               ref={audioRef}
               src={audioUrl}
               controls
               onTimeUpdate={handleTimeUpdate}
-              className="h-8 max-w-[240px]"
+              className="h-8 w-full sm:w-56 md:w-64"
             />
-          )}
-        </div>
-
-        <div className="flex gap-1.5 text-xs">
-          <button
-            onClick={() => exportAsDocx(segments, speakers)}
-            disabled={!segments.length}
-            className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-semibold px-3 py-1.5 rounded cursor-pointer"
-          >
-            📄 匯出 Word (.docx)
-          </button>
-          <button
-            onClick={() => exportAsMarkdown(segments, speakers)}
-            disabled={!segments.length}
-            className="border px-2.5 py-1.5 rounded hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
-          >
-            匯出 Markdown
-          </button>
-          <button
-            onClick={() => exportAsSrt(segments, speakers)}
-            disabled={!segments.length}
-            className="border px-2.5 py-1.5 rounded hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
-          >
-            匯出 SRT
-          </button>
-          <button
-            onClick={() => exportProjectJson(segments, speakers)}
-            disabled={!segments.length}
-            className="border px-2.5 py-1.5 rounded hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
-          >
-            專案 JSON
-          </button>
-          {segments.length > 0 && (
-            <button
-              onClick={clearTranscript}
-              className="border border-rose-300 text-rose-600 hover:bg-rose-50 px-2.5 py-1.5 rounded cursor-pointer"
-            >
-              清空紀錄
-            </button>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
-      {/* 轉寫中或完成後之「單行精簡聲學資訊與操作提示列」（不佔用畫面高度） */}
+      {/* 轉寫中或完成後之「單行精簡聲學資訊與操作提示列」 */}
       {audioPreAnalysis && !showFullPreAnalysisCards && (
-        <div className="bg-slate-50 border-b border-slate-200 px-5 py-1.5 flex items-center justify-between gap-3 flex-wrap text-xs">
+        <div className="bg-slate-50 border-b border-slate-200 px-3 sm:px-5 py-1.5 flex items-center justify-between gap-2 flex-wrap text-xs shrink-0">
           <div className="flex items-center gap-2 text-slate-600 flex-wrap">
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 font-semibold border border-indigo-200 text-[11px]">
-              <Activity className="w-3 h-3" />
-              目前採用：{activePresetOption?.badge || '方案 A'}（預估{' '}
-              {config.minSpeakers}~{config.maxSpeakers} 人）
+              <Activity className="w-3 h-3 shrink-0" />
+              <span>
+                {activePresetOption?.badge || '方案 A'}（{config.minSpeakers}~
+                {config.maxSpeakers} 人）
+              </span>
             </span>
             <span className="text-[11px] text-slate-500">
-              SNR {audioPreAnalysis.snrDb}dB · 換人頻率{' '}
-              {audioPreAnalysis.turnSwitchRatePerMin} 次/分 · 重疊率{' '}
-              {(audioPreAnalysis.overlapRatio * 100).toFixed(1)}%
+              SNR {audioPreAnalysis.snrDb}dB · 換人{' '}
+              {audioPreAnalysis.turnSwitchRatePerMin}次/分
             </span>
             {hasTranscript && !isRunning && (
-              <span className="text-[11px] text-emerald-700 font-medium">
-                💡 提示：點擊字詞可聽原音或選同音候選詞；想潤飾全文請點上方「✨ AI 全文順稿」，想換參數重跑請點「換方案重新轉寫」。
+              <span className="text-[11px] text-emerald-700 font-medium hidden md:inline">
+                💡 點擊字詞可聽原音或選同音候選詞；想潤飾全文請點「✨ AI 全文順稿」。
               </span>
             )}
           </div>
@@ -384,38 +505,38 @@ export const TranscriptEditor: React.FC = () => {
             onClick={() => setManualExpandPreAnalysis(true)}
             className="inline-flex items-center gap-1 text-[11px] text-indigo-600 hover:text-indigo-800 font-medium cursor-pointer shrink-0"
           >
-            檢視完整聲學報告與 3 方案卡片
+            <span>聲學報告與方案</span>
             <ChevronDown className="w-3.5 h-3.5" />
           </button>
         </div>
       )}
 
       {polishFeedback && (
-        <div className="bg-emerald-50 border-b border-emerald-200 px-5 py-2 text-xs text-emerald-800 font-medium flex items-center justify-between">
+        <div className="bg-emerald-50 border-b border-emerald-200 px-3 sm:px-5 py-2 text-xs text-emerald-800 font-medium flex items-center justify-between gap-2 shrink-0">
           <span>{polishFeedback}</span>
           <button
             type="button"
             onClick={() => setPolishFeedback(null)}
-            className="text-emerald-600 hover:text-emerald-900 text-[11px] ml-4"
+            className="text-emerald-600 hover:text-emerald-900 text-[11px] shrink-0"
           >
             關閉
           </button>
         </div>
       )}
 
-      {/* 【方向一】：3~5 秒全文深度聲學預分析與 3 組白話情境方案選擇面板（僅在啟動前或使用者主動展開時顯示） */}
+      {/* 【方向一】：3~5 秒全文深度聲學預分析與 3 組白話情境方案選擇面板 */}
       {showFullPreAnalysisCards && (
-        <div className="bg-slate-50 border-b border-slate-200 px-6 py-3.5 space-y-3 max-h-[54vh] overflow-y-auto">
+        <div className="bg-slate-50 border-b border-slate-200 px-3 sm:px-6 py-3 space-y-3 max-h-[65dvh] sm:max-h-[56vh] overflow-y-auto shrink-0">
           {isPreAnalyzingAudio ? (
-            <div className="bg-white rounded-xl border border-indigo-200 p-4 shadow-xs space-y-2.5">
-              <div className="flex items-center justify-between text-xs">
-                <div className="flex items-center gap-2 font-semibold text-indigo-900">
+            <div className="bg-white rounded-xl border border-indigo-200 p-3.5 sm:p-4 shadow-xs space-y-2.5">
+              <div className="flex items-center justify-between text-xs gap-2">
+                <div className="flex items-center gap-2 font-semibold text-indigo-900 min-w-0">
                   <Loader2 className="w-4 h-4 text-indigo-600 animate-spin shrink-0" />
-                  <span>
-                    正在對《{audioFile?.name}》執行全場多點深度聲學預分析（約 3～5 秒）...
+                  <span className="truncate">
+                    正在對《{audioFile?.name}》執行全場多點聲學預分析（約 3～5 秒）...
                   </span>
                 </div>
-                <span className="font-bold text-indigo-700">
+                <span className="font-bold text-indigo-700 shrink-0">
                   {preAnalysisProgress.percent}%
                 </span>
               </div>
@@ -432,16 +553,18 @@ export const TranscriptEditor: React.FC = () => {
             </div>
           ) : (
             audioPreAnalysis && (
-              <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs space-y-3">
+              <div className="bg-white rounded-xl border border-slate-200 p-3 sm:p-4 shadow-xs space-y-3">
                 {/* 頂部摘要與指標徽章 */}
                 <div className="flex flex-wrap items-start justify-between gap-2 border-b border-slate-100 pb-2">
-                  <div className="space-y-1 flex-1 min-w-[260px]">
+                  <div className="space-y-1 flex-1 min-w-[220px]">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 font-semibold text-xs border border-indigo-200">
-                        <Volume2 className="w-3.5 h-3.5" />
-                        全場深度聲學體檢完成 (抽樣{' '}
-                        {audioPreAnalysis.sampledWindowsCount} 區段 /{' '}
-                        {audioPreAnalysis.sampledDurationSec} 秒)
+                        <Volume2 className="w-3.5 h-3.5 shrink-0" />
+                        <span>
+                          全場深度聲學體檢完成 (抽樣{' '}
+                          {audioPreAnalysis.sampledWindowsCount} 區段 /{' '}
+                          {audioPreAnalysis.sampledDurationSec} 秒)
+                        </span>
                       </span>
                       <span className="text-[11px] text-slate-400">
                         耗時{' '}
@@ -450,11 +573,6 @@ export const TranscriptEditor: React.FC = () => {
                         )}{' '}
                         秒
                       </span>
-                      {hasTranscript && (
-                        <span className="text-[11px] px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-medium">
-                          ⚠️ 注意：下方卡片用於「更換語者分離參數並從頭重新轉寫」；若只需順稿請點上方「✨ AI 全文順稿」或直接收合此面板。
-                        </span>
-                      )}
                     </div>
                     <p className="text-xs text-slate-700 leading-relaxed">
                       {audioPreAnalysis.plainSummary}
@@ -467,10 +585,9 @@ export const TranscriptEditor: React.FC = () => {
                         type="button"
                         onClick={() => preAnalyzeAudioFile(audioFile)}
                         className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-200 text-[11px] text-slate-600 hover:bg-slate-50 cursor-pointer"
-                        title="重新掃描音檔聲學特徵"
                       >
                         <RefreshCw className="w-3 h-3" />
-                        重新檢測
+                        <span>重新檢測</span>
                       </button>
                     )}
                     <button
@@ -479,19 +596,19 @@ export const TranscriptEditor: React.FC = () => {
                       className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-slate-100 hover:bg-slate-200 text-[11px] font-medium text-slate-700 cursor-pointer"
                     >
                       <ChevronUp className="w-3.5 h-3.5" />
-                      收合面板（檢視逐字稿）
+                      <span>收合面板</span>
                     </button>
                   </div>
                 </div>
 
-                {/* 關鍵聲學指標列 */}
+                {/* 關鍵聲學指標列 (RWD: 手機 2 欄、電腦 5 欄) */}
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-[11px]">
                   <div className="bg-slate-50 rounded-lg px-2.5 py-1.5 border border-slate-200/80">
                     <div className="text-slate-400">環境信噪比 (SNR)</div>
                     <div className="font-bold text-slate-800">
                       {audioPreAnalysis.snrDb} dB{' '}
                       <span className="font-normal text-slate-500">
-                        (底噪 {audioPreAnalysis.noiseFloorDb} dBFS)
+                        ({audioPreAnalysis.noiseFloorDb} dBFS)
                       </span>
                     </div>
                   </div>
@@ -500,8 +617,7 @@ export const TranscriptEditor: React.FC = () => {
                     <div className="font-bold text-slate-800">
                       {audioPreAnalysis.pitchSpreadSemitones} 半音{' '}
                       <span className="font-normal text-slate-500">
-                        ({audioPreAnalysis.f0P10Hz}~{audioPreAnalysis.f0P90Hz}
-                        Hz)
+                        ({audioPreAnalysis.f0P10Hz}~{audioPreAnalysis.f0P90Hz}Hz)
                       </span>
                     </div>
                   </div>
@@ -526,7 +642,7 @@ export const TranscriptEditor: React.FC = () => {
                       </span>
                     </div>
                   </div>
-                  <div className="bg-slate-50 rounded-lg px-2.5 py-1.5 border border-slate-200/80">
+                  <div className="bg-slate-50 rounded-lg px-2.5 py-1.5 border border-slate-200/80 col-span-2 sm:col-span-1">
                     <div className="text-slate-400">預估語者人數</div>
                     <div className="font-bold text-blue-700">
                       {audioPreAnalysis.estimatedMinSpeakers} ～{' '}
@@ -535,8 +651,8 @@ export const TranscriptEditor: React.FC = () => {
                   </div>
                 </div>
 
-                {/* 3 組白話情境推薦卡片 */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {/* 3 組白話情境推薦卡片 (手機單欄垂直排列、電腦三欄並列) */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 sm:gap-3">
                   {audioPreAnalysis.recommendations.map((opt) => {
                     const isSelected = selectedPresetId === opt.id;
                     return (
@@ -588,44 +704,18 @@ export const TranscriptEditor: React.FC = () => {
                               {opt.recommendedMinSpeakers}～
                               {opt.recommendedMaxSpeakers} 人
                             </div>
-                            {opt.diarizationPatch.formulaCalibration && (
-                              <div className="pt-0.5 text-[10px] text-indigo-700 font-medium">
-                                <strong>底層聲學公式動態閥值：</strong>
-                                諧波門檻{" "}
-                                {
-                                  opt.diarizationPatch.formulaCalibration
-                                    .harmonicityGateThreshold
-                                }{" "}
-                                · 邊界波峰{" "}
-                                {
-                                  opt.diarizationPatch.formulaCalibration
-                                    .scdPeakCutoff
-                                }{" "}
-                                · 微觀視窗{" "}
-                                {
-                                  opt.diarizationPatch.formulaCalibration
-                                    .maxMicroTurnSec
-                                }
-                                s · 階躍 ≥
-                                {
-                                  opt.diarizationPatch.formulaCalibration
-                                    .stepDbDiffFloor
-                                }
-                                dB
-                              </div>
-                            )}
                           </div>
                         </div>
 
-                        <div className="pt-2.5 mt-2 border-t border-slate-100 flex items-center justify-between">
+                        <div className="pt-2.5 mt-2 border-t border-slate-100 flex items-center justify-between gap-2">
                           <span className="text-[11px] font-medium text-blue-700 flex items-center gap-1">
                             {isSelected ? (
                               <>
-                                <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
-                                目前已選取此方案
+                                <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                                <span>目前已選取</span>
                               </>
                             ) : (
-                              '點選切換此方案'
+                              '點選切換'
                             )}
                           </span>
                           {!isRunning && (
@@ -635,15 +725,15 @@ export const TranscriptEditor: React.FC = () => {
                                 e.stopPropagation();
                                 handleConfirmAndLaunch(opt);
                               }}
-                              className={`px-2.5 py-1 rounded text-[11px] font-semibold transition-colors cursor-pointer ${
+                              className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors cursor-pointer ${
                                 isSelected
                                   ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
                                   : 'bg-slate-800 hover:bg-slate-900 text-white'
                               }`}
                             >
                               {hasTranscript
-                                ? '🔄 改用此方案重新轉寫'
-                                : '▶ 以此方案啟動轉寫'}
+                                ? '🔄 以此方案重跑'
+                                : '▶ 以此方案啟動'}
                             </button>
                           )}
                         </div>
@@ -660,30 +750,32 @@ export const TranscriptEditor: React.FC = () => {
                       <strong className="text-slate-800">
                         {config.minSpeakers}～{config.maxSpeakers} 人
                       </strong>{' '}
-                      · 檢核管線已啟用{' '}
+                      · 已啟用{' '}
                       <strong className="text-indigo-700">
-                        「Stage 1 先抓句子語意完整性 → Stage 2 單詞槽位精修」
+                        「先句後詞兩階段語意與槽位精修」
                       </strong>
                     </span>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
                       {hasTranscript && (
                         <button
                           type="button"
                           onClick={() => setManualExpandPreAnalysis(false)}
-                          className="px-3.5 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-100 font-semibold cursor-pointer"
+                          className="px-3 py-1.5 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-100 font-semibold cursor-pointer"
                         >
-                          保留目前結果並收合
+                          保留結果並收合
                         </button>
                       )}
                       <button
                         type="button"
                         onClick={() => handleConfirmAndLaunch()}
-                        className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-4 py-1.5 rounded-lg shadow-sm transition-colors cursor-pointer"
+                        className="inline-flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-4 py-1.5 rounded-lg shadow-sm transition-colors cursor-pointer flex-1 sm:flex-initial"
                       >
                         <Play className="w-3.5 h-3.5 fill-current" />
-                        {hasTranscript
-                          ? '套用新方案並重新轉寫全檔'
-                          : '確認方案並開始轉寫'}
+                        <span>
+                          {hasTranscript
+                            ? '套用新方案並重新轉寫'
+                            : '確認方案並開始轉寫'}
+                        </span>
                       </button>
                     </div>
                   </div>
@@ -694,40 +786,72 @@ export const TranscriptEditor: React.FC = () => {
         </div>
       )}
 
-      {/* 逐字稿段落列表 */}
-      <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-white">
+      {/* 逐字稿段落列表 (RWD：手機為上下堆疊卡片讓文字佔滿 100% 寬度；平板與電腦為左右分欄) */}
+      <div className="flex-1 overflow-y-auto p-3 sm:p-5 md:p-6 space-y-2.5 sm:space-y-4 bg-white">
         {segments.length === 0 && !isPreAnalyzingAudio && (
-          <div className="h-full flex flex-col items-center justify-center text-center text-slate-400 space-y-2 py-12">
-            <p className="text-sm font-medium text-slate-500">
+          <div className="h-full flex flex-col items-center justify-center text-center text-slate-400 space-y-3 py-10 px-4">
+            <p className="text-sm font-medium text-slate-600">
               {audioFile
                 ? '請於上方確認聲學預分析推薦方案，並點擊「確認方案並開始轉寫」'
                 : '請點擊左上角「載入會議錄音檔」開始 3～5 秒全文深度聲學預分析'}
             </p>
-            <p className="text-xs text-slate-400 max-w-md">
+            <p className="text-xs text-slate-400 max-w-md leading-relaxed">
               系統將自動完成全場多點聲學體檢、推薦最佳語者分離參數，並以「先句後詞（先修跨段尾字掉落與句子完整性，再修同音單詞）」雙階段檢核產出高品質逐字稿。
             </p>
+
+            {/* 手機/平板快速設定捷徑按鈕 */}
+            {onOpenMobileSettings && (
+              <div className="flex items-center gap-2 pt-2 lg:hidden flex-wrap justify-center">
+                <button
+                  type="button"
+                  onClick={() => onOpenMobileSettings('speakers')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs text-slate-700 font-medium cursor-pointer"
+                >
+                  <Users className="w-3.5 h-3.5 text-blue-600" />
+                  <span>設定會議人數與情境</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenMobileSettings('dictionary')}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-xs text-slate-700 font-medium cursor-pointer"
+                >
+                  <BookOpen className="w-3.5 h-3.5 text-indigo-600" />
+                  <span>同步字典或上傳簡報</span>
+                </button>
+              </div>
+            )}
           </div>
         )}
 
         {segments.map((seg) => {
           const sp = speakers[seg.speakerId];
+          const timeStr = `${Math.floor(seg.start / 60)}:${String(
+            Math.floor(seg.start % 60)
+          ).padStart(2, '0')}`;
+
           return (
-            <div key={seg.id} className="flex gap-4 items-start">
-              <div className="w-36 shrink-0 pt-0.5">
-                <span
-                  className="inline-block text-xs font-bold px-2 py-0.5 rounded text-white"
-                  style={{ backgroundColor: sp?.color || '#475569' }}
-                >
-                  {sp?.name || seg.speakerId}
-                </span>
-                <div className="text-[11px] text-slate-400 mt-0.5">
-                  {Math.floor(seg.start / 60)}:
-                  {String(Math.floor(seg.start % 60)).padStart(2, '0')}
+            <div
+              key={seg.id}
+              className="flex flex-col sm:flex-row gap-1.5 sm:gap-4 items-start p-2.5 sm:p-0 rounded-xl sm:rounded-none border sm:border-0 border-slate-100 bg-slate-50/40 sm:bg-transparent"
+            >
+              {/* 語者標籤與時間戳：手機端單行橫向排列，平板/電腦端左側固定寬度欄 */}
+              <div className="w-full sm:w-32 md:w-36 shrink-0 sm:pt-0.5 flex sm:block items-center justify-between gap-2 flex-wrap">
+                <div className="flex items-center gap-2 sm:block">
+                  <span
+                    className="inline-block text-xs font-bold px-2 py-0.5 rounded text-white shadow-2xs"
+                    style={{ backgroundColor: sp?.color || '#475569' }}
+                  >
+                    {sp?.name || seg.speakerId}
+                  </span>
+                  <div className="text-[11px] text-slate-400 sm:mt-0.5 font-mono">
+                    {timeStr}
+                  </div>
                 </div>
                 {renderSentenceIntegrityBadge(seg)}
               </div>
 
-              <div className="flex-1 text-sm leading-relaxed text-slate-800">
+              {/* 逐字稿文字區：手機端佔滿 100% 寬度且字體微幅放大 (15px) 利於閱讀與點擊 */}
+              <div className="w-full sm:flex-1 text-[15px] sm:text-sm leading-relaxed text-slate-800 break-words">
                 {seg.words.map((w, idx) => {
                   const isWordActive =
                     currentTime >= w.start && currentTime <= w.end;
@@ -738,7 +862,7 @@ export const TranscriptEditor: React.FC = () => {
                       wordIndex={idx}
                       word={w}
                       isActive={isWordActive}
-                      onPlaySnippet={seekToWord}
+                      onPlaySnippet={(start) => seekToWord(start)}
                     />
                   );
                 })}

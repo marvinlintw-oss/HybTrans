@@ -9,7 +9,7 @@ export const DEFAULT_PUBLIC_DICTIONARY: DictEntry[] =
   getBuiltinTaiwanMeetingDictionary();
 
 /**
- * 預設支援快速掛載之《HybTransPlus 地方創生字典》Google Sheet ID 與完整網址
+ * 預設支援快速掛載之《地方創生共編字典》Google Sheet ID 與完整網址
  */
 export const DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID =
   '1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E';
@@ -139,7 +139,7 @@ export function resolveGoogleSheetEndpoint(
 }
 
 /**
- * 產生包含 `?dict=<GoogleSheetID>` 的可分享完整網址（例如 `http://xxx.xxx.xxx/HybTransPlus?dict=1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E`）
+ * 產生包含 `?dict=<GoogleSheetID>` 的可分享完整網址（例如 `https://marvinlintw-oss.github.io/HybTrans/?dict=1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E`）
  */
 export function buildShareableDictUrl(inputUrlOrId?: string | null): string {
   const target = safeTrim(inputUrlOrId) || DEFAULT_REGIONAL_REVITALIZATION_SHEET_ID;

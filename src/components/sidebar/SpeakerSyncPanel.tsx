@@ -111,9 +111,9 @@ const HoverInfoPopover: React.FC<{
       </button>
 
       <div
-        className={`absolute ${
-          align === 'right' ? 'right-0' : 'left-0'
-        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
+        className={`max-sm:fixed max-sm:left-3 max-sm:right-3 max-sm:top-16 max-sm:w-auto sm:absolute ${
+          align === 'right' ? 'sm:right-0' : 'sm:left-0'
+        } sm:top-full sm:mt-1.5 z-50 sm:w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
           pinned
             ? 'opacity-100 visible pointer-events-auto'
             : 'opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
@@ -556,7 +556,7 @@ export const SpeakerSyncPanel: React.FC = () => {
           >
             <span className="flex items-center gap-1">
               <Settings2 className="w-3 h-3" />
-              參數設定（預設最佳化，一般無須調整）
+              進階聲學參數設定（預設已最佳化，一般無須調整）
             </span>
             {showAdvancedTech ? (
               <ChevronUp className="w-3.5 h-3.5" />
@@ -701,7 +701,7 @@ export const SpeakerSyncPanel: React.FC = () => {
       </div>
 
       {/* 3. 語者清單與更名 */}
-      <div className="space-y-1.5 max-h-48 overflow-y-auto pr-0.5">
+      <div className="space-y-1.5 max-h-64 lg:max-h-48 overflow-y-auto pr-0.5">
         {speakerList.length === 0 ? (
           <div className="text-xs text-slate-400 text-center py-3 bg-slate-50 rounded-lg border border-dashed border-slate-200">
             上傳音檔開始轉寫後將自動識別與會語者

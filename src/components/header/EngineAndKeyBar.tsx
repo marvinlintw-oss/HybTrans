@@ -1,5 +1,5 @@
 // src/components/header/EngineAndKeyBar.tsx
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Cpu,
   Cloud,
@@ -9,6 +9,7 @@ import {
   CheckCircle,
   HelpCircle,
   Info,
+  X,
 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import { GranularityTier, HardwareProbeResult } from '../../types';
@@ -19,7 +20,7 @@ import {
 } from '../../services/modelCacheManager';
 
 /**
- * 內建互動式說明浮出視窗（支援滑鼠懸停與點擊展開，確保所有 ⓘ 圖示皆有豐富且即時的說明內容）
+ * 內建互動式說明浮出視窗（支援電腦滑鼠懸停與手機/平板觸控點擊展開，手機端自動置中防超出螢幕邊界）
  */
 const HoverInfoPopover: React.FC<{
   label?: string;
@@ -28,9 +29,26 @@ const HoverInfoPopover: React.FC<{
   align?: 'left' | 'right';
 }> = ({ label, title, children, align = 'left' }) => {
   const [pinned, setPinned] = useState(false);
+  const popRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!pinned) return;
+    const handleOutside = (e: MouseEvent | TouchEvent) => {
+      if (popRef.current && !popRef.current.contains(e.target as Node)) {
+        setPinned(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('touchstart', handleOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('touchstart', handleOutside);
+    };
+  }, [pinned]);
 
   return (
     <div
+      ref={popRef}
       className="relative inline-flex items-center group"
       onMouseLeave={() => setPinned(false)}
     >
@@ -41,7 +59,7 @@ const HoverInfoPopover: React.FC<{
           setPinned((prev) => !prev);
         }}
         aria-label={title}
-        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-blue-600 focus:text-blue-600 transition-colors cursor-pointer focus:outline-none"
+        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-blue-600 focus:text-blue-600 transition-colors cursor-pointer focus:outline-none p-0.5"
       >
         <Info className="w-3.5 h-3.5 shrink-0" />
         {label && (
@@ -52,17 +70,31 @@ const HoverInfoPopover: React.FC<{
       </button>
 
       <div
-        className={`absolute ${
-          align === 'right' ? 'right-0' : 'left-0'
-        } top-full mt-1.5 z-50 w-80 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
+        className={`max-sm:fixed max-sm:left-3 max-sm:right-3 max-sm:top-14 max-sm:w-auto sm:absolute ${
+          align === 'right' ? 'sm:right-0' : 'sm:left-0'
+        } sm:top-full sm:mt-1.5 z-50 sm:w-80 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
           pinned
             ? 'opacity-100 visible pointer-events-auto'
-            : 'opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
+            : 'opacity-0 invisible pointer-events-none sm:group-hover:opacity-100 sm:group-hover:visible sm:group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
         }`}
       >
-        <div className="font-semibold text-white mb-1.5 flex items-center gap-1.5 border-b border-slate-700/80 pb-1">
-          <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-          <span>{title}</span>
+        <div className="font-semibold text-white mb-1.5 flex items-center justify-between gap-1.5 border-b border-slate-700/80 pb-1">
+          <span className="flex items-center gap-1.5">
+            <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+            <span>{title}</span>
+          </span>
+          {pinned && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setPinned(false);
+              }}
+              className="text-slate-400 hover:text-white p-0.5 sm:hidden"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
         <div className="text-slate-300 space-y-1.5 font-normal">{children}</div>
       </div>
@@ -98,24 +130,24 @@ export const EngineAndKeyBar: React.FC = () => {
   );
 
   return (
-    <header className="bg-white border-b border-slate-200 px-4 py-2.5 shadow-sm">
-      <div className="w-full flex flex-wrap items-center justify-start gap-4">
+    <header className="bg-white border-b border-slate-200 px-3 sm:px-4 py-2 sm:py-2.5 shadow-sm shrink-0">
+      <div className="w-full flex flex-wrap items-center justify-between sm:justify-start gap-2 sm:gap-3.5">
         {/* 1. 系統標題與硬體環境說明 Popover */}
-        <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-blue-600 flex items-center justify-center text-white font-bold text-xs shadow-sm">
+        <div className="flex items-center gap-2">
+          <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-blue-600 flex items-center justify-center text-white font-bold text-xs shadow-sm shrink-0">
             HT
           </div>
-          <div className="flex items-center gap-1.5">
-            <h1 className="font-bold text-slate-800 text-sm">
+          <div className="flex items-center gap-1">
+            <h1 className="font-bold text-slate-800 text-xs sm:text-sm tracking-tight">
               HybridTranscriber
             </h1>
             <HoverInfoPopover
-              title="系統架構與本機硬體環境狀態"
+              title="系統架構與裝置硬體環境狀態"
               align="left"
             >
               <p>
                 • <strong>偵測硬體：</strong>
-                {probe ? probe.adapterName : '正在偵測 WebGPU 顯示卡環境...'}
+                {probe ? probe.adapterName : '正在偵測 WebGPU 運算環境...'}
               </p>
               <p>
                 • <strong>模型快取佔用：</strong>
@@ -124,22 +156,22 @@ export const EngineAndKeyBar: React.FC = () => {
                   : '計算中...'}
               </p>
               <p>
-                • <strong>長音檔微批次流水線：</strong>
-                自動以 5 分鐘為單位切片處理，支援 2～4 小時大型會議錄音且不佔滿記憶體。
+                • <strong>跨裝置支援：</strong>
+                桌機與筆電支援本機免金鑰 WebGPU 運算；手機與平板建議點選「雲端高速」搭配 API Key 享受極速轉寫。
               </p>
             </HoverInfoPopover>
           </div>
         </div>
 
-        {/* 2. 電腦效能與細膩度規格選單 */}
-        <div className="flex items-center gap-1.5 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200">
+        {/* 2. 電腦效能與細膩度規格選單 (手機端自動調整寬度防溢出) */}
+        <div className="flex items-center gap-1 bg-slate-50 px-2 sm:px-2.5 py-1 rounded-lg border border-slate-200 max-w-full">
           <Gauge className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-          <div className="text-xs flex items-center gap-1.5">
+          <div className="text-xs flex items-center gap-1 min-w-0">
             <label
               htmlFor="tier-select"
-              className="text-slate-500 font-medium"
+              className="text-slate-500 font-medium hidden xs:inline shrink-0"
             >
-              效能模式:
+              效能:
             </label>
             <select
               id="tier-select"
@@ -147,7 +179,7 @@ export const EngineAndKeyBar: React.FC = () => {
               onChange={(e) =>
                 applyGranularityTier(e.target.value as GranularityTier)
               }
-              className="font-semibold text-slate-800 bg-transparent focus:outline-none cursor-pointer"
+              className="font-semibold text-slate-800 bg-transparent focus:outline-none cursor-pointer max-w-[145px] sm:max-w-none truncate text-[11px] sm:text-xs"
             >
               {(Object.keys(TIER_PRESET_SPECS) as GranularityTier[]).map(
                 (tKey) => {
@@ -162,7 +194,7 @@ export const EngineAndKeyBar: React.FC = () => {
                 }
               )}
             </select>
-            <span className="hidden sm:inline-block text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 font-medium">
+            <span className="hidden md:inline-block text-[10px] px-1.5 py-0.5 rounded bg-blue-50 text-blue-700 border border-blue-200 font-medium shrink-0">
               Beam={config.asrBeamSize || currentSpec.asrBeamSize} · 重聽
               {config.maxRelistenQuota ?? currentSpec.maxRelistenQuotaPerChunk}段
             </span>
@@ -189,50 +221,50 @@ export const EngineAndKeyBar: React.FC = () => {
           </HoverInfoPopover>
         </div>
 
-        {/* 3. 引擎切換與 API Key */}
-        <div className="flex items-center gap-2">
+        {/* 3. 引擎切換、API Key 與使用說明 */}
+        <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
           <div className="inline-flex rounded-lg border border-slate-200 p-0.5 bg-slate-100">
             <button
               type="button"
               onClick={() => updateConfig({ mode: 'local_webgpu' })}
-              className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-all ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-md text-[11px] sm:text-xs font-medium transition-all cursor-pointer ${
                 isLocalMode
                   ? 'bg-white text-blue-600 shadow-sm'
                   : 'text-slate-600 hover:text-slate-800'
               }`}
             >
-              <Cpu className="w-3.5 h-3.5" />
-              本機免金鑰
+              <Cpu className="w-3.5 h-3.5 shrink-0" />
+              <span>本機免金鑰</span>
             </button>
             <button
               type="button"
               onClick={() => updateConfig({ mode: 'byok_cloud' })}
-              className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-all ${
+              className={`flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-md text-[11px] sm:text-xs font-medium transition-all cursor-pointer ${
                 !isLocalMode
                   ? 'bg-white text-indigo-600 shadow-sm'
                   : 'text-slate-600 hover:text-slate-800'
               }`}
             >
-              <Cloud className="w-3.5 h-3.5" />
-              雲端高速
+              <Cloud className="w-3.5 h-3.5 shrink-0" />
+              <span>雲端高速</span>
             </button>
           </div>
 
           <button
             type="button"
             onClick={() => setShowKeyModal(!showKeyModal)}
-            className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors ${
+            className={`flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-lg text-[11px] sm:text-xs font-medium border transition-colors cursor-pointer ${
               hasGeminiKey
                 ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
                 : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
             }`}
           >
             {hasGeminiKey ? (
-              <CheckCircle className="w-3.5 h-3.5" />
+              <CheckCircle className="w-3.5 h-3.5 shrink-0" />
             ) : (
-              <Key className="w-3.5 h-3.5" />
+              <Key className="w-3.5 h-3.5 shrink-0" />
             )}
-            {hasGeminiKey ? 'API 已連線' : 'API Key'}
+            <span>{hasGeminiKey ? 'API 已連線' : 'API Key'}</span>
           </button>
 
           {/* 4. 快速上手指南 Popover */}
@@ -244,24 +276,33 @@ export const EngineAndKeyBar: React.FC = () => {
             <button
               type="button"
               onClick={() => setShowHelpPopover(!showHelpPopover)}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-slate-500 hover:text-blue-600 hover:bg-blue-50 border border-transparent hover:border-blue-100 transition-colors"
+              className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] sm:text-xs text-slate-500 hover:text-blue-600 hover:bg-blue-50 border border-transparent hover:border-blue-100 transition-colors cursor-pointer"
             >
-              <HelpCircle className="w-4 h-4" />
-              <span>使用說明</span>
+              <HelpCircle className="w-4 h-4 shrink-0" />
+              <span className="hidden sm:inline">使用說明</span>
             </button>
 
             {showHelpPopover && (
-              <div className="absolute left-0 top-full mt-1.5 w-80 bg-white border border-slate-200 rounded-xl shadow-lg p-3.5 z-50 text-xs text-slate-700 space-y-2">
+              <div className="max-sm:fixed max-sm:left-3 max-sm:right-3 max-sm:top-14 sm:absolute sm:right-0 lg:left-0 sm:top-full mt-1.5 sm:w-80 bg-white border border-slate-200 rounded-xl shadow-xl p-3.5 z-50 text-xs text-slate-700 space-y-2">
                 <div className="font-semibold text-slate-900 border-b border-slate-100 pb-1.5 flex items-center justify-between">
                   <span>快速上手指南（三步驟）</span>
-                  <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded">
-                    支援 2~4 小時音檔
-                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[10px] text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded">
+                      支援手機 / 平板 / 電腦
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowHelpPopover(false)}
+                      className="text-slate-400 hover:text-slate-700 sm:hidden"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 </div>
                 <ol className="space-y-1.5 text-[11px] text-slate-600 list-decimal list-inside">
                   <li>
                     <strong className="text-slate-800">確認與會人數：</strong>
-                    於左側面板點選預估的會議人數範圍（例如 2～6 人）。
+                    於「語者與情境」面板點選預估會議人數範圍（例如 2～6 人）。
                   </li>
                   <li>
                     <strong className="text-slate-800">載入字典或簡報：</strong>
@@ -280,7 +321,7 @@ export const EngineAndKeyBar: React.FC = () => {
 
       {/* 內顯硬體防呆提示列 */}
       {hardwareWarning && (
-        <div className="mt-2 px-3 py-1 bg-amber-50 border border-amber-200 rounded-lg inline-flex items-center gap-1.5 text-xs text-amber-800">
+        <div className="mt-2 px-3 py-1 bg-amber-50 border border-amber-200 rounded-lg inline-flex items-center gap-1.5 text-[11px] sm:text-xs text-amber-800">
           <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
           <span>{hardwareWarning}</span>
         </div>

@@ -46,9 +46,9 @@ const HoverInfoPopover: React.FC<{
       </button>
 
       <div
-        className={`absolute ${
-          align === 'right' ? 'right-0' : 'left-0'
-        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
+        className={`max-sm:fixed max-sm:left-3 max-sm:right-3 max-sm:top-16 max-sm:w-auto sm:absolute ${
+          align === 'right' ? 'sm:right-0' : 'sm:left-0'
+        } sm:top-full sm:mt-1.5 z-50 sm:w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
           pinned
             ? 'opacity-100 visible pointer-events-auto'
             : 'opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
@@ -79,7 +79,8 @@ import {
 
 type ActiveTab = 'public' | 'personal' | 'session';
 
-const GSHEET_STORAGE_KEY = 'hybrid_transcriber_gsheet_dict_url';
+// 獨立命名空間：避免與同網域 /HybTransPlus/ 的儲存鍵衝突
+const GSHEET_STORAGE_KEY = 'hybtrans_rwd_gsheet_dict_url_v10';
 
 interface ParsedDocCompatResult {
   summary: string;
@@ -547,7 +548,7 @@ export const KnowledgeDictPanel: React.FC = () => {
               }}
               disabled={isSyncingSheet}
               className="text-[10px] px-2 py-0.5 rounded bg-indigo-100/80 text-indigo-800 hover:bg-indigo-200/80 font-medium transition-colors truncate"
-              title="一鍵載入《HybTransPlus 地方創生字典 (1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E)》"
+              title="一鍵載入《地方創生共編字典 (1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E)》"
             >
               ⚡ 載入地方創生共編字典
             </button>
@@ -659,7 +660,7 @@ export const KnowledgeDictPanel: React.FC = () => {
       )}
 
       {/* 詞彙列表 */}
-      <div className="space-y-1 max-h-48 overflow-y-auto pr-1">
+      <div className="space-y-1 max-h-64 lg:max-h-48 overflow-y-auto pr-1">
         {currentList.length === 0 ? (
           <p className="text-xs text-slate-400 text-center py-3">尚無詞彙</p>
         ) : (

@@ -1,7 +1,8 @@
 {
-  "name": "hybrid-meeting-transcriber-saas",
+  "name": "hybtrans",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "HybTrans - 智慧語者分離與會議逐字稿系統 (RWD 跨裝置版，獨立部署於 /HybTrans/)",
   "type": "module",
   "scripts": {
     "dev": "vite",

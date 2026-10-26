@@ -1554,7 +1554,8 @@ export const useAppStore = create<AppState>()(
         set({ rollingMeetingSummary: summary, briefingSummary: summary }),
     }),
     {
-      name: 'hybrid-transcriber-storage-v9',
+      // 獨立命名空間：確保 https://marvinlintw-oss.github.io/HybTrans/ 與同網域之 /HybTransPlus/ 的 localStorage 100% 隔離互不覆蓋
+      name: 'hybtrans-rwd-storage-v10',
       partialize: (state) => ({
         config: state.config,
         dictionary: mergeDictLists(
@@ -1563,7 +1564,38 @@ export const useAppStore = create<AppState>()(
         ),
       }),
       merge: (persistedState, currentState) => {
-        const p = (persistedState || {}) as Partial<AppState>;
+        let p = (persistedState || {}) as Partial<AppState>;
+        // 若首次進入 /HybTrans/ 尚未建立獨立快取，單向唯讀繼承舊版 API Key（絕不寫回舊版鍵值，保護 HybTransPlus）
+        if (!p.config && typeof window !== 'undefined') {
+          try {
+            const legacyRaw = window.localStorage.getItem('hybrid-transcriber-storage-v9');
+            if (legacyRaw) {
+              const legacyParsed = JSON.parse(legacyRaw) as {
+                state?: {
+                  config?: {
+                    geminiApiKey?: string;
+                    groqApiKey?: string;
+                  };
+                };
+              };
+              const legacyCfg = legacyParsed?.state?.config;
+              if (legacyCfg) {
+                p = {
+                  ...p,
+                  config: {
+                    ...currentState.config,
+                    geminiApiKey:
+                      legacyCfg.geminiApiKey || currentState.config.geminiApiKey,
+                    groqApiKey:
+                      legacyCfg.groqApiKey || currentState.config.groqApiKey,
+                  },
+                };
+              }
+            }
+          } catch {
+            // 忽略單向讀取異常
+          }
+        }
         const mergedDiar: DiarizationConfig = {
           ...DEFAULT_DIARIZATION_CONFIG,
           ...(p.config?.diarizationConfig || {}),

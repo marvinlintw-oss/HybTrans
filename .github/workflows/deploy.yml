@@ -1,9 +1,10 @@
 # .github/workflows/deploy.yml
-name: Deploy to GitHub Pages
+# 專供 https://github.com/marvinlintw-oss/HybTrans 自動編譯並部署至 https://marvinlintw-oss.github.io/HybTrans/
+name: Deploy HybTrans to GitHub Pages
 
 on:
   push:
-    branches: ['main']
+    branches: ['main', 'master']
   workflow_dispatch:
 
 permissions:
@@ -12,7 +13,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: 'pages'
+  group: 'pages-hybtrans'
   cancel-in-progress: true
 
 jobs:
@@ -41,7 +42,7 @@ jobs:
             cp node_modules/coi-serviceworker/coi-serviceworker.min.js public/coi-serviceworker.min.js
           fi
 
-      - name: Build with Vite
+      - name: Build with Vite (Relative Base './' for /HybTrans/)
         run: npm run build
 
       - name: Setup Pages

@@ -27,7 +27,8 @@ const SPEAKER_PALETTE = [
   '#0891b2', '#dc2626', '#4f46e5', '#65a30d', '#ea580c',
 ];
 
-const LOCAL_MODEL_CACHE_NAME = 'hybrid-transcriber-local-models-v1';
+// 獨立模型快取命名空間，與 /HybTransPlus/ 互不干擾
+const LOCAL_MODEL_CACHE_NAME = 'hybtrans-rwd-local-models-v2';
 
 function resolvePublicRootUrl(relPath: string): string {
   const cleanRel = relPath.replace(/^(\.\/|\/)+/, '');
@@ -36,7 +37,7 @@ function resolvePublicRootUrl(relPath: string): string {
     ? href.split('/src/workers/')[0] + '/'
     : href.includes('/assets/')
     ? href.split('/assets/')[0] + '/'
-    : self.location.origin + '/';
+    : new URL('./', href).href;
   return `${baseRoot}${cleanRel}`;
 }
 
