@@ -969,9 +969,17 @@ export const useAppStore = create<AppState>()(
                 enableVirtualSpeakerTrackStitching: false,
               };
 
+        // 保留已由全場聲學預分析推導出之底層公式校準參數 (formulaCalibration)，避免切換效能模式時沖掉聲學適應閥值
+        const preservedCalibration =
+          currentDiar.formulaCalibration ||
+          get().audioPreAnalysis?.formulaCalibration;
+
         const nextDiar: DiarizationConfig = {
           ...currentDiar,
           ...tierDiarPatch,
+          ...(preservedCalibration
+            ? { formulaCalibration: preservedCalibration }
+            : {}),
         };
 
         set((state) => {

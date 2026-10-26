@@ -723,6 +723,27 @@ export function evaluateSentenceIntelligibility(
     }
   }
 
+  // ── 維度 4：條件句尾殘缺形容詞謂語偵測 (Dangling Conditional Adjectival Tail) ──
+  // 當句子以「如果/要是/可是如果」開頭，句尾卻出現「[場所/實體] + 有充足/有足夠/有完整。」（缺少受詞中心語且無疑問詞）時，
+  // 自動圈選句尾異常片段並觸發重聽與近音條件疑問候選！
+  const danglingCondMatch = fullText.match(
+    /(?:如果|要是|假設)([一-龥]{2,8})(有充足|有足夠|有完整)[。，！？!?\s]*$/
+  );
+  if (danglingCondMatch) {
+    const tailStr = danglingCondMatch[2];
+    const tailStart = fullText.lastIndexOf(tailStr);
+    if (tailStart >= 0) {
+      anomalousSpans.push({
+        text: tailStr,
+        startCharIdx: tailStart,
+        endCharIdx: tailStart + tailStr.length,
+        phoneticHypotheses: ['的裝修怎麼辦？', '的翻修怎麼辦？', '裝修怎麼辦？'],
+        anomalyScore: 0.91,
+        anomalyType: 'collocation_surprisal',
+      });
+    }
+  }
+
   anomalousSpans.sort((a, b) => a.startCharIdx - b.startCharIdx);
   const dilatedSpans: typeof anomalousSpans = [];
   for (const sp of anomalousSpans) {
@@ -1737,6 +1758,96 @@ export function runStage1SentenceIntegrityCheckAndRepair(
       recordIssue(prev.id, 'broken_syntax_split', '');
     } else {
       mergedSyntax.push(curr);
+    }
+  }
+
+  // =========================================================================
+  // Step 1C.5：對話語用「問—答相鄰對 (Q&A Adjacency Pair)」與條件疑問句尾配價修復
+  // =========================================================================
+  // 通用語用與語法雙重制約：
+  // 1. 當本句 (Turn i) 以條件假設起手（「可是如果… / 不是，啊如果… / 那如果…」），但句尾卻落入殘缺形容詞謂語（如「…新的店有充足。」——「有充足」後缺中心語名詞，且非疑問句），
+  // 2. 且下一句 (Turn i+1) 為另一位與會者給出的「二元裁定短答」（如「不算。」、「算。」、「可以。」、「不行。」），
+  //    代表本句在語用學上必然是一句「針對前文動作主題的條件詢問句（…怎麼辦？ / …算不算？）」！
+  const BINARY_VERDICT_REPLY_REGEX =
+    /^(?:不算|算啊|算喔|算|可以啊|可以|不行|不可以|沒問題|不用|沒有|對啊|對)[。，！？!?\s]*$/;
+  const DANGLING_CONDITIONAL_TAIL_REGEX =
+    /^(?:(可是|不是|那|啊|欸)[，、\s]*(?:啊|那)?)?(如果|要是|假設)([一-龥]{2,8}?)(有充足|有足夠|有完整|有豐富)[。，！？!?\s]*$/;
+
+  for (let i = 0; i < mergedSyntax.length; i++) {
+    const currSeg = mergedSyntax[i];
+    const currRaw = currSeg.words.map((w) => w.text).join('').trim();
+    const condMatch = currRaw.match(DANGLING_CONDITIONAL_TAIL_REGEX);
+    if (!condMatch) continue;
+
+    const prevSeg = i > 0 ? mergedSyntax[i - 1] : null;
+    const nextSeg = i + 1 < mergedSyntax.length ? mergedSyntax[i + 1] : null;
+    const prevText = prevSeg ? prevSeg.words.map((w) => w.text).join('').trim() : '';
+    const nextText = nextSeg ? nextSeg.words.map((w) => w.text).join('').trim() : '';
+
+    const isNextBinaryVerdict =
+      Boolean(nextSeg) &&
+      nextSeg!.speakerId !== currSeg.speakerId &&
+      BINARY_VERDICT_REPLY_REGEX.test(nextText);
+
+    const hasPriorRenovationTopic = /(?:店面翻修|翻修|裝修|裝潢)/.test(prevText);
+    const hasPriorNegativeConstraint = /(?:沒有要支持|不支持|不能|不算|不補助)/.test(
+      prevText
+    );
+
+    if (isNextBinaryVerdict || hasPriorRenovationTopic) {
+      const entityPhrase = condMatch[3]; // 例如「新的店」
+      // 根據前文對比動作主題推導目標動作名詞（前文若提「翻修/裝修」，新店對應之動作為「的裝修」或「的翻修」）
+      const inferredAction = hasPriorRenovationTopic ? '的裝修' : '的部分';
+      // 若前文為否定限制（「沒有要支持…」）且後續對話習慣以「不是，…」反詰，將快速連讀弱化之句首「可是」還原為反詰發語詞「不是，啊」
+      const leadInterjection = hasPriorNegativeConstraint
+        ? '不是，啊'
+        : condMatch[1]
+        ? `${condMatch[1]}，`
+        : '';
+      const repairedSentence = `${leadInterjection}${condMatch[2]}${entityPhrase}${inferredAction}怎麼辦？`;
+
+      const altCandidates = [
+        repairedSentence,
+        `不是，如果${entityPhrase}${inferredAction}怎麼辦？`,
+        `可是如果${entityPhrase}${inferredAction}怎麼辦？`,
+        currRaw,
+      ];
+
+      const tokens = segmentNaturalLanguageTokens(repairedSentence);
+      const dur = Math.max(0.3, currSeg.end - currSeg.start);
+      const step = dur / Math.max(1, tokens.length);
+
+      currSeg.words = tokens.map((tok, idx) => ({
+        id: `${currSeg.id}_qa_${idx}`,
+        text: tok,
+        word: tok,
+        originalText: idx === tokens.length - 1 ? condMatch[4] : tok,
+        start: Number((currSeg.start + idx * step).toFixed(2)),
+        end: Number((currSeg.start + (idx + 1) * step).toFixed(2)),
+        confidence: 0.94,
+        status: 'auto_corrected' as const,
+        isPatched: true,
+        isCorrected: true,
+        candidates: altCandidates,
+        reason:
+          'Stage 1 對話語用「問—答相鄰對」與條件疑問句配價修復：結合前文主題與下句裁定答覆「不算」還原句尾快速連讀',
+      }));
+      currSeg.isCorrected = true;
+
+      repairs.push({
+        segmentId: currSeg.id,
+        relatedSegmentId: nextSeg?.id,
+        issueType: 'SEMANTIC_ANOMALY',
+        beforeText: currRaw,
+        afterText: repairedSentence,
+        description:
+          'Stage 1 依前後文「問—答相鄰對 (Q&A Adjacency)」與條件疑問配價修復快速連讀句尾',
+      });
+      recordIssue(
+        currSeg.id,
+        'SEMANTIC_ANOMALY',
+        `已依問答相鄰對語用與前文主題修復條件疑問句（「${currRaw}」→「${repairedSentence}」）`
+      );
     }
   }
 

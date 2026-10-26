@@ -786,7 +786,8 @@ async function runWhisperWithWordTimestampsAndFallback(
   audioInput: Float32Array,
   resolvedWhisperLang: string,
   chunkLengthSec = 30,
-  strideLengthSec = 5
+  strideLengthSec = 5,
+  asrBeamSize = 1
 ): Promise<{
   chunks: Array<{ text: string; timestamp?: [number, number | null] }>;
   isWordLevel: boolean;
@@ -797,15 +798,26 @@ async function runWhisperWithWordTimestampsAndFallback(
   } | null = null;
   let isWordLevel = false;
 
+  const safeBeams = Math.max(1, Math.min(4, Math.round(asrBeamSize || 1)));
+  const effectiveChunkSec =
+    safeBeams === 1 ? Math.min(25, chunkLengthSec) : chunkLengthSec;
+  const effectiveStrideSec =
+    safeBeams === 1
+      ? Math.min(3, strideLengthSec)
+      : safeBeams >= 3
+      ? Math.max(6, strideLengthSec)
+      : strideLengthSec;
+
   // 先使用子句級時間戳記 (return_timestamps: true) 確保標點符號與完整語意結構不流失，
-  // 若單一 chunk 過長或無標點則結合聲學換人切點對齊！
+  // 並將效能模式對應之 Beam Search 寬度 (num_beams: 1 極速貪婪 / 2 平衡 / 3 深度束搜尋) 傳入推論管線！
   try {
     output = await transcriber(audioInput, {
       language: resolvedWhisperLang,
       task: 'transcribe',
       return_timestamps: true,
-      chunk_length_s: chunkLengthSec,
-      stride_length_s: strideLengthSec,
+      chunk_length_s: effectiveChunkSec,
+      stride_length_s: effectiveStrideSec,
+      num_beams: safeBeams,
     });
     isWordLevel = false;
   } catch {
@@ -818,8 +830,9 @@ async function runWhisperWithWordTimestampsAndFallback(
         language: resolvedWhisperLang,
         task: 'transcribe',
         return_timestamps: 'word',
-        chunk_length_s: chunkLengthSec,
-        stride_length_s: strideLengthSec,
+        chunk_length_s: effectiveChunkSec,
+        stride_length_s: effectiveStrideSec,
+        num_beams: safeBeams,
       });
       if (output && Array.isArray(output.chunks) && output.chunks.length > 0) {
         isWordLevel = true;
@@ -1456,6 +1469,7 @@ self.onmessage = async (event: MessageEvent) => {
       modelName,
       languageHint = 'zh',
       acousticThreshold = 0.72,
+      asrBeamSize = 2,
       backchannelMarginThreshold = 0.12,
       pingPongMaxDurSec = 1.5,
     } = data as {
@@ -1504,7 +1518,8 @@ self.onmessage = async (event: MessageEvent) => {
           audioInput,
           resolvedWhisperLang,
           30,
-          5
+          5,
+          asrBeamSize
         );
 
       const wordItems = normalizeWhisperChunksToWordItems(
@@ -1603,13 +1618,15 @@ self.onmessage = async (event: MessageEvent) => {
           ? 'japanese'
           : 'chinese';
 
+      // 局部放大重聽時強制啟用 Beam=2 深度解碼，提升微弱氣音與快速句尾之辨識解析力
       const { chunks: rawChunks } =
         await runWhisperWithWordTimestampsAndFallback(
           transcriber,
           audioInput,
           resolvedWhisperLang,
           20,
-          3
+          4,
+          2
         );
 
       const rawText = rawChunks

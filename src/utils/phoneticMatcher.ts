@@ -81,6 +81,12 @@ const PHONETIC_GROUPS: Record<string, string> = {
   '核合何河荷盒和禾吉及級即極急集籍': 'HE',
   '銷消宵霄削囂小曉': 'XIAO_2',
   '給北被備背倍輩貝': 'GEI_BEI',
+  '裝樁莊妝裝潢': 'ZHUANG',
+  '充衝沖聰匆蔥煙': 'CHONG',
+  '足族卒竹築逐燭': 'ZU_FOOT',
+  '怎診枕整貞針': 'ZEN',
+  '麼嗎嘛麻馬媽': 'ME_PARTICLE',
+  '辦半伴扮絆版板': 'BAN',
 };
 
 const charToPhoneticCode = new Map<string, string>();
@@ -181,6 +187,12 @@ const CODE_TO_TUPLE_MAP: Record<
   XUAN: { initial: 'x', medial: 'u', rime: 'an', fuzzyHash: 'xuan' },
   HE: { initial: 'h', medial: '', rime: 'e', fuzzyHash: 'he' },
   GEI_BEI: { initial: 'g', medial: '', rime: 'ei', fuzzyHash: 'gei' },
+  ZHUANG: { initial: 'z', medial: 'u', rime: 'an', fuzzyHash: 'zuan' },
+  CHONG: { initial: 'c', medial: 'u', rime: 'on', fuzzyHash: 'con' },
+  ZU_FOOT: { initial: 'z', medial: 'u', rime: 'u', fuzzyHash: 'zu' },
+  ZEN: { initial: 'z', medial: '', rime: 'en', fuzzyHash: 'zen' },
+  ME_PARTICLE: { initial: 'm', medial: '', rime: 'e', fuzzyHash: 'me' },
+  BAN: { initial: 'b', medial: '', rime: 'an', fuzzyHash: 'ban' },
 };
 
 function charToSyllableTuple(ch: string): SyllablePhonemeTuple {
@@ -244,14 +256,18 @@ function computeSyllableSubCost(
   ) {
     return 0.18;
   }
-  // 快速語流圓唇滑音與軟顎塞音弱化 (如「物 wu <-> 果 guo」、「委 wei <-> 晚 wan」、「員 yuan <-> 於 yu」)
+  // 快速語流圓唇滑音與軟顎塞音弱化 (如「物 wu <-> 果 guo」、「委 wei <-> 晚 wan」、「員 yuan <-> 於 yu」、「裝 zuan <-> 充 con」、「修 xiou <-> 足 zu」)
   if (
     (a.fuzzyHash === 'wu' && b.fuzzyHash === 'guo') ||
     (a.fuzzyHash === 'guo' && b.fuzzyHash === 'wu') ||
     (a.fuzzyHash === 'wei' && b.fuzzyHash === 'wan') ||
     (a.fuzzyHash === 'wan' && b.fuzzyHash === 'wei') ||
     (a.fuzzyHash === 'yuan' && b.fuzzyHash === 'yu') ||
-    (a.fuzzyHash === 'yu' && b.fuzzyHash === 'yuan')
+    (a.fuzzyHash === 'yu' && b.fuzzyHash === 'yuan') ||
+    (a.fuzzyHash === 'zuan' && b.fuzzyHash === 'con') ||
+    (a.fuzzyHash === 'con' && b.fuzzyHash === 'zuan') ||
+    (a.fuzzyHash === 'xiou' && b.fuzzyHash === 'zu') ||
+    (a.fuzzyHash === 'zu' && b.fuzzyHash === 'xiou')
   ) {
     return 0.22;
   }

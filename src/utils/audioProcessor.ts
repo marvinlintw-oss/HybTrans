@@ -317,17 +317,26 @@ export function applyVadGatedLookAheadLoudnessNormalization(
       (prevH >= 0.48 || nextH >= 0.48) &&
       frameRms[f] >= minSpeechRms * 0.65 &&
       frameRms[f] < Math.max(prevR, nextR) * 0.72;
-    const consonantClarityBonusDb = isInterVowelWeakConsonant ? 1.65 : 0.0;
+    // 針對疑問句尾或遠距插話尾段能量衰減（如「…的裝修怎麼辦」）提供平滑尾音托舉補償
+    const prev2R = f >= 2 ? frameRms[f - 2] : prevR;
+    const isTrailingQuestionDecay =
+      pVad >= 0.34 &&
+      prevH >= 0.45 &&
+      localRms < prev2R * 0.78 &&
+      localRms >= minSpeechRms * 0.75;
+    const consonantClarityBonusDb =
+      (isInterVowelWeakConsonant ? 1.55 : 0.0) +
+      (isTrailingQuestionDecay ? 1.45 : 0.0);
 
-    if (pVad < 0.3 || localRms < minSpeechRms) {
+    if (pVad < 0.28 || localRms < minSpeechRms) {
       targetFrameGain[f] = 1.0;
     } else if (localRms < targetRms || consonantClarityBonusDb > 0) {
       const dbCurrent = 20.0 * Math.log10(Math.max(1e-5, localRms));
-      const dbTarget = -18.8;
+      const dbTarget = -18.3;
       const dbDeficit = Math.max(0.0, dbTarget - dbCurrent);
       const boostDb = Math.min(
-        8.2,
-        dbDeficit * 0.5 * pVad + consonantClarityBonusDb
+        9.8,
+        dbDeficit * 0.68 * pVad + consonantClarityBonusDb
       );
       targetFrameGain[f] = Math.min(
         maxLinearGain,
@@ -340,16 +349,16 @@ export function applyVadGatedLookAheadLoudnessNormalization(
 
   const smoothedFrameGain = new Float32Array(numFrames);
   let currentGain = 1.0;
-  const alphaAttack = 0.5;
-  const alphaRelease = 0.08;
+  const alphaAttack = 0.58;
+  const alphaRelease = 0.065;
 
   for (let f = 0; f < numFrames; f++) {
     let lookAheadGain = targetFrameGain[f];
-    if (f + 1 < numFrames) {
-      lookAheadGain = Math.max(lookAheadGain, targetFrameGain[f + 1]);
-    }
-    if (f + 2 < numFrames) {
-      lookAheadGain = Math.max(lookAheadGain, targetFrameGain[f + 2]);
+    // 80ms (4 frames) 前瞻視窗：當遠距小聲語者（如女聲2）緊接在大聲語者後突然插話時，提前拉升包絡增益避免首字「不是」被吞沒
+    for (let la = 1; la <= 4; la++) {
+      if (f + la < numFrames) {
+        lookAheadGain = Math.max(lookAheadGain, targetFrameGain[f + la]);
+      }
     }
 
     if (lookAheadGain > currentGain) {
@@ -395,10 +404,11 @@ export function applyVadGatedLookAheadLoudnessNormalization(
     out[i] *= limiterEnv;
   }
 
-  // 【ASR 音頻細節強化】：針對 ASR 音軌施加 2650Hz (+2.3dB, Q=1.05) 聲母與 F2/F3 第二/三共振峰清晰度補償，
-  // 強化快速連讀中易衰減的流音/滑音 (/l/, /w/, /y/, /j/, /q/, /x/ 如「禮物」、「委員」、「工項」)，
-  // 而語者分離音軌 (Track 1) 仍保持 100% 純線性不經過此濾波！
-  return applyPresenceBoostBiquad(out, sampleRate, 2650, 2.3, 1.05);
+  // 【保持主轉寫音軌 100% 頻譜平坦無音染】：
+  // 主 ASR 視窗僅執行純線性音節包絡動態範圍正規化 (Syllabic Look-Ahead AGC)，不施加全視窗 Biquad EQ 染音，
+  // 避免會議室殘響環境下高頻齒音被過度放大而將快速句尾（如「的裝修怎麼辦」）模糊化；
+  // 2650Hz 共振峰增強僅保留於第二階段局部重聽 (`enhanceSubSegmentAudioForRelisten`)！
+  return out;
 }
 
 /**
@@ -563,13 +573,14 @@ export async function analyzeFullAudioAcousticProfile(
     totalDurationSec = Math.max(30, file.size / 16000);
   }
 
-  const windowDurSec = 7.5;
+  // 提升預分析全場抽樣密度：以 6.0 秒高解析探針涵蓋更多微觀插話區間（3 分鐘內音檔近乎 100% 全覆蓋掃描，長音檔最高 36 個探針點）
+  const windowDurSec = 6.0;
   const targetWindowCount =
-    totalDurationSec <= 180
-      ? Math.max(4, Math.ceil(totalDurationSec / windowDurSec))
+    totalDurationSec <= 216
+      ? Math.max(6, Math.ceil(totalDurationSec / windowDurSec))
       : totalDurationSec <= 900
-      ? 24
-      : 32;
+      ? 28
+      : 36;
 
   const nameLower = file.name.toLowerCase();
   const isWavOrMp3 =

@@ -48,7 +48,7 @@ const ENGINE_STRATEGY_GUIDES: Record<DiarizationEngineMode, ModeScenarioGuide> =
     mode_c_onnx_neural: {
       shortBadge: '同性別精細區分',
       optionLabel: '精細音色模式（多位同性別與會者）',
-      whyChoose: '針對聲音相近的同性別同事，強化細微腔調與音色共鳴的區分度。',
+      whyChoose: '針對聲音相近的同性別與會者，強化細微腔調與音色共鳴的區分度。',
       bestFor: '多位同性別與會者（如 3 女 1 男、全男或全女）且需要細分每個人時。',
       notFor: '現場環境雜音極大、麥克風離太遠，或想最快拿到初稿時。',
       techPrincipleTitle: 'WeSpeaker 256維雙尺度深度聲紋 + 短句延展',
@@ -70,7 +70,7 @@ const ENGINE_STRATEGY_GUIDES: Record<DiarizationEngineMode, ModeScenarioGuide> =
       optionLabel: '快速省電模式（長錄音 / 一般文書筆電）',
       whyChoose: '轉檔速度最快、最省電，適合先快速產出文字初稿再手動微調。',
       bestFor: '1～2 小時以上長錄音、輕薄文書筆電，或不在意同性別細分的情境。',
-      notFor: '有多位同性別同事且希望系統自動精準分出每個人時。',
+      notFor: '有多位同性別與會者，且需要系統自動精細區分每個人時。',
       techPrincipleTitle: '純 DSP 64維共振峰統計池化 (無須 ONNX 模型)',
       techPrincipleDetail:
         '全程使用輕量級 64 維 Kaldi Fbank 共振峰包絡與時序統計池化（TSTP），CPU 與記憶體負擔最低，老舊筆電也能流暢執行。',
@@ -86,11 +86,21 @@ const HoverInfoPopover: React.FC<{
   children: React.ReactNode;
   align?: 'left' | 'right';
 }> = ({ label, title, children, align = 'right' }) => {
+  const [pinned, setPinned] = useState(false);
+
   return (
-    <div className="relative inline-flex items-center group">
+    <div
+      className="relative inline-flex items-center group"
+      onMouseLeave={() => setPinned(false)}
+    >
       <button
         type="button"
-        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-indigo-600 transition-colors cursor-help focus:outline-none"
+        onClick={(e) => {
+          e.stopPropagation();
+          setPinned((prev) => !prev);
+        }}
+        aria-label={title}
+        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-indigo-600 focus:text-indigo-600 transition-colors cursor-pointer focus:outline-none"
       >
         <HelpCircle className="w-3.5 h-3.5 shrink-0" />
         {label && (
@@ -103,13 +113,17 @@ const HoverInfoPopover: React.FC<{
       <div
         className={`absolute ${
           align === 'right' ? 'right-0' : 'left-0'
-        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 opacity-0 invisible group-hover:opacity-100 group-hover:visible group-focus-within:opacity-100 group-focus-within:visible transition-all duration-150 pointer-events-none group-hover:pointer-events-auto`}
+        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
+          pinned
+            ? 'opacity-100 visible pointer-events-auto'
+            : 'opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
+        }`}
       >
         <div className="font-semibold text-white mb-1 flex items-center gap-1.5 border-b border-slate-700/80 pb-1">
           <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
           <span>{title}</span>
         </div>
-        <div className="text-slate-300 space-y-1">{children}</div>
+        <div className="text-slate-300 space-y-1 font-normal">{children}</div>
       </div>
     </div>
   );
@@ -136,6 +150,7 @@ export const SpeakerSyncPanel: React.FC = () => {
   const [nameInput, setNameInput] = useState('');
   const [mergeSourceId, setMergeSourceId] = useState<string>('');
   const [mergeTargetId, setMergeTargetId] = useState<string>('');
+  const [showScenarioGuide, setShowScenarioGuide] = useState<boolean>(false);
   const [showAdvancedTech, setShowAdvancedTech] = useState<boolean>(false);
 
   const diarCfg = config.diarizationConfig || {
@@ -389,30 +404,46 @@ export const SpeakerSyncPanel: React.FC = () => {
         </div>
       </div>
 
-      {/* 2. 會議情境模式選擇 (白話直覺版 + 浮出式技術說明) */}
+      {/* 2. 會議情境模式選擇 (預設收起適用情境說明，保持版面精簡，點擊或挑選時再展開) */}
       <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-2.5 space-y-2">
         <div className="flex items-center justify-between">
-          <span className="text-xs font-medium text-slate-700">
-            會議情境模式
-          </span>
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs font-medium text-slate-700">
+              會議情境模式
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowScenarioGuide((prev) => !prev)}
+              className="inline-flex items-center gap-0.5 text-[11px] text-indigo-600 hover:text-indigo-800 font-medium cursor-pointer transition-colors"
+            >
+              <span>{showScenarioGuide ? '收起情境說明' : '適用情境說明'}</span>
+              {showScenarioGuide ? (
+                <ChevronUp className="w-3 h-3" />
+              ) : (
+                <ChevronDown className="w-3 h-3" />
+              )}
+            </button>
+          </div>
           <HoverInfoPopover
-            label="技術原理說明"
+            label="技術原理"
             title={currentGuide.techPrincipleTitle}
             align="right"
           >
             <p>{currentGuide.techPrincipleDetail}</p>
             <p className="text-indigo-300 pt-1 border-t border-slate-700/80">
-              💡 系統已自動為此情境配好最佳分群與聲紋強化參數，一般使用無須手動調整。
+              💡 系統已自動為此情境配置最佳分群與聲紋強化參數，一般使用無須手動調整。
             </p>
           </HoverInfoPopover>
         </div>
 
         <select
           value={diarCfg.engineMode}
-          onChange={(e) =>
-            handleSelectEngineMode(e.target.value as DiarizationEngineMode)
-          }
-          className="w-full bg-white border border-slate-300 rounded-md px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:border-blue-500 shadow-2xs"
+          onFocus={() => setShowScenarioGuide(true)}
+          onChange={(e) => {
+            handleSelectEngineMode(e.target.value as DiarizationEngineMode);
+            setShowScenarioGuide(true);
+          }}
+          className="w-full bg-white border border-slate-300 rounded-md px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:border-blue-500 shadow-2xs cursor-pointer"
         >
           <option value="mode_0_heritage_classic">
             {ENGINE_STRATEGY_GUIDES.mode_0_heritage_classic.optionLabel}
@@ -428,21 +459,31 @@ export const SpeakerSyncPanel: React.FC = () => {
           </option>
         </select>
 
-        {/* 簡潔三行情境提示：為什麼選 / 適合 / 不適合 */}
-        <div className="rounded-md bg-white border border-slate-200/90 p-2 text-[11px] leading-relaxed space-y-1">
-          <div className="text-slate-800">
-            <span className="font-semibold text-indigo-700">💡 為什麼選：</span>
-            {currentGuide.whyChoose}
+        {/* 三行情境提示（預設收合，僅在點擊「適用情境說明」或挑選下拉選單時展開） */}
+        {showScenarioGuide && (
+          <div className="rounded-md bg-white border border-slate-200/90 p-2 text-[11px] leading-relaxed space-y-1 relative">
+            <button
+              type="button"
+              onClick={() => setShowScenarioGuide(false)}
+              className="float-right text-[10px] text-slate-400 hover:text-slate-600 ml-2 cursor-pointer"
+              title="收起說明"
+            >
+              收起 ✕
+            </button>
+            <div className="text-slate-800">
+              <span className="font-semibold text-indigo-700">💡 為什麼選：</span>
+              {currentGuide.whyChoose}
+            </div>
+            <div className="text-slate-700">
+              <span className="font-semibold text-emerald-700">✅ 適合情境：</span>
+              {currentGuide.bestFor}
+            </div>
+            <div className="text-slate-500">
+              <span className="font-semibold text-amber-700">⚠️ 不適合：</span>
+              {currentGuide.notFor}
+            </div>
           </div>
-          <div className="text-slate-700">
-            <span className="font-semibold text-emerald-700">✅ 適合情境：</span>
-            {currentGuide.bestFor}
-          </div>
-          <div className="text-slate-500">
-            <span className="font-semibold text-amber-700">⚠️ 不適合：</span>
-            {currentGuide.notFor}
-          </div>
-        </div>
+        )}
 
         {/* 會議語言與插話敏感度 (精簡直覺版) */}
         <div className="grid grid-cols-2 gap-1.5 pt-0.5">
@@ -515,7 +556,7 @@ export const SpeakerSyncPanel: React.FC = () => {
           >
             <span className="flex items-center gap-1">
               <Settings2 className="w-3 h-3" />
-              進階工程微調（一般同事無須調整）
+              參數設定（預設最佳化，一般無須調整）
             </span>
             {showAdvancedTech ? (
               <ChevronUp className="w-3.5 h-3.5" />
@@ -764,7 +805,7 @@ export const SpeakerSyncPanel: React.FC = () => {
               align="left"
             >
               <p>
-                若同一位同事因為某幾句笑聲或音量變化被分成兩個標籤（例如「語者 01」與「語者 04」其實是同一人），可在此將「語者 04」併入「語者 01」，全文會自動同步合併。
+                若同一位與會者因笑聲、咳嗽或音量變化被分成兩個標籤（例如「語者 01」與「語者 04」其實是同一人），可在此將「語者 04」併入「語者 01」，全文會自動同步合併。
               </p>
             </HoverInfoPopover>
           </div>

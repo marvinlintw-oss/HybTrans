@@ -17,6 +17,52 @@ import {
   Share2,
   Check,
 } from 'lucide-react';
+
+/**
+ * 內建互動式說明浮出視窗（支援滑鼠懸停與點擊切換，解決原生 title 無法即時顯示或看似空白的問題）
+ */
+const HoverInfoPopover: React.FC<{
+  title: string;
+  children: React.ReactNode;
+  align?: 'left' | 'right';
+}> = ({ title, children, align = 'left' }) => {
+  const [pinned, setPinned] = useState(false);
+
+  return (
+    <div
+      className="relative inline-flex items-center group"
+      onMouseLeave={() => setPinned(false)}
+    >
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          setPinned((prev) => !prev);
+        }}
+        aria-label={title}
+        className="inline-flex items-center text-slate-400 hover:text-indigo-600 focus:text-indigo-600 transition-colors cursor-pointer focus:outline-none"
+      >
+        <Info className="w-3.5 h-3.5 shrink-0" />
+      </button>
+
+      <div
+        className={`absolute ${
+          align === 'right' ? 'right-0' : 'left-0'
+        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
+          pinned
+            ? 'opacity-100 visible pointer-events-auto'
+            : 'opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
+        }`}
+      >
+        <div className="font-semibold text-white mb-1 flex items-center gap-1.5 border-b border-slate-700/80 pb-1">
+          <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+          <span>{title}</span>
+        </div>
+        <div className="text-slate-300 space-y-1 font-normal">{children}</div>
+      </div>
+    </div>
+  );
+};
 import { useAppStore } from '../../store/useAppStore';
 import { DictCategory, DictEntry } from '../../types';
 import * as docParserMod from '../../utils/docParser';
@@ -334,12 +380,20 @@ export const KnowledgeDictPanel: React.FC = () => {
         <div className="flex items-center gap-1.5">
           <BookOpen className="w-4 h-4 text-indigo-600" />
           <h3 className="font-semibold text-slate-800 text-sm">智慧字典與會議簡報</h3>
-          <span
-            title="支援透過網址參數 ?dict=<GoogleSheetID> 自動掛載團隊共編字典；亦支援手動貼上 Google Sheet 網址或 Sheet ID 同步。"
-            className="text-slate-400 hover:text-slate-600 cursor-help"
+          <HoverInfoPopover
+            title="三層智慧字典與會議簡報機制"
+            align="left"
           >
-            <Info className="w-3.5 h-3.5" />
-          </span>
+            <p>
+              • <strong>公共字典：</strong>預載台灣會議與地方創生常見專詞，支援連結 Google Sheet 團隊共編表。
+            </p>
+            <p>
+              • <strong>個人字典：</strong>保存在您的瀏覽器本機，適合記錄部門常用人名與縮寫。
+            </p>
+            <p>
+              • <strong>單次簡報：</strong>上傳本次會議的 <code>.pptx / .docx / .pdf</code>，系統會自動萃取投影片內的專有名詞投入先句後詞校對。
+            </p>
+          </HoverInfoPopover>
         </div>
         <span className="text-[11px] text-slate-500">共 {dictionary.length} 詞</span>
       </div>
@@ -417,12 +471,20 @@ export const KnowledgeDictPanel: React.FC = () => {
             <span className="flex items-center gap-1">
               <Link2 className="w-3.5 h-3.5 text-blue-600" />
               Google Sheet 共編與 ?dict= 網址掛載
-              <span
-                title="支援直接貼上 Google Sheet 網址或純 Sheet ID（例如 1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E），亦可透過網址列 ?dict=<SheetID> 讓開啟連結的人自動預設載入該字典！"
-                className="text-blue-400 hover:text-blue-600 cursor-help"
+              <HoverInfoPopover
+                title="如何共享與自動掛載 Google Sheet 字典？"
+                align="left"
               >
-                <Info className="w-3 h-3" />
-              </span>
+                <p>
+                  • <strong>直接輸入：</strong>可貼上完整 Google Sheet 網址或純 Sheet ID（須設為「知道連結的任何人可檢視」）。
+                </p>
+                <p>
+                  • <strong>網址參數分享：</strong>點擊下方「複製分享連結」，會自動產生帶有 <code>?dict=&lt;SheetID&gt;</code> 的專屬網址，其他人開啟該網址即會自動載入同一份字典。
+                </p>
+                <p>
+                  • <strong>表格欄位：</strong>支援「正確詞彙、分類、常見誤聽別名」三欄或「誤聽詞 → 正確詞」兩欄格式。
+                </p>
+              </HoverInfoPopover>
             </span>
             {resolvedEndpoint.canonicalViewUrl && (
               <a

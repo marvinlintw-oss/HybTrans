@@ -45,11 +45,21 @@ const HoverInfoPopover: React.FC<{
   children: React.ReactNode;
   align?: 'left' | 'right';
 }> = ({ label, title, children, align = 'right' }) => {
+  const [pinned, setPinned] = useState(false);
+
   return (
-    <div className="relative inline-flex items-center group">
+    <div
+      className="relative inline-flex items-center group"
+      onMouseLeave={() => setPinned(false)}
+    >
       <button
         type="button"
-        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-indigo-600 transition-colors cursor-help focus:outline-none"
+        onClick={(e) => {
+          e.stopPropagation();
+          setPinned((prev) => !prev);
+        }}
+        aria-label={title}
+        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-indigo-600 focus:text-indigo-600 transition-colors cursor-pointer focus:outline-none"
       >
         <HelpCircle className="w-3.5 h-3.5 shrink-0" />
         {label && (
@@ -62,13 +72,17 @@ const HoverInfoPopover: React.FC<{
       <div
         className={`absolute ${
           align === 'right' ? 'right-0' : 'left-0'
-        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 opacity-0 invisible group-hover:opacity-100 group-hover:visible group-focus-within:opacity-100 group-focus-within:visible transition-all duration-150 pointer-events-none group-hover:pointer-events-auto`}
+        } top-full mt-1.5 z-50 w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
+          pinned
+            ? 'opacity-100 visible pointer-events-auto'
+            : 'opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
+        }`}
       >
         <div className="font-semibold text-white mb-1 flex items-center gap-1.5 border-b border-slate-700/80 pb-1">
           <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
           <span>{title}</span>
         </div>
-        <div className="text-slate-300 space-y-1">{children}</div>
+        <div className="text-slate-300 space-y-1 font-normal">{children}</div>
       </div>
     </div>
   );

@@ -11,7 +11,6 @@ import {
   Square,
   FileText,
   ShieldCheck,
-  Wand2,
 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import { usePipelineScheduler } from '../../hooks/usePipelineScheduler';
@@ -40,11 +39,9 @@ const STAGE_LABEL_MAP: Record<ChunkStage, string> = {
 };
 
 export const MacroChunkProgress: React.FC = () => {
-  const { chunks, segments, config, modelDownload, rollingMeetingSummary } =
+  const { chunks, config, modelDownload, rollingMeetingSummary } =
     useAppStore();
-  const { isProcessing, stopPipeline, triggerRetroactivePass } =
-    usePipelineScheduler();
-  const [retroMsg, setRetroMsg] = useState<string | null>(null);
+  const { isProcessing, stopPipeline } = usePipelineScheduler();
   const [expandSummary, setExpandSummary] = useState<boolean>(false);
 
   const hasChunks = chunks.length > 0;
@@ -53,17 +50,6 @@ export const MacroChunkProgress: React.FC = () => {
   if (!hasChunks && !isDownloading) {
     return null;
   }
-
-  const handleManualRetroPass = async () => {
-    setRetroMsg('正在用全場詞彙與先句後詞引擎潤飾現有逐字稿（不重跑音訊）...');
-    const count = await triggerRetroactivePass();
-    setRetroMsg(
-      count > 0
-        ? `✨ 已回頭修正 ${count} 處跨句結構與同音詞！`
-        : '✨ 前後文句意與全場用語已全數一致！'
-    );
-    setTimeout(() => setRetroMsg(null), 3500);
-  };
 
   const totalChunks = chunks.length;
   const completedCount = chunks.filter(
@@ -111,12 +97,9 @@ export const MacroChunkProgress: React.FC = () => {
           </span>
 
           {isProcessing && (
-            <span
-              title="防電腦休眠保護已啟動：轉檔期間切換視窗或放置不管也不會進入睡眠中斷"
-              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] cursor-help"
-            >
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px]">
               <ShieldCheck className="w-3.5 h-3.5" />
-              防休眠中
+              防休眠保護已啟用
             </span>
           )}
 
@@ -156,26 +139,14 @@ export const MacroChunkProgress: React.FC = () => {
           )}
         </div>
 
-        {/* 右側：總進度條、「AI 全文順稿」與「停止轉檔」 */}
+        {/* 右側：總進度條與「停止轉檔」（避免與下方工具列的 AI 全文順稿按鈕重複） */}
         <div className="flex items-center gap-2">
-          {segments.length > 0 && (
-            <button
-              type="button"
-              onClick={handleManualRetroPass}
-              className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-medium text-xs transition-colors cursor-pointer"
-              title="不重跑音訊轉寫，僅利用目前累積至後文的完整詞彙與摘要，回頭重新順過所有文字（約 1~2 秒）"
-            >
-              <Wand2 className="w-3.5 h-3.5" />
-              AI 全文順稿（不重跑音訊）
-            </button>
-          )}
-
           {totalChunks > 0 && (
             <div className="flex items-center gap-1.5">
               <span className="text-[11px] text-slate-500 shrink-0">
                 {overallProgress}%
               </span>
-              <div className="w-20 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+              <div className="w-24 h-1.5 bg-slate-100 rounded-full overflow-hidden">
                 <div
                   className={`h-full transition-all duration-300 ${
                     isAllCompleted ? 'bg-emerald-500' : 'bg-blue-600'
@@ -198,12 +169,6 @@ export const MacroChunkProgress: React.FC = () => {
           )}
         </div>
       </div>
-
-      {retroMsg && (
-        <div className="px-2.5 py-1 bg-emerald-50 border border-emerald-200 rounded text-xs text-emerald-800 font-medium">
-          {retroMsg}
-        </div>
-      )}
 
       {/* 背景下載 / 載入 AI 模型即時進度列 */}
       {isDownloading && (
@@ -233,7 +198,6 @@ export const MacroChunkProgress: React.FC = () => {
         <div
           onClick={() => setExpandSummary((prev) => !prev)}
           className="px-2.5 py-1 bg-indigo-50/50 border border-indigo-200/70 rounded flex items-start justify-between gap-2 text-xs text-slate-700 cursor-pointer hover:bg-indigo-50/80 transition-colors"
-          title="點擊展開或收合全場高頻核心詞與近期共識摘要"
         >
           <div className="flex items-start gap-1.5 min-w-0 flex-1">
             <FileText className="w-3.5 h-3.5 text-indigo-600 shrink-0 mt-0.5" />
