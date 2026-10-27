@@ -2,8 +2,8 @@
 // 句法與語用感知之字級受限 Viterbi 語者解碼器 (Syntax- & Pragmatics-Aware Word-Level Viterbi Decoder)
 // 通用性核心升級：
 // 1. 導入瀏覽器原生 ICU 自然語言斷詞 (`Intl.Segmenter('zh-TW', { granularity: 'word' })`)，徹底消滅機械式 2 字正則將「我現在是」、「你明年是」、「一般組」從詞中劈開的根因！
-// 2. 導入「物理音節與時長質量加權發射機率 (`w_dur`)」：解決 `Intl.Segmenter` 將短促應答句（如「不算。」、「算不算。」、「對，」、「可以啊。」）合為單一 Token 後，因進出一詞需承受兩次語者轉移懲罰而被前後長句吞併之根因！
-// 3. 精確化語法價鍵保護 (`isSyntacticallyBoundPair`)：保護真實主謂/動賓/動補/數詞範圍結構，同時嚴格放行獨立搶話與應答詞。
+// 2. 導入「物理音節與時長質量加權發射機率 (`w_dur`)」：解決 `Intl.Segmenter` 將短促應答句（如「不算。」、「算不算。」、「24號。」、「禮拜三早上。」、「對，」、「好，再來。」）合為單一或雙 Token 後，因進出一詞需承受兩次語者轉移懲罰而被前後長句吞併之根因！
+// 3. 聲學通量解鎖機制 (`flux >= 0.46`)：當相鄰字詞間之幀級聲紋後驗分佈發生劇烈翻轉（如男主席 <-> 女報告人快速問答），即使 Whisper 未標出句號，只要非強語法價鍵綁定對，即允許於自然詞界處換人！
 
 import {
   AcousticSlotTier,
@@ -44,13 +44,13 @@ export interface AlignedWordSlot {
 }
 
 const QUESTION_MARKERS =
-  /[？?]|(嗎|呢|吧|對不對|是不是|好不好|可以嗎|是嗎|對嗎|誰要|怎麼辦|怎麼|為什麼|算不算|可不可以|有沒有|か|でしょうか|ますか|ですか)[。，？?!\s]*$/i;
+  /[？?]|(嗎|呢|吧|對不對|是不是|好不好|可以嗎|是嗎|對嗎|誰要|誰會|怎麼辦|怎麼樣|怎樣|為什麼|什麼時候|甚麼時候|哪裡|什麼意思|甚麼意思|算不算|可不可以|有沒有|接觸了沒|か|でしょうか|ますか|ですか)[。，？?!\s]*$/i;
 const TERMINAL_PUNCT = /[。！!？?\.]+$/;
 const CLAUSE_PUNCT = /[，,、；;：:]+$/;
 const BACKCHANNEL_SHORT_TOKEN =
-  /^(不算[啦]?|算不算|算[啊]?|對[啊呀喔]?|對對對|沒錯|可以[啊呀]?|沒有[啊啦]?|不用|不用不用|好[的啊喔]?|是[啊的]?|不是[啊]?|了解|はい|ええ|うん|なるほど|yeah|yes|right|sure|ok|okay)[，。！？!?,.\s]*$/i;
+  /^(不算[啦]?|算不算|算[啊]?|對[啊呀喔]?|對對對|沒錯|可以[啊呀]?|沒有[啊啦]?|不用|不用不用|好[的啊喔]?|好再來|是[啊的]?|不是[啊]?|了解|有[啊]?|啥|什麼意思|甚麼意思|[0-9一二三四五六七八九十]+號|禮拜[一二三四五六日天](?:早上|下午|晚上)?|はい|ええ|うん|なるほど|yeah|yes|right|sure|ok|okay)[，。！？!?,.\s]*$/i;
 const UNIVERSAL_DISCOURSE_STARTER =
-  /^(不是|可是|不過|但是|然而|因為|所以|如果|要是|那如果|就只要|沒錯|可以|算|不算|算不算|對|我覺得|所以我|はい|ええ|いや|しかし|yeah|yes|no|but|right|okay|ok)/i;
+  /^(不是|可是|不過|但是|然而|因為|所以|如果|要是|那如果|就只要|沒錯|可以|算|不算|算不算|對|我覺得|所以我|報告主席|好報告|目前的話|現在只有|現在總共|第一個是|第二個是|另外一個|這應該|好再來|所以要|這個也是|這個他們|也是|那原民會|有接觸|接觸哪|什麼意思|甚麼意思|喂|請問|はい|ええ|いや|しかし|yeah|yes|no|but|right|okay|ok)/i;
 
 // 瀏覽器原生 ICU 自然語言斷詞器實例
 const zhWordSegmenter: {
@@ -119,7 +119,7 @@ export function segmentNaturalLanguageTokens(text: string): string[] {
       merged.length > 0 &&
       !/[，。？！、；：,.?!]$/.test(prev) &&
       curPure.length === 1 &&
-      /^(的|得|地|了|嗎|呢|吧|啊|呀|喔|哦|啦|囉|嘛|過|著|們|組|處|署|師|店|標|案|錢|人|事)$/.test(
+      /^(的|得|地|了|嗎|呢|吧|啊|呀|喔|哦|啦|囉|嘛|過|著|們|組|處|署|師|店|標|案|錢|人|事|號)$/.test(
         curPure
       ) &&
       prevPure.length <= 2
@@ -135,7 +135,7 @@ export function segmentNaturalLanguageTokens(text: string): string[] {
 
 /**
  * 檢查兩相鄰無標點詞是否屬於不可切斷之「強語法價鍵結構 (Syntactic Valence Bound Pair)」：
- * 嚴格排除獨立搶話起手詞（可是、不是、不過、算、不算、算不算、對）！
+ * 嚴格排除獨立搶話起手詞（可是、不是、不過、算、不算、算不算、對、好再來、這應該）！
  */
 export function isSyntacticallyBoundPair(
   prevRaw: string,
@@ -144,17 +144,18 @@ export function isSyntacticallyBoundPair(
   const prevTrim = prevRaw.trim();
   const currTrim = currRaw.trim();
   if (!prevTrim || !currTrim) return false;
-  // 若前詞已帶有標點符號，代表語法上已斷開，絕不綁定！
   if (/[，。？！、；：,.?!]$/.test(prevTrim)) return false;
 
   const prevClean = prevTrim.replace(/[，。？！、；：,.?!\s]+$/g, '');
   const currClean = currTrim.replace(/[，。？！、；：,.?!\s]+$/g, '');
   if (!prevClean || !currClean) return false;
 
-  // 若後詞為獨立附和詞或轉折打斷起手詞，不進行強語法鎖定
   if (
     BACKCHANNEL_SHORT_TOKEN.test(currTrim) ||
-    /^(可是|不是|不過|但是|然而|那如果|算不算|不算|算)$/.test(currClean)
+    UNIVERSAL_DISCOURSE_STARTER.test(currClean) ||
+    /^(可是|不是|不過|但是|然而|那如果|算不算|不算|算|好再來|這應該|誰會)$/.test(
+      currClean
+    )
   ) {
     return false;
   }
@@ -181,11 +182,11 @@ export function isSyntacticallyBoundPair(
     return true;
   }
 
-  // 3. 定語「的」結尾（且非句末語氣「的」如「翻修的」）+ 名詞中心語，或主語名詞 + 緊接助動詞謂語 (如：這次的錢+就是要、要做的+事情)
+  // 3. 定語「的」結尾 + 名詞中心語，或主語名詞 + 緊接助動詞謂語
   if (
     (/的$/.test(prevClean) &&
       prevClean.length <= 4 &&
-      !/^(沒有要|是要|不是要|支持|翻修|開店)/.test(prevClean) &&
+      !/^(沒有要|是要|不是要|支持|翻修|開店|不同的|可以的)$/.test(prevClean) &&
       /^[\u4e00-\u9fa5]{1,3}$/.test(currClean)) ||
     (/(的錢|的人|的事|的店|的話|的時候|的問題|的部分|的對象|的時程|的規劃|的案子)$/.test(
       prevClean
@@ -197,31 +198,31 @@ export function isSyntacticallyBoundPair(
     return true;
   }
 
-  // 4. 數詞/範圍/時間量詞結構 (如：10到+15分鐘、60到+70、一年+六個月)
+  // 4. 數詞/範圍/時間量詞結構
   if (
     /([0-9一二三四五六七八九十百千萬兩半點到至~～]|分|秒|時|天|月|年|週)$/.test(
       prevClean
     ) &&
-    /^([0-9一二三四五六七八九十百千萬兩半]|到|至|分|秒|點|時|天|日|月|年|週|禮拜|個|位|名|次|件|種|家|間|萬|元|塊|折|成|倍|差)/.test(
+    /^([0-9一二三四五六七八九十百千萬兩半]|到|至|分|秒|點|時|天|日|月|年|週|禮拜|個|位|名|次|件|種|家|間|處|案|萬|元|塊|折|成|倍|差|號)/.test(
       currClean
     )
   ) {
     return true;
   }
 
-  // 5. 代名詞/時間詞主語 + 緊接副詞/時間詞/繫詞 (如：我+現在+是、你+下半年、你+明年+是)
+  // 5. 代名詞/時間詞主語 + 緊接副詞/時間詞/繫詞
   if (
     /^(我|你|您|他|她|它|我們|你們|他們|現在|目前|今年|明年|下半年|上半年)$/.test(
       prevClean
     ) &&
-    /^(現在|目前|今年|明年|下半年|上半年|是|要|會|在|有|都|也|已經|原本|覺得|建議|希望|知道)/.test(
+    /^(現在|目前|今年|明年|下半年|上半年|是|要|會|在|有|都|也|已經|原本|覺得|建議|希望|知道|還有)/.test(
       currClean
     )
   ) {
     return true;
   }
 
-  // 6. 程度/範圍/否定副詞 + 形容詞/助動詞補語 (如：都很+好、非常+滿、太+遠)
+  // 6. 程度/範圍/否定副詞 + 形容詞/助動詞補語
   if (
     /(很|太|更|最|超|蠻|挺|都|還|不|沒|別|真|非常|相當|特別|十分|比較|稍微|有點|已經)$/.test(
       prevClean
@@ -233,7 +234,7 @@ export function isSyntacticallyBoundPair(
     return true;
   }
 
-  // 7. 句末語氣助詞、時態助詞或組織/名詞詞尾 (如：...的/了/嗎/呢/吧/啊/組/處/署/師)
+  // 7. 句末語氣助詞、時態助詞或組織/名詞詞尾
   if (
     /^(的|得|地|了|嗎|呢|吧|啊|呀|喔|哦|啦|囉|嘛|齁|吼|過|著|們|組|處|署|師|店|標|案|長|員)$/.test(
       currClean
@@ -245,7 +246,7 @@ export function isSyntacticallyBoundPair(
   // 8. 數詞/指示詞 + 量詞
   if (
     /[一二三四五六七八九十百千萬兩這那某每各幾]$/.test(prevClean) &&
-    /^(個|位|名|次|件|種|些|點|處|家|間|筆|項|套|場|人|天|年|月|週)/.test(
+    /^(個|位|名|次|件|種|些|點|處|家|間|筆|項|套|場|人|天|年|月|週|案)/.test(
       currClean
     )
   ) {
@@ -321,12 +322,12 @@ export function synthesizePosteriorMatrixFromFineTurns(
         top1Idx;
 
       const p1 = Math.max(
-        0.55,
+        0.58,
         Math.min(0.96, matchedTurn.speakerConfidence ?? 0.85)
       );
       const margin = Math.max(
-        0.08,
-        Math.min(0.85, matchedTurn.speakerMargin ?? 0.22)
+        0.10,
+        Math.min(0.85, matchedTurn.speakerMargin ?? 0.24)
       );
       const p2 = K > 1 ? Math.max(0.02, Math.min(1.0 - p1, p1 - margin)) : 0.0;
       const rem =
@@ -386,7 +387,7 @@ export function decodeWordLevelSpeakersViterbi(
   const K = posteriorMatrix.speakerIds.length;
   if (M === 0 || K === 0) return [];
 
-  const lambdaTrans = options?.lambdaTrans ?? 0.58;
+  const lambdaTrans = options?.lambdaTrans ?? 0.56;
   const frameStepSec = posteriorMatrix.frameStepSec || 0.02;
   const matrixStartSec = posteriorMatrix.chunkStartSec || 0;
   const numFrames = posteriorMatrix.numFrames;
@@ -427,8 +428,6 @@ export function decodeWordLevelSpeakersViterbi(
       1,
       words[i].text.replace(/[，。？！、；：,.?!\s]/g, '').length
     );
-    // 【物理音節與時長質量加權】：確保被 Intl.Segmenter 合併為單一 Token 之短句（如「算不算。」、「不算。」、「對，」）
-    // 擁有與其物理時長/字數相稱的發射機率權重，不會因單 Token 進出承受兩次轉移懲罰而被前後語者吞併！
     wordEmissionWeights[i] = Math.max(
       1.0,
       Math.min(4.5, Math.max(durSec / 0.22, pureCharLen * 0.85))
@@ -491,7 +490,7 @@ export function decodeWordLevelSpeakersViterbi(
     const prevHasPunct = /[，。？！、；：,.?!]$/.test(prevText);
     const isPrevQuestion = QUESTION_MARKERS.test(prevText);
     const isCurrBackchannel =
-      (prevHasPunct || pauseSec >= 0.18) &&
+      (prevHasPunct || pauseSec >= 0.14 || flux >= 0.45) &&
       BACKCHANNEL_SHORT_TOKEN.test(currText);
     const isCurrInterruptionStarter =
       UNIVERSAL_DISCOURSE_STARTER.test(currText);
@@ -501,28 +500,38 @@ export function decodeWordLevelSpeakersViterbi(
       !isCurrBackchannel &&
       !Boolean(words[i].isAcousticTurnBoundary) &&
       /^[\u4e00-\u9fa5]{1,2}[，。？！、；：,.?!]+$/.test(currText) &&
-      flux < 0.55;
+      flux < 0.48;
     const isTurnBoundary =
       Boolean(words[i].isAcousticTurnBoundary) &&
       !isBoundSyntacticPair &&
       !isClauseClosingTail;
 
-    let psiPunct = -6.0; // 預設：無標點子句內部鎖定同一語者
+    let psiPunct = -5.5;
     if (isBoundSyntacticPair || isClauseClosingTail) {
-      psiPunct = -10.5; // 強語法價鍵約束或句尾收束字：絕對鎖定同一語者！
+      psiPunct = -10.5;
     } else if (isPrevQuestion) {
       psiPunct = 2.6;
-    } else if (isTurnBoundary && (prevHasPunct || isCurrInterruptionStarter || isCurrBackchannel || pauseSec >= 0.15 || flux >= 0.45)) {
-      psiPunct = 2.4;
+    } else if (
+      isTurnBoundary &&
+      (prevHasPunct ||
+        isCurrInterruptionStarter ||
+        isCurrBackchannel ||
+        pauseSec >= 0.14 ||
+        flux >= 0.42)
+    ) {
+      psiPunct = 2.5;
     } else if (TERMINAL_PUNCT.test(prevText)) {
-      psiPunct = flux >= 0.40 || isCurrBackchannel ? 2.0 : 1.1;
+      psiPunct = flux >= 0.38 || isCurrBackchannel ? 2.1 : 1.1;
     } else if (CLAUSE_PUNCT.test(prevText)) {
       psiPunct =
-        isCurrBackchannel || isCurrInterruptionStarter || flux >= 0.40
+        isCurrBackchannel || isCurrInterruptionStarter || flux >= 0.38
+          ? 1.7
+          : -1.0;
+    } else if (flux >= 0.46 || pauseSec >= 0.28) {
+      psiPunct =
+        isCurrInterruptionStarter || isCurrBackchannel || flux >= 0.56
           ? 1.6
-          : -1.2;
-    } else if (flux >= 0.55 && (isCurrInterruptionStarter || isCurrBackchannel)) {
-      psiPunct = 1.4;
+          : 0.8;
     }
 
     const logit =
@@ -536,12 +545,14 @@ export function decodeWordLevelSpeakersViterbi(
       Math.max(0.0005, 1.0 / (1.0 + Math.exp(-logit)))
     );
 
+    // 當聲學後驗通量 flux >= 0.46 或停頓 >= 0.28s 且非強語法價鍵時，解除句中換人封鎖，讓無標點之快速問答也能精準換人！
     const blockMidClauseSwitch =
       isBoundSyntacticPair ||
       isClauseClosingTail ||
       (!prevHasPunct &&
         !isTurnBoundary &&
-        !(flux >= 0.55 && (isCurrInterruptionStarter || isCurrBackchannel)));
+        flux < 0.46 &&
+        pauseSec < 0.28);
 
     const wEm = wordEmissionWeights[i];
 
@@ -556,7 +567,12 @@ export function decodeWordLevelSpeakersViterbi(
         let transProb: number;
         if (kCurr === kPrev) {
           transProb = blockMidClauseSwitch ? 1.0 : 1.0 - pSwitch;
-        } else if (prevHasPunct || isPrevQuestion || isTurnBoundary) {
+        } else if (
+          prevHasPunct ||
+          isPrevQuestion ||
+          isTurnBoundary ||
+          flux >= 0.46
+        ) {
           const otherMass = Math.max(1e-6, 1.0 - emissions[i][kPrev]);
           transProb = pSwitch * (emissions[i][kCurr] / otherMass);
         } else {
@@ -686,7 +702,6 @@ export function groupAlignedWordsIntoSegments(
 
   const groups: TempGroup[] = [];
 
-  // 明確語意分段轉折起手詞（僅在同語者單段已超過 160 字且出現明確主題列舉轉折時才分段）
   const SEMANTIC_TOPIC_SHIFT_STARTER =
     /^(?:然後|那|另外|再來|此外|最後)?(?:第[二三四五六七八九十][個點項部分步]|另外一個(?:部分|問題|重點|面向)|再來(?:就是|是|一個)|那另外(?:就是|一個)|接下來(?:我們|就是))/;
 
@@ -698,8 +713,8 @@ export function groupAlignedWordsIntoSegments(
       ? prevGroup.slots.reduce((acc, s) => acc + s.word.length, 0)
       : 0;
 
-    // 【同語者連續發言不碎切】：只要 alignedWords 中相鄰字詞屬於同一語者（代表中間完全沒有其他語者插話），
-    // 即便換氣停頓 > 0.85s 也不拆成多段，除非已累積較長段落 (>= 150字) 且遇到明確語意分段標記！
+    // 【同語者連續發言不碎切】：只要相鄰字詞屬於同一語者（代表中間完全沒有其他語者插話），
+    // 即便翻頁或換氣停頓也不拆成多段，除非累積較長段落 (>= 150字) 且遇到明確語意分段標記！
     const isExplicitTopicBreak =
       prevChars >= 150 &&
       lastSlot &&
