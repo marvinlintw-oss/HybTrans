@@ -29,7 +29,7 @@ function escapeXml(unsafe: string): string {
 }
 
 /**
- * 將會議 AI 摘要、結論與行動事項格式化為結構化 Markdown 字串
+ * 將會議 AI 摘要、結論與行動事項格式化為精煉條列式 Markdown 字串
  */
 export function formatMeetingMinutesToMarkdown(
   report: MeetingMinutesReport
@@ -37,58 +37,51 @@ export function formatMeetingMinutesToMarkdown(
   const lines: string[] = [];
   lines.push(`# ${report.title}`);
   lines.push(
-    `> 產生時間：${new Date(report.generatedAt).toLocaleString('zh-TW')} ｜ 總語者數：${report.speakerStats.length} 位`
+    `> 產生時間：${new Date(report.generatedAt).toLocaleString('zh-TW')} ｜ 與會語者：${report.speakerStats.length} 位`
   );
   lines.push('');
-  lines.push('## 一、會議執行摘要 (Executive Summary)');
-  lines.push(report.executiveSummary);
+
+  lines.push('## 一、會議討論要點摘要');
+  const summaryBullets = (report.executiveSummary || '')
+    .split(/\n+/)
+    .map((s) => s.replace(/^[•\-*]\s*/, '').trim())
+    .filter(Boolean);
+  for (const b of summaryBullets) {
+    lines.push(`- ${b}`);
+  }
+  if (report.topicBreakdowns.length > 0) {
+    for (const t of report.topicBreakdowns) {
+      const timeTag = t.timeRange ? ` (${t.timeRange})` : '';
+      const detail =
+        t.decision && t.decision !== t.discussionPoints
+          ? `${t.discussionPoints} ➔ **${t.decision}**`
+          : t.discussionPoints;
+      lines.push(`- **【${t.topic}】**${timeTag}：${detail}`);
+    }
+  }
   lines.push('');
 
-  lines.push('## 二、重要結論與裁示事項');
+  lines.push('## 二、重要結論與裁示');
   if (report.keyConclusions.length > 0) {
-    report.keyConclusions.forEach((c, idx) => {
-      lines.push(`${idx + 1}. ${c}`);
+    report.keyConclusions.forEach((c) => {
+      lines.push(`- ${c.replace(/^[•\-*]\s*/, '')}`);
     });
   } else {
-    lines.push('- （無明確結論項目）');
+    lines.push('- 依各案討論進度持續推進。');
   }
   lines.push('');
 
-  lines.push('## 三、各議題討論重點與決議');
-  if (report.topicBreakdowns.length > 0) {
-    lines.push('| 議題 / 專案名稱 | 討論現況與重點 | 決議與裁示 | 時間區間 |');
-    lines.push('| :--- | :--- | :--- | :--- |');
-    report.topicBreakdowns.forEach((t) => {
-      lines.push(
-        `| **${t.topic.replace(/\|/g, '｜')}** | ${t.discussionPoints.replace(/\|/g, '｜')} | ${t.decision.replace(/\|/g, '｜')} | ${t.timeRange || '-'} |`
-      );
-    });
-  }
-  lines.push('');
-
-  lines.push('## 四、後續行動事項追蹤表 (Action Items)');
+  lines.push('## 三、後續行動事項 (Action Items)');
   if (report.actionItems.length > 0) {
-    lines.push('| 編號 | 具體待辦與行動事項 | 負責語者 / 單位 | 目標時程 | 備註 / 依據 |');
-    lines.push('| :--- | :--- | :--- | :--- | :--- |');
-    report.actionItems.forEach((item, idx) => {
+    report.actionItems.forEach((item) => {
       lines.push(
-        `| #${idx + 1} | **${item.task.replace(/\|/g, '｜')}** | ${item.owner.replace(/\|/g, '｜')} | ${item.deadline.replace(/\|/g, '｜')} | ${(item.contextNote || '-').replace(/\|/g, '｜')} |`
+        `- **[${item.owner}｜${item.deadline}]** ${item.task}`
       );
     });
   } else {
     lines.push('- （未偵測到待辦行動事項）');
   }
   lines.push('');
-
-  if (report.speakerStats.length > 0) {
-    lines.push('## 五、與會語者發言統計');
-    lines.push('| 語者名稱 | 發言輪次 | 累計字數 |');
-    lines.push('| :--- | :---: | :---: |');
-    report.speakerStats.forEach((sp) => {
-      lines.push(`| ${sp.speakerName} | ${sp.turnCount} 次 | ${sp.charCount} 字 |`);
-    });
-    lines.push('');
-  }
 
   return lines.join('\n');
 }
@@ -108,170 +101,115 @@ export function exportMeetingMinutesAsMarkdown(
 }
 
 /**
- * 將結構化會議摘要轉為 OpenXML 段落與表格區段（供單獨匯出或附加於逐字稿 Word 檔頂部）
+ * 將結構化會議摘要轉為精煉條列式 OpenXML 段落區段（供單獨匯出或附加於逐字稿 Word 檔頂部）
  */
 function buildMeetingMinutesOpenXmlSection(
   report: MeetingMinutesReport
 ): string {
-  const conclusionsXml = report.keyConclusions
+  const summaryBullets = (report.executiveSummary || '')
+    .split(/\n+/)
+    .map((s) => s.replace(/^[•\-*]\s*/, '').trim())
+    .filter(Boolean);
+
+  const summaryXml = summaryBullets
     .map(
-      (c, i) => `
+      (b) => `
     <w:p>
-      <w:pPr><w:spacing w:after="80"/></w:pPr>
+      <w:pPr><w:spacing w:after="60"/></w:pPr>
       <w:r>
-        <w:rPr>
-          <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei"/>
-          <w:b/>
-          <w:color w:val="1E40AF"/>
-          <w:sz w:val="21"/>
-        </w:rPr>
-        <w:t>${i + 1}. </w:t>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="1E40AF"/><w:sz w:val="21"/></w:rPr>
+        <w:t>• </w:t>
       </w:r>
       <w:r>
-        <w:rPr>
-          <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei"/>
-          <w:color w:val="0F172A"/>
-          <w:sz w:val="21"/>
-        </w:rPr>
-        <w:t>${escapeXml(c)}</w:t>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="1E293B"/><w:sz w:val="21"/></w:rPr>
+        <w:t>${escapeXml(b)}</w:t>
       </w:r>
     </w:p>`
     )
     .join('');
 
-  const topicRowsXml = report.topicBreakdowns
+  const topicBulletsXml = report.topicBreakdowns
+    .map((t) => {
+      const timeTag = t.timeRange ? ` (${t.timeRange})` : '';
+      const detail =
+        t.decision && t.decision !== t.discussionPoints
+          ? `${t.discussionPoints} ➔ ${t.decision}`
+          : t.discussionPoints;
+      return `
+    <w:p>
+      <w:pPr><w:spacing w:after="60"/></w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="0F172A"/><w:sz w:val="20"/></w:rPr>
+        <w:t>• 【${escapeXml(t.topic)}】${escapeXml(timeTag)}：</w:t>
+      </w:r>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="334155"/><w:sz w:val="20"/></w:rPr>
+        <w:t>${escapeXml(detail)}</w:t>
+      </w:r>
+    </w:p>`;
+    })
+    .join('');
+
+  const conclusionsXml = report.keyConclusions
     .map(
-      (t) => `
-      <w:tr>
-        <w:tc>
-          <w:tcPr><w:tcW w:w="2200" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="F8FAFC"/></w:tcPr>
-          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="1E293B"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(t.topic)}</w:t></w:r></w:p>
-          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="64748B"/><w:sz w:val="16"/></w:rPr><w:t>${escapeXml(t.timeRange || '')}</w:t></w:r></w:p>
-        </w:tc>
-        <w:tc>
-          <w:tcPr><w:tcW w:w="4300" w:type="dxa"/></w:tcPr>
-          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="334155"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(t.discussionPoints)}</w:t></w:r></w:p>
-        </w:tc>
-        <w:tc>
-          <w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr>
-          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="065F46"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(t.decision)}</w:t></w:r></w:p>
-        </w:tc>
-      </w:tr>`
+      (c) => `
+    <w:p>
+      <w:pPr><w:spacing w:after="60"/></w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="065F46"/><w:sz w:val="20"/></w:rPr>
+        <w:t>• </w:t>
+      </w:r>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="0F172A"/><w:sz w:val="20"/></w:rPr>
+        <w:t>${escapeXml(c.replace(/^[•\-*]\s*/, ''))}</w:t>
+      </w:r>
+    </w:p>`
     )
     .join('');
 
-  const actionRowsXml = report.actionItems
+  const actionBulletsXml = report.actionItems
     .map(
-      (a, idx) => `
-      <w:tr>
-        <w:tc>
-          <w:tcPr><w:tcW w:w="800" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="F8FAFC"/></w:tcPr>
-          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="334155"/><w:sz w:val="20"/></w:rPr><w:t>#${idx + 1}</w:t></w:r></w:p>
-        </w:tc>
-        <w:tc>
-          <w:tcPr><w:tcW w:w="4700" w:type="dxa"/></w:tcPr>
-          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="0F172A"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(a.task)}</w:t></w:r></w:p>
-        </w:tc>
-        <w:tc>
-          <w:tcPr><w:tcW w:w="2200" w:type="dxa"/></w:tcPr>
-          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="1D4ED8"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(a.owner)}</w:t></w:r></w:p>
-        </w:tc>
-        <w:tc>
-          <w:tcPr><w:tcW w:w="1800" w:type="dxa"/></w:tcPr>
-          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="B45309"/><w:sz w:val="19"/></w:rPr><w:t>${escapeXml(a.deadline)}</w:t></w:r></w:p>
-        </w:tc>
-      </w:tr>`
+      (a) => `
+    <w:p>
+      <w:pPr><w:spacing w:after="60"/></w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="B45309"/><w:sz w:val="20"/></w:rPr>
+        <w:t>• [${escapeXml(a.owner)}｜${escapeXml(a.deadline)}] </w:t>
+      </w:r>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="0F172A"/><w:sz w:val="20"/></w:rPr>
+        <w:t>${escapeXml(a.task)}</w:t>
+      </w:r>
+    </w:p>`
     )
     .join('');
 
   return `
     <w:p>
-      <w:pPr><w:spacing w:before="120" w:after="120"/></w:pPr>
+      <w:pPr><w:spacing w:before="120" w:after="80"/></w:pPr>
       <w:r>
-        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="1E3A8A"/></w:rPr>
-        <w:t>壹、會議執行摘要 (Executive Summary)</w:t>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="24"/><w:color w:val="1E3A8A"/></w:rPr>
+        <w:t>壹、會議討論要點摘要</w:t>
       </w:r>
     </w:p>
+    ${summaryXml}
+    ${topicBulletsXml}
     <w:p>
-      <w:pPr><w:spacing w:line="320" w:lineRule="auto" w:after="200"/></w:pPr>
+      <w:pPr><w:spacing w:before="140" w:after="80"/></w:pPr>
       <w:r>
-        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:sz w:val="21"/><w:color w:val="1E293B"/></w:rPr>
-        <w:t>${escapeXml(report.executiveSummary)}</w:t>
-      </w:r>
-    </w:p>
-    <w:p>
-      <w:pPr><w:spacing w:before="160" w:after="120"/></w:pPr>
-      <w:r>
-        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="1E3A8A"/></w:rPr>
-        <w:t>貳、重要結論與裁示事項</w:t>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="24"/><w:color w:val="065F46"/></w:rPr>
+        <w:t>貳、重要結論與裁示</w:t>
       </w:r>
     </w:p>
     ${conclusionsXml}
     <w:p>
-      <w:pPr><w:spacing w:before="200" w:after="120"/></w:pPr>
+      <w:pPr><w:spacing w:before="140" w:after="80"/></w:pPr>
       <w:r>
-        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="1E3A8A"/></w:rPr>
-        <w:t>參、各議題討論重點與決議</w:t>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="24"/><w:color w:val="B45309"/></w:rPr>
+        <w:t>參、後續行動事項 (Action Items)</w:t>
       </w:r>
     </w:p>
-    <w:tbl>
-      <w:tblPr>
-        <w:tblW w:w="9500" w:type="dxa"/>
-        <w:tblBorders>
-          <w:top w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
-          <w:bottom w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
-          <w:left w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
-          <w:right w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
-          <w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
-          <w:insideV w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
-        </w:tblBorders>
-        <w:tblCellMar>
-          <w:top w:w="120" w:type="dxa"/>
-          <w:bottom w:w="120" w:type="dxa"/>
-          <w:left w:w="150" w:type="dxa"/>
-          <w:right w:w="150" w:type="dxa"/>
-        </w:tblCellMar>
-      </w:tblPr>
-      <w:tr>
-        <w:tc><w:tcPr><w:tcW w:w="2200" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="1E3A8A"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>議題 / 時間區間</w:t></w:r></w:p></w:tc>
-        <w:tc><w:tcPr><w:tcW w:w="4300" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="1E3A8A"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>討論現況與重點</w:t></w:r></w:p></w:tc>
-        <w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="1E3A8A"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>決議與裁示</w:t></w:r></w:p></w:tc>
-      </w:tr>
-      ${topicRowsXml}
-    </w:tbl>
-    <w:p>
-      <w:pPr><w:spacing w:before="240" w:after="120"/></w:pPr>
-      <w:r>
-        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="1E3A8A"/></w:rPr>
-        <w:t>肆、後續行動事項追蹤表 (Action Items)</w:t>
-      </w:r>
-    </w:p>
-    <w:tbl>
-      <w:tblPr>
-        <w:tblW w:w="9500" w:type="dxa"/>
-        <w:tblBorders>
-          <w:top w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
-          <w:bottom w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
-          <w:left w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
-          <w:right w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
-          <w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
-          <w:insideV w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
-        </w:tblBorders>
-        <w:tblCellMar>
-          <w:top w:w="120" w:type="dxa"/>
-          <w:bottom w:w="120" w:type="dxa"/>
-          <w:left w:w="150" w:type="dxa"/>
-          <w:right w:w="150" w:type="dxa"/>
-        </w:tblCellMar>
-      </w:tblPr>
-      <w:tr>
-        <w:tc><w:tcPr><w:tcW w:w="800" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="0F766E"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>編號</w:t></w:r></w:p></w:tc>
-        <w:tc><w:tcPr><w:tcW w:w="4700" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="0F766E"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>具體待辦與行動事項</w:t></w:r></w:p></w:tc>
-        <w:tc><w:tcPr><w:tcW w:w="2200" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="0F766E"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>負責語者 / 單位</w:t></w:r></w:p></w:tc>
-        <w:tc><w:tcPr><w:tcW w:w="1800" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="0F766E"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>目標時程</w:t></w:r></w:p></w:tc>
-      </w:tr>
-      ${actionRowsXml}
-    </w:tbl>
+    ${actionBulletsXml}
   `;
 }
 
@@ -308,19 +246,19 @@ export async function exportMeetingMinutesAsDocx(
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
     <w:p>
-      <w:pPr><w:jc w:val="center"/><w:spacing w:after="160"/></w:pPr>
+      <w:pPr><w:jc w:val="center"/><w:spacing w:after="140"/></w:pPr>
       <w:r>
         <w:rPr>
           <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei"/>
           <w:b/>
-          <w:sz w:val="32"/>
+          <w:sz w:val="30"/>
           <w:color w:val="0F172A"/>
         </w:rPr>
         <w:t>${escapeXml(report.title)}</w:t>
       </w:r>
     </w:p>
     <w:p>
-      <w:pPr><w:jc w:val="center"/><w:spacing w:after="240"/></w:pPr>
+      <w:pPr><w:jc w:val="center"/><w:spacing w:after="200"/></w:pPr>
       <w:r>
         <w:rPr>
           <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei"/>
@@ -355,7 +293,8 @@ export async function exportMeetingMinutesAsDocx(
 }
 
 /**
- * 將單一 WordSpan 轉換為 OpenXML <w:r> 標籤，保留三態視覺標記
+ * 將單一 WordSpan 轉換為 OpenXML <w:r> 標籤
+ * 【修正重點】：移除 `[候選:...]` 括號附註文字，保持 Word 逐字稿內文乾淨流暢不干擾閱讀！
  */
 function wordSpanToOpenXmlRun(w: WordSpan): string {
   const safeText = escapeXml(w.text);
@@ -373,18 +312,14 @@ function wordSpanToOpenXmlRun(w: WordSpan): string {
   }
 
   if (w.status === 'semantic_uncertain') {
-    const candNote = w.candidates?.length
-      ? `[候選:${escapeXml(w.candidates.join('/'))}]`
-      : '';
     return `
       <w:r>
         <w:rPr>
           <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei" w:hAnsi="Microsoft JhengHei"/>
-          <w:b/>
           <w:color w:val="92400E"/>
-          <w:shd w:val="clear" w:color="auto" w:fill="FEF08A"/>
+          <w:shd w:val="clear" w:color="auto" w:fill="FEF9C3"/>
         </w:rPr>
-        <w:t>${safeText}${candNote}</w:t>
+        <w:t>${safeText}</w:t>
       </w:r>`;
   }
 
@@ -411,7 +346,7 @@ function wordSpanToOpenXmlRun(w: WordSpan): string {
 }
 
 /**
- * 匯出包含「(選配) 會議 AI 摘要 + 語者色彩標籤、時間戳記表格與三態校對色彩標記」之原生 Microsoft Word (.docx)
+ * 匯出包含「(選配) 會議 AI 摘要 + 語者色彩標籤、時間戳記表格與乾淨逐字稿」之原生 Microsoft Word (.docx)
  */
 export async function exportAsDocx(
   segments: Segment[],
@@ -493,7 +428,7 @@ export async function exportAsDocx(
   const exportDateStr = new Date().toLocaleString('zh-TW');
   const minutesSectionXml = meetingMinutes
     ? `${buildMeetingMinutesOpenXmlSection(meetingMinutes)}
-       <w:p><w:pPr><w:spacing w:before="280" w:after="160"/></w:pPr><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="0F172A"/></w:rPr><w:t>伍、會議完整逐字稿紀錄</w:t></w:r></w:p>`
+       <w:p><w:pPr><w:spacing w:before="240" w:after="140"/></w:pPr><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="24"/><w:color w:val="0F172A"/></w:rPr><w:t>肆、會議完整逐字稿紀錄</w:t></w:r></w:p>`
     : '';
 
   const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -508,7 +443,7 @@ export async function exportAsDocx(
           <w:sz w:val="32"/>
           <w:color w:val="0F172A"/>
         </w:rPr>
-        <w:t>${escapeXml(meetingMinutes?.title || '會議逐字稿紀錄（含 AI 語境校正標記）')}</w:t>
+        <w:t>${escapeXml(meetingMinutes?.title || '會議逐字稿紀錄')}</w:t>
       </w:r>
     </w:p>
     <w:p>
@@ -519,7 +454,7 @@ export async function exportAsDocx(
           <w:sz w:val="18"/>
           <w:color w:val="475569"/>
         </w:rPr>
-        <w:t>匯出時間：${escapeXml(exportDateStr)} ｜ 色彩圖例：【綠底】AI 語境自動修正 【黃底】多候選詞待確認 【橘波浪底線】低聲學信心度</w:t>
+        <w:t>匯出時間：${escapeXml(exportDateStr)}</w:t>
       </w:r>
     </w:p>
     ${minutesSectionXml}
