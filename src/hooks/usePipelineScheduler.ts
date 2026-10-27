@@ -2,8 +2,8 @@
 // 次世代雙軌耦合調度器 (5 分鐘 Macro-Chunk 零相位前瞻正規化 + 12~22s 靜音谷底最佳化視窗 + 全域幀級後驗矩陣傳遞 + 本地/雲端統一字級 Viterbi 對齊)
 // 修正重點：
 // 1. 嚴格序列化各階段 Worker 生命週期：在 Diarization Worker 完成並 Terminate 後等待 180ms 讓瀏覽器徹底回收 WASM 記憶體，再啟動 LocalASR Worker，杜絕雙 Worker 記憶體峰值重疊。
-// 2. 在啟動本地 WebLLM 進行語意修復前，若顯卡為整合式內顯、不支援 shader-f16 或未勾選雙模型常駐，強制執行 `asrWorker.terminate()` 徹底銷毀 ONNX Runtime WebGPU Context 並等待 200ms 回收記憶體。
-// 3. 將使用者選定之 `granularityTier` 傳遞至 `localAsr.worker.ts`，搭配 `q4f16/q4` 序列載入徹底消除 16GB RAM 電腦的 Out of Memory 崩潰。
+// 2. 早期高頻 AI 介入 (Early-Stage High-Frequency AI Intervention)：前 3 個視窗或前 15 段只要滿 85 字即刻觸發三層關注度校準與 Stage 1/2 語境精修，防止前段原始 ASR 錯字被當作歷史上下文繼續誤導後續轉寫。
+// 3. 內建「生成會議 AI 摘要、結論與行動事項 (`generateMeetingMinutes`)」並在全場轉寫完成時自動產出結構化會議報告。
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
@@ -11,6 +11,7 @@ import {
   CorrectionPatchItem,
   FineDiarizationTurn,
   FrameSpeakerPosteriorMatrix,
+  MeetingMinutesReport,
   Segment,
   Speaker,
   SpeakerTrackBatch,
@@ -39,6 +40,7 @@ import {
   buildTriLevelContextPayload,
   evolveRollingMeetingSummary,
   executeBoundedQuotaRelisten,
+  generateStructuredMeetingMinutes,
   mineAdaptiveHighFreqTerms,
   runGlobalRetroactiveContextPass,
   runStage1SentenceIntegrityCheckAndRepair,
@@ -343,7 +345,6 @@ export function usePipelineScheduler() {
       // ignore
     }
     w.terminate();
-    // 給予瀏覽器 GPU 與 WASM 記憶體池 220ms 徹底回收
     await new Promise((r) => setTimeout(r, 220));
   }, []);
 
@@ -522,6 +523,29 @@ export function usePipelineScheduler() {
       }
     }
   }, [invokeLocalLlmWorker, terminateAsrWorkerAndReclaimVram]);
+
+  const generateMeetingMinutes = useCallback(async (): Promise<MeetingMinutesReport | null> => {
+    const state = useAppStore.getState();
+    if (state.segments.length === 0) return null;
+    state.setIsGeneratingMinutes(true);
+    try {
+      const report = await generateStructuredMeetingMinutes({
+        config: state.config,
+        segments: state.segments,
+        speakers: state.speakers,
+        dictionary: state.dictionary,
+        docContextSummary: state.docContextSummary,
+        rollingMeetingSummary: state.rollingMeetingSummary,
+      });
+      useAppStore.getState().setMeetingMinutes(report);
+      return report;
+    } catch (err) {
+      console.warn('⚠️ [generateMeetingMinutes] 產生會議摘要失敗:', err);
+      return null;
+    } finally {
+      useAppStore.getState().setIsGeneratingMinutes(false);
+    }
+  }, []);
 
   const buildFallbackTurns = (
     chunkStartSec: number,
@@ -800,7 +824,7 @@ export function usePipelineScheduler() {
             stage: 'preprocessing',
             progress: 10,
             detailText:
-              '音訊切片、85Hz 原地零相位濾波與前瞻包絡響度正規化中...',
+              '音訊切片、85Hz 原地零相位濾波與遠場人聲響度正規化中...',
           });
 
           const { samples: chunkSamples } =
@@ -841,7 +865,6 @@ export function usePipelineScheduler() {
 
           if (globalAbortFlag) break;
 
-          // 給予瀏覽器 180ms 徹底回收已終止之 Diarization Worker 及其 WASM 記憶體池，再啟動 ASR Worker
           await new Promise((r) => setTimeout(r, 180));
 
           useAppStore.getState().upsertSpeakers(updatedSpeakers);
@@ -1090,12 +1113,16 @@ export function usePipelineScheduler() {
                 );
                 pendingWindowChars += addedChars;
 
-                if (
-                  pendingWindowChars >= (currentConfig.highAttentionChars || 300)
-                ) {
+                const isEarlyStage =
+                  bIdx <= 2 || useAppStore.getState().segments.length < 15;
+                const triggerChars = isEarlyStage
+                  ? 85
+                  : Math.min(180, currentConfig.highAttentionChars || 180);
+
+                if (pendingWindowChars >= triggerChars) {
                   useAppStore.getState().updateChunkState(cIdx, {
                     stage: 'correcting',
-                    detailText: `三層關注度與三級信心度閘控介入：修正近 ${pendingWindowChars} 字...`,
+                    detailText: `早期高頻 AI 語境介入：修正近 ${pendingWindowChars} 字...`,
                   });
                   await flushPendingWindowCorrection(
                     canSafelyCoReside ? coResidentLlmWorkerRef.current : null
@@ -1296,10 +1323,20 @@ export function usePipelineScheduler() {
                   windowStage1Segments = stage1Fixed.slice(1);
                 }
 
+                // 同時結合字典先驗與目前已驗證之高頻詞彙進行即時單句校準
+                const verifiedSoFar = mineAdaptiveHighFreqTerms(
+                  useAppStore.getState().segments,
+                  latestDict,
+                  stateBeforeWin.docContextSummary
+                );
+                const mergedQuickTerms = Array.from(
+                  new Set([...quickTerms, ...verifiedSoFar])
+                );
+
                 const { updatedSegments: instantCorrected } =
                   applySentenceLevelLocalCorrection(
                     windowStage1Segments,
-                    quickTerms,
+                    mergedQuickTerms,
                     latestDict
                   );
                 useAppStore.getState().appendSegments(instantCorrected);
@@ -1312,12 +1349,17 @@ export function usePipelineScheduler() {
                 );
                 pendingWindowChars += addedChars;
 
-                if (
-                  pendingWindowChars >= (currentConfig.highAttentionChars || 300)
-                ) {
+                // 【早期高頻 AI 介入機制】：前 3 個視窗或總段落數 < 15 時，只要累積滿 85 字即刻介入校準，防止前段錯字被當成正確參考傳播！
+                const isEarlyStage =
+                  wIdx <= 2 || useAppStore.getState().segments.length < 15;
+                const effectiveHighAttentionThreshold = isEarlyStage
+                  ? 85
+                  : Math.min(180, currentConfig.highAttentionChars || 180);
+
+                if (pendingWindowChars >= effectiveHighAttentionThreshold) {
                   useAppStore.getState().updateChunkState(cIdx, {
                     stage: 'correcting',
-                    detailText: `三層關注度與三級信心度閘控介入：修正近 ${pendingWindowChars} 字...`,
+                    detailText: `早期高頻 AI 語境介入：修正近 ${pendingWindowChars} 字...`,
                   });
                   await flushPendingWindowCorrection(
                     canSafelyCoReside ? coResidentLlmWorkerRef.current : null
@@ -1445,6 +1487,11 @@ export function usePipelineScheduler() {
             relistenUsed: relistenedUsed,
           });
         }
+
+        // 全場轉寫完成後，自動生成「會議 AI 摘要、重要結論與行動事項報告」
+        if (!globalAbortFlag && useAppStore.getState().segments.length > 0) {
+          await generateMeetingMinutes();
+        }
       } catch (err) {
         console.error('❌ Pipeline 執行發生錯誤:', err);
       } finally {
@@ -1455,6 +1502,7 @@ export function usePipelineScheduler() {
     },
     [
       ensureLocalLlmWorker,
+      generateMeetingMinutes,
       invokeLocalLlmWorker,
       terminateAllWorkers,
       terminateAsrWorkerAndReclaimVram,
@@ -1471,5 +1519,6 @@ export function usePipelineScheduler() {
     runPipeline: startPipeline,
     stopPipeline,
     triggerRetroactivePass,
+    generateMeetingMinutes,
   };
 }
