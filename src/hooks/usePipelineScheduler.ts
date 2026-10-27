@@ -1,9 +1,9 @@
 // src/hooks/usePipelineScheduler.ts
 // 次世代雙軌耦合調度器 (5 分鐘 Macro-Chunk 零相位前瞻正規化 + 12~22s 靜音谷底最佳化視窗 + 全域幀級後驗矩陣傳遞 + 本地/雲端統一字級 Viterbi 對齊)
 // 修正重點：
-// 1. 徹底解決 F12 Console `ID3D12Device::CreatePlacedResource failed with DXGI_ERROR_DEVICE_REMOVED (0x887A0005)` 與 `DXGI_ERROR_DEVICE_HUNG (0x887A0006)`：
-//    在啟動本地 WebLLM 進行語意修復前，若顯卡不支援 shader-f16 或未勾選雙模型常駐，強制執行 `asrWorker.terminate()` 徹底銷毀 ONNX Runtime WebGPU Context 並等待 180ms 讓 D3D12 回收 ~1.8GB 顯存緩衝池，杜絕 Whisper 與 WebLLM 同時爭奪 VRAM 導致驅動崩潰！
-// 2. 內建 WebGPU 裝置熔斷追蹤 (`llmCircuitBrokenRef`)：若本地顯卡 VRAM 不足觸發熔斷，後續視窗自動零延遲切換至確定性 Stage 1/2 語意與音韻引擎，不再重複建立失敗的 WebLLM 實例。
+// 1. 嚴格序列化各階段 Worker 生命週期：在 Diarization Worker 完成並 Terminate 後等待 180ms 讓瀏覽器徹底回收 WASM 記憶體，再啟動 LocalASR Worker，杜絕雙 Worker 記憶體峰值重疊。
+// 2. 在啟動本地 WebLLM 進行語意修復前，若顯卡為整合式內顯、不支援 shader-f16 或未勾選雙模型常駐，強制執行 `asrWorker.terminate()` 徹底銷毀 ONNX Runtime WebGPU Context 並等待 200ms 回收記憶體。
+// 3. 將使用者選定之 `granularityTier` 傳遞至 `localAsr.worker.ts`，搭配 `q4f16/q4` 序列載入徹底消除 16GB RAM 電腦的 Out of Memory 崩潰。
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store/useAppStore';
@@ -64,29 +64,42 @@ function setGlobalProcessing(val: boolean) {
 }
 
 /**
- * 探測當前顯卡是否支援 WebGPU `shader-f16`。
- * 若不支援 `shader-f16`，代表 Whisper 與 WebLLM 皆需以 FP32 緩衝區運行，此時嚴禁兩者同時常駐於同一張顯卡，必須序列化先 Terminate ASR Worker 再啟動 LLM Worker！
+ * 探測當前顯卡是否為支援 shader-f16 之高階獨立顯卡。
+ * 若為整合式內顯 (如 Intel UHD / Iris Xe) 或不支援 shader-f16，嚴禁雙模型同時常駐於記憶體！
  */
-async function checkWebGpuSupportsFp16(): Promise<boolean> {
+async function checkWebGpuCanSafelyCoReside(): Promise<boolean> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const gpu = (navigator as unknown as { gpu?: any }).gpu;
     if (!gpu || typeof gpu.requestAdapter !== 'function') return false;
     const adapter = await gpu.requestAdapter();
-    return Boolean(
+    if (!adapter) return false;
+    const supportsFp16 = Boolean(
       adapter?.features &&
         typeof adapter.features.has === 'function' &&
         adapter.features.has('shader-f16')
     );
+    const info =
+      (
+        adapter as unknown as {
+          info?: { vendor?: string; architecture?: string; description?: string };
+        }
+      ).info || {};
+    const vendor = (info.vendor || '').toLowerCase();
+    const desc = (info.description || info.architecture || '').toLowerCase();
+    const maxBufferBytes = adapter.limits?.maxBufferSize || 268435456;
+    const isIntegrated =
+      desc.includes('uhd') ||
+      desc.includes('iris') ||
+      desc.includes('hd graphics') ||
+      (vendor.includes('intel') && !desc.includes('arc')) ||
+      maxBufferBytes < 2048 * 1024 * 1024;
+    return supportsFp16 && !isIntegrated;
   } catch {
     return false;
   }
 }
 
-/**
- * 根據語者虛擬音軌映射表 `timeMap`，從當前 5 分鐘巨集區塊的原始無損波形中抽取該語者的所有發聲片段，
- * 並在片段與片段之間插入 `0.35s` 零值靜音隔板（附帶 10ms 線性淡入淡出防爆音），組裝成純淨同語者音訊！
- */
 function stitchVirtualSpeakerTrackSamples(
   chunkSamples: Float32Array,
   chunkStartGlobalSec: number,
@@ -94,7 +107,7 @@ function stitchVirtualSpeakerTrackSamples(
   sampleRate = TARGET_SAMPLE_RATE
 ): Float32Array {
   const spacerSamplesCount = Math.round(batch.spacerDurationSec * sampleRate);
-  const fadeSamples = Math.min(160, Math.floor(spacerSamplesCount / 4)); // 10ms 微淡入淡出
+  const fadeSamples = Math.min(160, Math.floor(spacerSamplesCount / 4));
 
   const slices: Float32Array[] = [];
   let totalLength = 0;
@@ -132,16 +145,13 @@ function stitchVirtualSpeakerTrackSamples(
     stitched.set(slices[i], offset);
     offset += slices[i].length;
     if (i < slices.length - 1) {
-      offset += spacerSamplesCount; // 中間維持 0.0 靜音隔板
+      offset += spacerSamplesCount;
     }
   }
 
   return stitched;
 }
 
-/**
- * 當雲端 BYOK 模式 (Groq / Gemini) 搭配「語者虛擬音軌拼接」時，將雲端回傳之相對時間區段還原回原始會議時間軸
- */
 function unwarpCloudSegmentsFromVirtualTrack(
   cloudSegs: Segment[],
   timeMap: VirtualTrackMapItem[],
@@ -230,10 +240,6 @@ function unwarpCloudSegmentsFromVirtualTrack(
   });
 }
 
-/**
- * 【雲端 BYOK 專屬升級】：當走雲端 Groq / Gemini 轉寫 12~22s 最佳化視窗時，
- * 將雲端回傳之 words 透過與本地 WebGPU 完全相同的 `decodeWordLevelSpeakersViterbi` 對齊至全域語者後驗機率矩陣！
- */
 function alignCloudSegmentsWithViterbi(
   rawCloudSegs: Segment[],
   windowStartSec: number,
@@ -337,8 +343,8 @@ export function usePipelineScheduler() {
       // ignore
     }
     w.terminate();
-    // 給予瀏覽器 GPU Process 180ms 回收 D3D12 PlacedResources 緩衝池
-    await new Promise((r) => setTimeout(r, 180));
+    // 給予瀏覽器 GPU 與 WASM 記憶體池 220ms 徹底回收
+    await new Promise((r) => setTimeout(r, 220));
   }, []);
 
   const terminateLlmWorkerAndReclaimVram = useCallback(async () => {
@@ -362,7 +368,7 @@ export function usePipelineScheduler() {
       // ignore
     }
     w.terminate();
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 180));
   }, []);
 
   const terminateAllWorkers = useCallback(() => {
@@ -484,7 +490,6 @@ export function usePipelineScheduler() {
 
     let tempLlmWorker: Worker | null = null;
     try {
-      // 執行手動順稿前，先確保釋放可能殘留的 ASR Worker 顯存
       await terminateAsrWorkerAndReclaimVram();
 
       if (!state.config.geminiApiKey.trim() && !llmCircuitBrokenRef.current) {
@@ -703,7 +708,6 @@ export function usePipelineScheduler() {
         }
       );
       useAppStore.getState().setAudioPreAnalysis(profile);
-      // 自動預選最佳推薦方案並將建議參數同步至設定，使用者可直接點擊啟動或自由切換方案 A/B/C
       useAppStore
         .getState()
         .applyRecommendedPreset(profile.recommendedPresetId);
@@ -733,9 +737,8 @@ export function usePipelineScheduler() {
 
       try {
         await acquireKeepAwakeLock();
-        const gpuSupportsFp16 = await checkWebGpuSupportsFp16();
+        const gpuCanSafelyCoReside = await checkWebGpuCanSafelyCoReside();
 
-        // 若使用者尚未執行全文預分析就直接呼叫 startPipeline，自動補跑一次預分析並套用推薦參數
         if (!useAppStore.getState().audioPreAnalysis) {
           useAppStore.getState().setIsPreAnalyzingAudio(true);
           try {
@@ -774,9 +777,15 @@ export function usePipelineScheduler() {
             currentConfig.diarizationConfig
               ?.enableVirtualSpeakerTrackStitching ?? false;
 
-          // 僅當顯卡原生支援 shader-f16 且使用者開啟雙模型常駐時，才允許 Whisper 與 WebLLM 同時駐留顯存
           const canSafelyCoReside =
-            Boolean(currentConfig.keepModelsCoResident) && gpuSupportsFp16;
+            Boolean(currentConfig.keepModelsCoResident) && gpuCanSafelyCoReside;
+
+          const useCloudAsr =
+            currentConfig.mode === 'byok_cloud' &&
+            Boolean(
+              currentConfig.groqApiKey.trim() ||
+                currentConfig.geminiApiKey.trim()
+            );
 
           const modeLabel =
             engineMode === 'mode_0_heritage_classic'
@@ -791,7 +800,7 @@ export function usePipelineScheduler() {
             stage: 'preprocessing',
             progress: 10,
             detailText:
-              '音訊切片、85Hz 零相位濾波與前瞻包絡響度正規化中...',
+              '音訊切片、85Hz 原地零相位濾波與前瞻包絡響度正規化中...',
           });
 
           const { samples: chunkSamples } =
@@ -799,7 +808,8 @@ export function usePipelineScheduler() {
               file,
               chunkMeta.startTime,
               chunkMeta.endTime,
-              totalDurationSec
+              totalDurationSec,
+              false
             );
 
           if (globalAbortFlag) break;
@@ -831,14 +841,10 @@ export function usePipelineScheduler() {
 
           if (globalAbortFlag) break;
 
-          useAppStore.getState().upsertSpeakers(updatedSpeakers);
+          // 給予瀏覽器 180ms 徹底回收已終止之 Diarization Worker 及其 WASM 記憶體池，再啟動 ASR Worker
+          await new Promise((r) => setTimeout(r, 180));
 
-          const useCloudAsr =
-            currentConfig.mode === 'byok_cloud' &&
-            Boolean(
-              currentConfig.groqApiKey.trim() ||
-                currentConfig.geminiApiKey.trim()
-            );
+          useAppStore.getState().upsertSpeakers(updatedSpeakers);
 
           let asrWorker: Worker | null = null;
           if (!useCloudAsr) {
@@ -930,9 +936,6 @@ export function usePipelineScheduler() {
             pendingWindowChars = 0;
           };
 
-          // ==================================================================
-          // 分支 A：語者專屬虛擬音軌拼接轉寫 (Virtual Speaker-Track Stitching)
-          // ==================================================================
           if (useVirtualTrackStitching && speakerTrackBatches.length > 0) {
             useAppStore.getState().updateChunkState(cIdx, {
               stage: 'transcribing',
@@ -1058,6 +1061,7 @@ export function usePipelineScheduler() {
                       chunkIndex: cIdx,
                       batchIndex: bIdx,
                       modelName: currentConfig.localAsrModel,
+                      granularityTier: currentConfig.granularityTier,
                       languageHint,
                       acousticThreshold: currentConfig.acousticThreshold,
                     });
@@ -1100,9 +1104,6 @@ export function usePipelineScheduler() {
               }
             }
           } else {
-            // ================================================================
-            // 分支 B：【次世代主力推薦】12~22s 靜音谷底最佳化視窗 + Cross-Attention DTW 字級 Viterbi 對齊
-            // ================================================================
             for (let wIdx = 0; wIdx < asrWindows.length; wIdx++) {
               if (globalAbortFlag) break;
               const win = asrWindows[wIdx];
@@ -1121,7 +1122,6 @@ export function usePipelineScheduler() {
                 relStartSample,
                 relEndSample
               );
-              // 【雙軌分流】：語者分離使用純線性 85Hz 高通波形保留真實能量谷底；送交 Whisper ASR 之視窗則執行 VAD 閘控前瞻響度補償，強化遠距小聲尾音！
               const winSamples =
                 currentConfig.diarizationConfig?.enableZeroPhaseLoudnessNorm !==
                 false
@@ -1247,6 +1247,7 @@ export function usePipelineScheduler() {
                       chunkIndex: cIdx,
                       windowIndex: wIdx,
                       modelName: currentConfig.localAsrModel,
+                      granularityTier: currentConfig.granularityTier,
                       languageHint,
                       acousticThreshold: currentConfig.acousticThreshold,
                       asrBeamSize: currentConfig.asrBeamSize,
@@ -1274,7 +1275,6 @@ export function usePipelineScheduler() {
                     ? existingSegs[existingSegs.length - 1]
                     : null;
 
-                // 【方向二 先句後詞】：連同上一個視窗的最後一段一起執行 Stage 1 跨句尾字掉落/搶字/殘句修復
                 const combinedForStage1 = lastPriorSeg
                   ? [lastPriorSeg, ...windowSegments]
                   : windowSegments;
@@ -1290,7 +1290,6 @@ export function usePipelineScheduler() {
                   stage1Fixed.length > 0 &&
                   stage1Fixed[0].id === lastPriorSeg.id
                 ) {
-                  // 若上一個視窗的末段因吸收了本視窗開頭的掉落尾字而更新，立即同步回 Store
                   useAppStore
                     .getState()
                     .replaceBatchSegments([stage1Fixed[0]]);
@@ -1389,6 +1388,7 @@ export function usePipelineScheduler() {
                       subSamples,
                       targetSegment: targetSeg,
                       modelName: currentConfig.localAsrModel,
+                      granularityTier: currentConfig.granularityTier,
                       languageHint:
                         currentConfig.diarizationConfig?.languageHint || 'zh',
                     });
@@ -1401,7 +1401,6 @@ export function usePipelineScheduler() {
             },
           });
 
-          // 【關鍵顯存防線】：在啟動本地 WebLLM 回溯精修前，若非安全常駐模式，必須徹底 Terminate ASR Worker 以釋放 ONNX WebGPU D3D12 PlacedResources！
           if (!canSafelyCoReside && asrWorker) {
             await terminateAsrWorkerAndReclaimVram();
             asrWorker = null;
