@@ -813,20 +813,13 @@ function restoreMultilingualPunctuation(
           return `${leftChunk}${rightChunk}`;
         }
         const isShortStandaloneInterjection =
-          /^(對|好|不是|沒有|算|不算|沒錯|可以|對啊|好啊|好那|喂)$/.test(
+          /^(對|好|是|不是|沒有|算|不算|沒錯|可以|對啊|好啊|好那|那|有|喂)$/.test(
             leftChunk
           );
-        if (isShortStandaloneInterjection && rightChunk.length >= 2) {
+        if (isShortStandaloneInterjection) {
           return `${leftChunk}，${rightChunk}`;
         }
-        // 嚴格防止 Whisper 子詞空白在專有名詞或動賓結構中誤插逗號（如「也是園 民會」、「苦 茶油」、「品牌 計畫」、「大概 十月中」）
-        if (
-          leftChunk.length <= 3 ||
-          rightChunk.length <= 3 ||
-          /[是有在的之把被對給向到去來要會能可以沒不很最更太真好再第那這一個些種處案部會局署室科組股苦園原民尖五武大十概牌]$/.test(
-            leftChunk
-          )
-        ) {
+        if (leftChunk.length <= 2) {
           return `${leftChunk}${rightChunk}`;
         }
         return `${leftChunk}，${rightChunk}`;
@@ -848,8 +841,7 @@ function restoreMultilingualPunctuation(
     .replace(/沒有，(嗎|呢|啊|吧|喔|要|問題|關係|辦法)/g, '沒有$1')
     .replace(/另外，(一[個種邊家位半])/g, '另外$1')
     .replace(/對，(長官|貴賓|同仁|講者|團隊|於|他|她|你|我|大家|口)/g, '對$1')
-    .replace(/(也是|這個是|一個是|另外一個是)([\u4e00-\u9fa5])，([\u4e00-\u9fa5]{1,3})/g, '$1$2$3')
-    .replace(/([\u4e00-\u9fa5])，(民會|茶油|計畫|工程|補助|培訓|培訊|空間|巴士|部落|部門|部分|目前|左右|而已|十月中)/g, '$1$2');
+    .replace(/([\u4e00-\u9fa5])，(民會|茶油|計畫|工程|補助|培訓|培訊|空間|巴士|部落|部門|部分|目前|左右|而已)/g, '$1$2');
 
   text = text.replace(
     /([\u4e00-\u9fa5A-Za-z0-9]{4,})(但是|可是|不過|因為|所以|如果說|不然的話|否則|那如果|而且|然後|ですが|けれども|しかし|ただ)/g,
@@ -1083,23 +1075,22 @@ function splitClauseAtAcousticSwitches(
         continue;
       }
 
-      const distPen = Math.abs(idx - rawIdx) * 0.42;
+      const distPen = Math.abs(idx - rawIdx) * 0.38;
       const prevChar = chars[idx - 1];
       let score = -distPen;
       if (/[，、；：,:;\s]/.test(prevChar)) {
         score += 3.5;
-      } else if (
-        UNIVERSAL_CLAUSE_STARTER_REGEX.test(restStr) &&
-        tokenBoundarySet.has(idx)
-      ) {
-        score += 2.6;
+      } else if (UNIVERSAL_CLAUSE_STARTER_REGEX.test(restStr)) {
+        score += 2.5;
+      } else if (tokenBoundarySet.has(idx)) {
+        score += 1.4;
       }
       if (score > bestScore) {
         bestScore = score;
         bestIdx = idx;
       }
     }
-    if (bestIdx >= 3 && bestScore >= 1.15) {
+    if (bestIdx >= 3 && bestScore >= 0.45) {
       splitPoints.push({ charIdx: bestIdx, timeSec: st });
     }
   }
@@ -1294,165 +1285,6 @@ async function runWhisperWithWordTimestampsAndFallback(
         ];
 
   releaseResidualGpuTensors(output);
-
-  // 【遠距微弱語音漏字區段自動補抓機制 (Uncovered Voiced-Gap Sub-Slice Recovery)】：
-  // 當同一視窗內既有大聲主講人又有遠距小聲插話（如 00:04~00:11「優先推動區，現在還有幾處啊？」或 00:32~00:37「24號 / 禮拜三早上」），
-  // Whisper 可能於停頓處提早結束或跳過遠距低能量區段。此處自動掃描視窗內未被文字覆蓋且具聲帶諧波 (harm >= 0.42) 之 >= 1.35s 區間，獨立正規化並補抓轉寫！
-  const totalDurSec = audioInput.length / 16000;
-  if (!isWordLevel && totalDurSec >= 4.0) {
-    const coveredIntervals: Array<[number, number]> = [];
-    for (const rc of rawChunks) {
-      const t = (rc.text || '').trim();
-      if (!t) continue;
-      const s = typeof rc.timestamp?.[0] === 'number' ? rc.timestamp[0] : 0;
-      const e =
-        typeof rc.timestamp?.[1] === 'number' && rc.timestamp[1] !== null
-          ? rc.timestamp[1]
-          : totalDurSec;
-      if (e > s + 0.1) {
-        coveredIntervals.push([s, Math.min(totalDurSec, e)]);
-      }
-    }
-    coveredIntervals.sort((a, b) => a[0] - b[0]);
-
-    const candidateGaps: Array<[number, number]> = [];
-    let cursorSec = 0.0;
-    for (const [cs, ce] of coveredIntervals) {
-      if (cs - cursorSec >= 1.35) {
-        candidateGaps.push([cursorSec, cs]);
-      }
-      cursorSec = Math.max(cursorSec, ce);
-    }
-    if (totalDurSec - cursorSec >= 1.35) {
-      candidateGaps.push([cursorSec, totalDurSec]);
-    }
-
-    if (candidateGaps.length > 0) {
-      const frameLen = 320; // 20ms
-      const numF = Math.floor(audioInput.length / frameLen);
-      const fRms = new Float32Array(numF);
-      for (let f = 0; f < numF; f++) {
-        let sumSq = 0;
-        const base = f * frameLen;
-        for (let i = 0; i < frameLen; i++) {
-          const v = audioInput[base + i];
-          sumSq += v * v;
-        }
-        fRms[f] = Math.sqrt(sumSq / frameLen);
-      }
-      const sortedWinRms = Array.from(fRms).sort((a, b) => a - b);
-      const winNoiseFloor = Math.max(
-        0.0015,
-        sortedWinRms[Math.floor(sortedWinRms.length * 0.12)] || 0.004
-      );
-
-      for (const [gStart, gEnd] of candidateGaps) {
-        const fStart = Math.max(0, Math.floor(gStart / 0.02));
-        const fEnd = Math.min(numF - 1, Math.ceil(gEnd / 0.02));
-        let voicedFrameCount = 0;
-
-        for (let f = fStart; f <= fEnd; f++) {
-          if (fRms[f] < winNoiseFloor * 1.12) continue;
-          const base = f * frameLen;
-          if (base + 380 >= audioInput.length) continue;
-          let maxC = 0.0;
-          for (let lag = 50; lag <= 212; lag += 3) {
-            let sum = 0;
-            let nA = 0;
-            let nB = 0;
-            for (let i = 0; i < 160; i += 2) {
-              const a = audioInput[base + i];
-              const b = audioInput[base + i + lag];
-              sum += a * b;
-              nA += a * a;
-              nB += b * b;
-            }
-            const c = nA > 1e-8 && nB > 1e-8 ? sum / Math.sqrt(nA * nB) : 0;
-            if (c > maxC) maxC = c;
-          }
-          if (maxC >= 0.42) {
-            voicedFrameCount++;
-          }
-        }
-
-        // 若未覆蓋區間內含有至少 0.24 秒 (12 幀) 之真實人聲諧波，獨立切出並正規化至最佳響度補抓轉寫
-        if (voicedFrameCount >= 12) {
-          const padStartSec = Math.max(0, gStart - 0.12);
-          const padEndSec = Math.min(totalDurSec, gEnd + 0.12);
-          const sSample = Math.floor(padStartSec * 16000);
-          const eSample = Math.ceil(padEndSec * 16000);
-          const subSlice = new Float32Array(eSample - sSample);
-          subSlice.set(audioInput.subarray(sSample, eSample));
-
-          // 計算 98% 分位數峰值（避開單點撞擊雜音），將遠距微弱語音拉升至 0.68 最佳振幅
-          const absVals: number[] = [];
-          for (let i = 0; i < subSlice.length; i += 4) {
-            absVals.push(Math.abs(subSlice[i]));
-          }
-          absVals.sort((a, b) => a - b);
-          const p98Peak =
-            absVals[Math.floor(absVals.length * 0.98)] || 0.02;
-          const subGain = Math.min(4.2, Math.max(1.0, 0.68 / p98Peak));
-          for (let i = 0; i < subSlice.length; i++) {
-            subSlice[i] = Math.max(
-              -0.88,
-              Math.min(0.88, subSlice[i] * subGain)
-            );
-          }
-
-          try {
-            const gapOut = await transcriber(subSlice, {
-              language: resolvedWhisperLang,
-              task: 'transcribe',
-              return_timestamps: true,
-              chunk_length_s: Math.min(20, Math.ceil(padEndSec - padStartSec + 1)),
-              stride_length_s: 2,
-            });
-            const gapChunks: Array<{
-              text: string;
-              timestamp?: [number, number | null];
-            }> =
-              gapOut && Array.isArray(gapOut.chunks) && gapOut.chunks.length > 0
-                ? gapOut.chunks
-                : typeof gapOut?.text === 'string' && gapOut.text.trim()
-                ? [
-                    {
-                      text: gapOut.text,
-                      timestamp: [0, padEndSec - padStartSec],
-                    },
-                  ]
-                : [];
-            releaseResidualGpuTensors(gapOut);
-
-            for (const gc of gapChunks) {
-              const gt = (gc.text || '').trim();
-              if (!gt || /^[a-zA-Z,.?!\s]{1,8}$/.test(gt)) continue;
-              const gs =
-                typeof gc.timestamp?.[0] === 'number' ? gc.timestamp[0] : 0;
-              const ge =
-                typeof gc.timestamp?.[1] === 'number' &&
-                gc.timestamp[1] !== null
-                  ? gc.timestamp[1]
-                  : padEndSec - padStartSec;
-              rawChunks.push({
-                text: gt,
-                timestamp: [
-                  Number((padStartSec + gs).toFixed(2)),
-                  Number(Math.min(totalDurSec, padStartSec + ge).toFixed(2)),
-                ],
-              });
-            }
-          } catch {
-            // ignore gap recovery error
-          }
-        }
-      }
-
-      rawChunks.sort(
-        (a, b) => (a.timestamp?.[0] ?? 0) - (b.timestamp?.[0] ?? 0)
-      );
-    }
-  }
 
   return {
     chunks: rawChunks,
@@ -1656,36 +1488,8 @@ function normalizeWhisperChunksToWordItems(
 
     for (let cIdx = 0; cIdx < numClauses; cIdx++) {
       const cText = clauses[cIdx];
-      let cStart = clauseBounds[cIdx];
-      let cEnd = Math.max(cStart + 0.16, clauseBounds[cIdx + 1]);
-
-      // 若子句起點落於兩個微觀話輪之間的靜音區段（如 38.8s~40.5s 停頓），自動將 cStart 推進至下一個發聲話輪起點，防止首字（「第」、「一個」）被映射到靜音底噪區！
-      if (windowTurns.length > 0) {
-        const activeAtStart = windowTurns.some(
-          (ft) => cStart >= ft.start - 0.08 && cStart <= ft.end + 0.08
-        );
-        if (!activeAtStart) {
-          const nextActiveTurn = windowTurns.find(
-            (ft) => ft.start > cStart && ft.start < cEnd - 0.22
-          );
-          if (nextActiveTurn) {
-            cStart = Number(nextActiveTurn.start.toFixed(3));
-          }
-        }
-        const activeAtEnd = windowTurns.some(
-          (ft) => cEnd >= ft.start - 0.08 && cEnd <= ft.end + 0.08
-        );
-        if (!activeAtEnd) {
-          const prevActiveTurn = [...windowTurns]
-            .reverse()
-            .find((ft) => ft.end < cEnd && ft.end > cStart + 0.22);
-          if (prevActiveTurn) {
-            cEnd = Number(
-              Math.max(cStart + 0.20, prevActiveTurn.end + 0.06).toFixed(3)
-            );
-          }
-        }
-      }
+      const cStart = clauseBounds[cIdx];
+      const cEnd = Math.max(cStart + 0.16, clauseBounds[cIdx + 1]);
 
       const midClauseSwitches = internalSwitches.filter(
         (st) =>
