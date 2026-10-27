@@ -710,3 +710,32 @@ export interface EngineConfig {
   /** 相容別名：與 diarizationConfig 同步 */
   diarization?: DiarizationConfig;
 }
+
+
+// ============================================================================
+// 【會議 AI 摘要、重要結論與行動事項報告 (`MeetingMinutesReport`)】
+// ============================================================================
+
+export interface MeetingTopicDecisionItem {
+  topic: string;
+  keyPoints: string;
+  conclusion: string;
+}
+
+export interface MeetingActionItem {
+  id: string;
+  task: string;
+  owner: string;
+  deadlineOrTimeline: string;
+  statusNote: string;
+}
+
+export interface MeetingMinutesReport {
+  generatedAt: string;
+  engineUsed: 'gemini_cloud' | 'local_webllm' | 'hybrid_discourse_analyzer';
+  meetingTitle: string;
+  executiveSummary: string;
+  keyConclusions: string[];
+  topicBreakdowns: MeetingTopicDecisionItem[];
+  actionItems: MeetingActionItem[];
+}
