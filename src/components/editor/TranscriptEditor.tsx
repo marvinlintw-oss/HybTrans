@@ -3,12 +3,17 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   BookOpen,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  ClipboardList,
+  Copy,
   Download,
+  FileText,
   HelpCircle,
   Info,
+  ListChecks,
   Loader2,
   Play,
   RefreshCw,
@@ -29,7 +34,10 @@ import {
   exportAsDocx,
   exportAsMarkdown,
   exportAsSrt,
+  exportMeetingMinutesAsDocx,
+  exportMeetingMinutesAsMarkdown,
   exportProjectJson,
+  formatMeetingMinutesToMarkdown,
 } from '../../utils/exporter';
 import { AudioRecommendationOption, Segment } from '../../types';
 
@@ -196,6 +204,8 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
     selectedPresetId,
     applyRecommendedPreset,
     config,
+    meetingMinutes,
+    isGeneratingMinutes,
   } = useAppStore();
 
   const {
@@ -203,6 +213,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
     preAnalyzeAudioFile,
     startPipeline,
     triggerRetroactivePass,
+    generateMeetingMinutes,
   } = usePipelineScheduler();
   const { audioRef, seekToWord, handleTimeUpdate } = useAudioPlayerSync();
 
@@ -212,7 +223,10 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
   const [polishFeedback, setPolishFeedback] = useState<string | null>(null);
   const [showMobileExportMenu, setShowMobileExportMenu] =
     useState<boolean>(false);
+  const [showMinutesCard, setShowMinutesCard] = useState<boolean>(true);
+  const [copiedMinutes, setCopiedMinutes] = useState<boolean>(false);
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
+  const minutesSectionRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!showMobileExportMenu) return;
@@ -270,6 +284,30 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
     }
   };
 
+  const handleGenerateAndScrollMinutes = async () => {
+    if (isGeneratingMinutes || segments.length === 0) return;
+    setShowMinutesCard(true);
+    await generateMeetingMinutes();
+    setTimeout(() => {
+      minutesSectionRef.current?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'start',
+      });
+    }, 100);
+  };
+
+  const handleCopyMinutesMarkdown = async () => {
+    if (!meetingMinutes) return;
+    try {
+      const md = formatMeetingMinutesToMarkdown(meetingMinutes);
+      await navigator.clipboard.writeText(md);
+      setCopiedMinutes(true);
+      setTimeout(() => setCopiedMinutes(false), 2500);
+    } catch {
+      // ignore clipboard fallback
+    }
+  };
+
   const showFullPreAnalysisCards =
     Boolean(audioFile) &&
     (isPreAnalyzingAudio ||
@@ -314,42 +352,64 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
             </button>
           )}
 
-          {/* 已有逐字稿結果且非轉寫中時：明確並列「✨ AI 全文順稿」與「換方案重跑」 */}
-          {hasTranscript && !isRunning && (
+          {/* 已有逐字稿結果時：並列「✨ AI 全文順稿」、「📝 生成會議摘要與結論」與「換方案重跑」 */}
+          {hasTranscript && (
             <>
-              <button
-                type="button"
-                onClick={handlePolishOnlyWithoutRerun}
-                disabled={isPolishingText}
-                className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-xs transition-colors cursor-pointer"
-              >
-                {isPolishingText ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-                ) : (
-                  <Wand2 className="w-3.5 h-3.5 shrink-0" />
-                )}
-                <span>✨ AI 全文順稿</span>
-              </button>
+              {!isRunning && (
+                <button
+                  type="button"
+                  onClick={handlePolishOnlyWithoutRerun}
+                  disabled={isPolishingText}
+                  className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-xs transition-colors cursor-pointer"
+                >
+                  {isPolishingText ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                  ) : (
+                    <Wand2 className="w-3.5 h-3.5 shrink-0" />
+                  )}
+                  <span>✨ AI 全文順稿</span>
+                </button>
+              )}
 
               <button
                 type="button"
-                onClick={() => setManualExpandPreAnalysis((prev) => !prev)}
-                className={`inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition-colors cursor-pointer ${
-                  manualExpandPreAnalysis
-                    ? 'bg-slate-800 text-white border-slate-800'
-                    : 'text-slate-700 hover:bg-slate-100 bg-slate-50 border-slate-300'
-                }`}
+                onClick={handleGenerateAndScrollMinutes}
+                disabled={isGeneratingMinutes}
+                className="inline-flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white text-xs font-semibold px-3 py-1.5 rounded-lg shadow-xs transition-colors cursor-pointer"
               >
-                <RotateCcw className="w-3.5 h-3.5 shrink-0" />
-                <span>
-                  {manualExpandPreAnalysis ? '收起方案面板' : '換方案重跑'}
-                </span>
-                {manualExpandPreAnalysis ? (
-                  <ChevronUp className="w-3.5 h-3.5" />
+                {isGeneratingMinutes ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
                 ) : (
-                  <ChevronDown className="w-3.5 h-3.5" />
+                  <ClipboardList className="w-3.5 h-3.5 shrink-0" />
                 )}
+                <span>
+                  {meetingMinutes
+                    ? '📋 會議摘要與結論'
+                    : '📝 生成會議摘要與行動事項'}
+                </span>
               </button>
+
+              {!isRunning && (
+                <button
+                  type="button"
+                  onClick={() => setManualExpandPreAnalysis((prev) => !prev)}
+                  className={`inline-flex items-center gap-1 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition-colors cursor-pointer ${
+                    manualExpandPreAnalysis
+                      ? 'bg-slate-800 text-white border-slate-800'
+                      : 'text-slate-700 hover:bg-slate-100 bg-slate-50 border-slate-300'
+                  }`}
+                >
+                  <RotateCcw className="w-3.5 h-3.5 shrink-0" />
+                  <span>
+                    {manualExpandPreAnalysis ? '收起方案面板' : '換方案重跑'}
+                  </span>
+                  {manualExpandPreAnalysis ? (
+                    <ChevronUp className="w-3.5 h-3.5" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  )}
+                </button>
+              )}
             </>
           )}
 
@@ -357,7 +417,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
           <div className="flex items-center gap-1.5 ml-auto sm:ml-0">
             <button
               type="button"
-              onClick={() => exportAsDocx(segments, speakers)}
+              onClick={() => exportAsDocx(segments, speakers, meetingMinutes)}
               disabled={!segments.length}
               className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white text-xs font-semibold px-2.5 sm:px-3 py-1.5 rounded-lg cursor-pointer transition-colors"
             >
@@ -368,7 +428,9 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
             <div className="hidden xl:flex items-center gap-1.5 text-xs">
               <button
                 type="button"
-                onClick={() => exportAsMarkdown(segments, speakers)}
+                onClick={() =>
+                  exportAsMarkdown(segments, speakers, meetingMinutes)
+                }
                 disabled={!segments.length}
                 className="border border-slate-200 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
               >
@@ -384,7 +446,9 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
               </button>
               <button
                 type="button"
-                onClick={() => exportProjectJson(segments, speakers)}
+                onClick={() =>
+                  exportProjectJson(segments, speakers, meetingMinutes)
+                }
                 disabled={!segments.length}
                 className="border border-slate-200 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 disabled:opacity-50 cursor-pointer"
               >
@@ -415,17 +479,29 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
               </button>
 
               {showMobileExportMenu && segments.length > 0 && (
-                <div className="absolute right-0 top-full mt-1.5 w-44 bg-white border border-slate-200 rounded-xl shadow-xl p-1.5 z-40 text-xs space-y-1">
+                <div className="absolute right-0 top-full mt-1.5 w-48 bg-white border border-slate-200 rounded-xl shadow-xl p-1.5 z-40 text-xs space-y-1">
                   <button
                     type="button"
                     onClick={() => {
-                      exportAsMarkdown(segments, speakers);
+                      exportAsMarkdown(segments, speakers, meetingMinutes);
                       setShowMobileExportMenu(false);
                     }}
                     className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 font-medium cursor-pointer"
                   >
                     📝 匯出 Markdown (.md)
                   </button>
+                  {meetingMinutes && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        exportMeetingMinutesAsDocx(meetingMinutes);
+                        setShowMobileExportMenu(false);
+                      }}
+                      className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-emerald-50 text-emerald-700 font-medium cursor-pointer"
+                    >
+                      📋 單獨匯出會議摘要 (.docx)
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => {
@@ -439,7 +515,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
                   <button
                     type="button"
                     onClick={() => {
-                      exportProjectJson(segments, speakers);
+                      exportProjectJson(segments, speakers, meetingMinutes);
                       setShowMobileExportMenu(false);
                     }}
                     className="w-full text-left px-2.5 py-1.5 rounded-lg hover:bg-slate-100 text-slate-700 font-medium cursor-pointer"
@@ -495,7 +571,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
             </span>
             {hasTranscript && !isRunning && (
               <span className="text-[11px] text-emerald-700 font-medium hidden md:inline">
-                💡 點擊字詞可聽原音或選同音候選詞；想潤飾全文請點「✨ AI 全文順稿」。
+                💡 點擊字詞可聽原音或選同音候選詞；點「📝 生成會議摘要與行動事項」可整理全場結論。
               </span>
             )}
           </div>
@@ -548,7 +624,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
               </div>
               <p className="text-[11px] text-slate-600">
                 {preAnalysisProgress.detailText ||
-                  '正在掃描全場信噪比、雙分位底噪、基頻半音跨度、每分鐘話輪轉換率與預估語者人數...'}
+                  '正在掃描全場信噪比、雙分位底噪、YIN 基頻半音跨度、每分鐘話輪轉換率與預估語者人數...'}
               </p>
             </div>
           ) : (
@@ -651,7 +727,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
                   </div>
                 </div>
 
-                {/* 3 組白話情境推薦卡片 (手機單欄垂直排列、電腦三欄並列) */}
+                {/* 3 組白話情境推薦卡片 */}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 sm:gap-3">
                   {audioPreAnalysis.recommendations.map((opt) => {
                     const isSelected = selectedPresetId === opt.id;
@@ -752,7 +828,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
                       </strong>{' '}
                       · 已啟用{' '}
                       <strong className="text-indigo-700">
-                        「先句後詞兩階段語意與槽位精修」
+                        「YIN 基頻防倍頻 + 遠場響度補償 + 早期 AI 語境介入」
                       </strong>
                     </span>
                     <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
@@ -786,7 +862,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
         </div>
       )}
 
-      {/* 逐字稿段落列表 (RWD：手機為上下堆疊卡片讓文字佔滿 100% 寬度；平板與電腦為左右分欄) */}
+      {/* 逐字稿段落列表與會議 AI 摘要面板 */}
       <div className="flex-1 overflow-y-auto p-3 sm:p-5 md:p-6 space-y-2.5 sm:space-y-4 bg-white">
         {segments.length === 0 && !isPreAnalyzingAudio && (
           <div className="h-full flex flex-col items-center justify-center text-center text-slate-400 space-y-3 py-10 px-4">
@@ -796,7 +872,7 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
                 : '請點擊左上角「載入會議錄音檔」開始 3～5 秒全文深度聲學預分析'}
             </p>
             <p className="text-xs text-slate-400 max-w-md leading-relaxed">
-              系統將自動完成全場多點聲學體檢、推薦最佳語者分離參數，並以「先句後詞（先修跨段尾字掉落與句子完整性，再修同音單詞）」雙階段檢核產出高品質逐字稿。
+              系統將自動完成全場多點聲學體檢、推薦最佳語者分離參數，並以「先句後詞（先修跨段尾字掉落與句子完整性，再修同音單詞）」雙階段檢核產出高品質逐字稿與會議摘要。
             </p>
 
             {/* 手機/平板快速設定捷徑按鈕 */}
@@ -818,6 +894,233 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
                   <BookOpen className="w-3.5 h-3.5 text-indigo-600" />
                   <span>同步字典或上傳簡報</span>
                 </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 結構化會議 AI 摘要、重要結論與行動事項報告面板 */}
+        {meetingMinutes && (
+          <div
+            ref={minutesSectionRef}
+            className="rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50/70 via-white to-indigo-50/40 p-3.5 sm:p-5 shadow-xs space-y-3.5 mb-4"
+          >
+            <div className="flex items-start justify-between gap-2 flex-wrap border-b border-emerald-200/70 pb-2.5">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-600 text-white text-xs font-bold shadow-2xs">
+                    <ClipboardList className="w-3.5 h-3.5" />
+                    <span>會議 AI 摘要、結論與行動事項</span>
+                  </span>
+                  <span className="text-[11px] text-slate-500">
+                    產生時間：
+                    {new Date(meetingMinutes.generatedAt).toLocaleTimeString(
+                      'zh-TW',
+                      { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+                    )}
+                  </span>
+                </div>
+                <h3 className="text-sm sm:text-base font-bold text-slate-900">
+                  {meetingMinutes.title}
+                </h3>
+              </div>
+
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <button
+                  type="button"
+                  onClick={handleCopyMinutesMarkdown}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 text-xs font-medium cursor-pointer shadow-2xs"
+                >
+                  {copiedMinutes ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                      <span className="text-emerald-700">已複製 Markdown</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5 text-slate-500" />
+                      <span>複製摘要</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => exportMeetingMinutesAsMarkdown(meetingMinutes)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 text-xs font-medium cursor-pointer shadow-2xs"
+                >
+                  <FileText className="w-3.5 h-3.5 text-indigo-600" />
+                  <span>匯出 .md</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => exportMeetingMinutesAsDocx(meetingMinutes)}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold cursor-pointer shadow-2xs"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>匯出摘要 Word</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => generateMeetingMinutes()}
+                  disabled={isGeneratingMinutes}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white hover:bg-slate-50 text-slate-600 border border-slate-200 text-xs cursor-pointer"
+                  title="依據最新修改之逐字稿與語者姓名重新生成摘要"
+                >
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 ${
+                      isGeneratingMinutes ? 'animate-spin text-emerald-600' : ''
+                    }`}
+                  />
+                  <span className="hidden sm:inline">重新生成</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowMinutesCard((prev) => !prev)}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-medium cursor-pointer"
+                >
+                  {showMinutesCard ? (
+                    <>
+                      <ChevronUp className="w-3.5 h-3.5" />
+                      <span>收合</span>
+                    </>
+                  ) : (
+                    <>
+                      <ChevronDown className="w-3.5 h-3.5" />
+                      <span>展開報告</span>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {showMinutesCard && (
+              <div className="space-y-4 text-xs sm:text-sm text-slate-800">
+                {/* 1. 執行摘要 */}
+                <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-1">
+                  <div className="font-bold text-xs text-indigo-900 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+                    <span>一、會議執行摘要 (Executive Summary)</span>
+                  </div>
+                  <p className="text-xs sm:text-sm text-slate-700 leading-relaxed">
+                    {meetingMinutes.executiveSummary}
+                  </p>
+                </div>
+
+                {/* 2. 重要結論與裁示事項 */}
+                <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-1.5">
+                  <div className="font-bold text-xs text-emerald-900 flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>二、重要結論與裁示事項</span>
+                  </div>
+                  <ul className="space-y-1.5 pl-1">
+                    {meetingMinutes.keyConclusions.map((item, idx) => (
+                      <li
+                        key={idx}
+                        className="text-xs sm:text-sm text-slate-700 leading-relaxed flex items-start gap-2"
+                      >
+                        <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px] shrink-0 mt-0.5">
+                          {idx + 1}
+                        </span>
+                        <span>{item}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                {/* 3. 各議題討論重點與決議 */}
+                {meetingMinutes.topicBreakdowns.length > 0 && (
+                  <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-2">
+                    <div className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
+                      <FileText className="w-3.5 h-3.5 text-blue-600" />
+                      <span>三、各議題討論重點與決議</span>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-200 bg-slate-50 text-slate-600">
+                            <th className="py-1.5 px-2.5 font-semibold w-1/4">
+                              議題 / 專案名稱
+                            </th>
+                            <th className="py-1.5 px-2.5 font-semibold w-5/12">
+                              討論現況與重點
+                            </th>
+                            <th className="py-1.5 px-2.5 font-semibold w-1/3">
+                              決議與裁示
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {meetingMinutes.topicBreakdowns.map((t, idx) => (
+                            <tr key={idx} className="hover:bg-slate-50/80">
+                              <td className="py-2 px-2.5 align-top font-semibold text-slate-800">
+                                <div>{t.topic}</div>
+                                {t.timeRange && (
+                                  <span className="inline-block mt-0.5 text-[10px] font-mono text-slate-400">
+                                    [{t.timeRange}]
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-2 px-2.5 align-top text-slate-600 leading-relaxed">
+                                {t.discussionPoints}
+                              </td>
+                              <td className="py-2 px-2.5 align-top font-medium text-emerald-800 leading-relaxed">
+                                {t.decision}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* 4. 後續行動事項追蹤表 */}
+                {meetingMinutes.actionItems.length > 0 && (
+                  <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-2">
+                    <div className="font-bold text-xs text-amber-900 flex items-center gap-1.5">
+                      <ListChecks className="w-3.5 h-3.5 text-amber-600" />
+                      <span>四、後續行動事項追蹤表 (Action Items)</span>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="border-b border-slate-200 bg-amber-50/60 text-slate-700">
+                            <th className="py-1.5 px-2 font-semibold w-10">
+                              #
+                            </th>
+                            <th className="py-1.5 px-2.5 font-semibold">
+                              具體待辦與行動事項
+                            </th>
+                            <th className="py-1.5 px-2.5 font-semibold w-36">
+                              負責語者 / 單位
+                            </th>
+                            <th className="py-1.5 px-2.5 font-semibold w-28">
+                              目標時程
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {meetingMinutes.actionItems.map((act, idx) => (
+                            <tr key={act.id} className="hover:bg-amber-50/20">
+                              <td className="py-2 px-2 align-top font-mono text-slate-400">
+                                {idx + 1}
+                              </td>
+                              <td className="py-2 px-2.5 align-top font-medium text-slate-800 leading-relaxed">
+                                {act.task}
+                              </td>
+                              <td className="py-2 px-2.5 align-top text-blue-700 font-semibold">
+                                {act.owner}
+                              </td>
+                              <td className="py-2 px-2.5 align-top text-amber-800 font-medium">
+                                {act.deadline}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -870,6 +1173,55 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
             </div>
           );
         })}
+
+        {/* 逐字稿底部「一鍵生成會議 AI 摘要、結論與行動事項」卡片 */}
+        {segments.length > 0 && (
+          <div className="pt-4 pb-6 border-t border-slate-200 mt-6 flex flex-col sm:flex-row items-center justify-between gap-3 bg-slate-50/70 rounded-2xl p-4">
+            <div className="space-y-0.5 text-center sm:text-left">
+              <div className="text-xs sm:text-sm font-bold text-slate-800 flex items-center justify-center sm:justify-start gap-1.5">
+                <ClipboardList className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>
+                  {meetingMinutes
+                    ? '已生成會議 AI 摘要、重要結論與行動事項報告'
+                    : '需要將上方逐字稿整理為正式會議紀錄嗎？'}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500">
+                自動歸納執行摘要、重要裁示結論、各議題討論重點與負責人員待辦事項追蹤表（支援離線與雲端 AI 雙模式，並可匯出 Word / Markdown）。
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              {meetingMinutes && (
+                <button
+                  type="button"
+                  onClick={() => exportMeetingMinutesAsDocx(meetingMinutes)}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-emerald-300 bg-white hover:bg-emerald-50 text-emerald-800 text-xs font-semibold cursor-pointer shadow-2xs"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>下載摘要 Word</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleGenerateAndScrollMinutes}
+                disabled={isGeneratingMinutes}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white text-xs sm:text-sm font-bold cursor-pointer shadow-sm transition-colors"
+              >
+                {isGeneratingMinutes ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Sparkles className="w-4 h-4" />
+                )}
+                <span>
+                  {meetingMinutes
+                    ? '🔄 重新生成會議 AI 摘要與結論'
+                    : '📝 生成會議 AI 摘要、結論與行動事項'}
+                </span>
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
