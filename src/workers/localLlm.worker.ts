@@ -2,8 +2,8 @@
 // 本地 WebLLM (Qwen2.5-3B / Gemma-2-2b) 方向二「先句後詞（Stage 1 句子語意完整性 -> Stage 2 免索引槽位校對）」與三級聲學信心度閘控 (Tier 1~3) 執行引擎
 // 修正重點：
 // 1. 將 OpenCC 改為純字形轉換 ({ from: 'cn', to: 'tw' })，避免 twp 將「對象 -> 物件、文件 -> 檔案、支持 -> 支援」強制改寫。
-// 2. 針對不支援 shader-f16 (fp16) 的顯卡，自動降載至輕量級 FP32 模型 (gemma-2-2b-it-q4f32_1-MLC) 並限制 KV Cache context_window_size: 2048，大幅降低 VRAM 峰值約 55%，徹底預防 D3D12 CreatePlacedResource OOM / DXGI_ERROR_DEVICE_HUNG！
-// 3. 內建 WebGPU 裝置斷線熔斷機制 (WebGPU Device-Lost Circuit Breaker)：一旦偵測到顯卡驅動重置或無可用 Adapter，立即觸發靜默熔斷並交由確定性 Stage 1/2 規則引擎接手，不再於 F12 狂刷 39 條警告與紅字報錯。
+// 2. 針對整合式內顯 (Intel UHD / Iris Xe / AMD Radeon Graphics 等與系統共用 16GB RAM 之環境) 自動啟動「智慧共享記憶體保護」，直接交由零顯存佔用之確定性 Stage 1/2 語意與音韻校對防線處理，徹底根除在轉寫結束階段載入 1.6GB WebLLM 時觸發二次 Out of Memory 崩潰！
+// 3. 內建 WebGPU 裝置斷線熔斷機制 (WebGPU Device-Lost Circuit Breaker)。
 
 import { CreateMLCEngine, MLCEngine } from '@mlc-ai/web-llm';
 import * as OpenCC from 'opencc-js';
@@ -25,11 +25,6 @@ let webGpuDeviceLost = false;
 let cachedResolvedModelId: string | null = null;
 let cachedInputModelId: string | null = null;
 
-/**
- * 針對 WebLLM XGrammar 最佳化之「先句後詞 (Sentence-First, Word-Second)」嚴格 JSON Schema：
- * 1. 先輸出 `contextual_fixes`（Stage 1：全句上下文語意完整性、掉字補齊與標點修復）與 `turn_splits`（語用問答拆句）
- * 2. 再輸出 `slot_corrections`（Stage 2：#S1 ~ #S5 單詞槽位填空，且將 brief_reason 排在 action 與 selected_text 之前）
- */
 const HYBTRANS_SLOT_GER_JSON_SCHEMA = {
   type: 'object',
   properties: {
@@ -139,11 +134,6 @@ const HYBTRANS_SLOT_GER_JSON_SCHEMA = {
   additionalProperties: false,
 };
 
-/**
- * 檢查當前 GPU 是否支援 WebGPU `shader-f16` 擴充功能。
- * 若不支援 `shader-f16`，由於 FP32 權重與激活值消耗雙倍 VRAM，若原請求為 3B/7B 模型，
- * 自動切換為輕量穩健之 `gemma-2-2b-it-q4f32_1-MLC`，避免觸發 D3D12 CreatePlacedResource OOM 與 DXGI_ERROR_DEVICE_HUNG！
- */
 async function resolveFp16CompatibleModelId(
   requestedModelId: string
 ): Promise<string> {
@@ -164,18 +154,59 @@ async function resolveFp16CompatibleModelId(
       webGpuDeviceLost = true;
       throw new Error('WebGPU No available adapters');
     }
+
+    const info =
+      (
+        adapter as unknown as {
+          info?: {
+            vendor?: string;
+            architecture?: string;
+            description?: string;
+          };
+        }
+      ).info || {};
+    const vendor = (info.vendor || '').toLowerCase();
+    const desc = (
+      info.description ||
+      info.architecture ||
+      ''
+    ).toLowerCase();
+    const maxBufferBytes = adapter.limits?.maxBufferSize || 268435456;
+    const maxStorageBytes =
+      adapter.limits?.maxStorageBufferBindingSize || 134217728;
+    const maxBufferSizeMB = Math.round(
+      Math.max(maxBufferBytes, maxStorageBytes) / (1024 * 1024)
+    );
+
+    const isIntegratedGpu =
+      desc.includes('uhd') ||
+      desc.includes('iris') ||
+      desc.includes('hd graphics') ||
+      (vendor.includes('intel') && !desc.includes('arc')) ||
+      (vendor.includes('amd') && desc.includes('radeon(tm) graphics')) ||
+      maxBufferSizeMB < 1536;
+
+    // 若為與系統共用記憶體之整合式內顯 (如 Intel UHD Graphics 16GB RAM)，跳過載入 1.6GB WebLLM，
+    // 全權交由內建零顯存佔用之 Stage 1 + Stage 2 語意/音韻/問答對修復引擎處理，保護分頁 100% 不會因 OOM 崩潰！
+    if (isIntegratedGpu) {
+      webGpuDeviceLost = true;
+      console.info(
+        'ℹ️ [WebLLM 智慧記憶體保護] 偵測到整合式內顯共享記憶體環境，已自動採用零顯存佔用之內建 Stage 1/2 語意與音韻校對引擎，防止系統記憶體溢位。'
+      );
+      throw new Error('Integrated GPU shared-memory protection activated');
+    }
+
     const supportsF16 = Boolean(
       adapter?.features &&
         typeof adapter.features.has === 'function' &&
         adapter.features.has('shader-f16')
     );
     if (!supportsF16) {
-      // 在不支援 shader-f16 的顯卡上，3B FP32 模型容易超出單一 Buffer 限制或觸發 TDR 逾時，自動採用輕量 2B FP32 模型
       const safeF32Id = /3B|7B|8B/i.test(baseId)
         ? 'gemma-2-2b-it-q4f32_1-MLC'
         : baseId.replace('-q4f16_1-MLC', '-q4f32_1-MLC');
       console.info(
-        `ℹ️ [WebLLM] 顯卡不支援 shader-f16 (fp16)，為避免 FP32 顯存溢位，自動採用輕量相容模型: ${safeF32Id}`
+        `ℹ️ [WebLLM] 顯卡不支援 shader-f16 (fp16)，自動採用輕量相容模型: ${safeF32Id}`
       );
       cachedInputModelId = baseId;
       cachedResolvedModelId = safeF32Id;
@@ -234,14 +265,11 @@ async function ensureLlmEngine(modelId: string): Promise<MLCEngine> {
   } catch (err) {
     const msg = String((err as Error)?.message || err);
     if (
-      /DXGI_ERROR_DEVICE|DeviceLost|No available adapters|CreatePlacedResource|OutOfMemory|Failed to create device/i.test(
+      /DXGI_ERROR_DEVICE|DeviceLost|No available adapters|CreatePlacedResource|OutOfMemory|Failed to create device|Integrated GPU/i.test(
         msg
       )
     ) {
       webGpuDeviceLost = true;
-      console.warn(
-        '⚠️ [WebLLM 防護熔斷] 偵測到顯卡 VRAM 滿載或 WebGPU 裝置重置，已自動啟用確定性語意與音韻校對防線（不再重複請求 GPU）。'
-      );
       throw err;
     }
     if (
@@ -354,7 +382,6 @@ self.onmessage = async (event: MessageEvent) => {
     return;
   }
 
-  // 相容交接規範 4.3：支援 STAGE1_SENTENCE_INTEGRITY 獨立檢核訊息
   if (data.type === 'STAGE1_SENTENCE_INTEGRITY') {
     const segments: Segment[] = data.segments || [];
     const repairs: SentenceIntegrityRepair[] = [];
@@ -368,7 +395,6 @@ self.onmessage = async (event: MessageEvent) => {
     return;
   }
 
-  // 相容交接規範 4.3：支援 STAGE2_SLOT_CORRECTION 獨立槽位訊息
   if (data.type === 'STAGE2_SLOT_CORRECTION') {
     self.postMessage({
       type: 'STAGE2_RESULT',
@@ -498,7 +524,6 @@ ${slottedTranscript}`;
           objMatch[0]
         ) as Partial<StructuredSlotGerResponse>;
 
-        // Stage 1A: 先套用全句上下文語意完整性與標點修復 (contextual_fixes)
         if (Array.isArray(parsed.contextual_fixes)) {
           for (const cf of parsed.contextual_fixes) {
             if (!cf.utterance_id || !cf.wrong_span || !cf.corrected_span) {
@@ -563,7 +588,6 @@ ${slottedTranscript}`;
           }
         }
 
-        // Stage 1B: 解析三級聲學信心度閘控之語用拆句與語者移轉 (turn_splits)
         if (Array.isArray(parsed.turn_splits)) {
           for (const ts of parsed.turn_splits) {
             if (
@@ -607,14 +631,12 @@ ${slottedTranscript}`;
           }
         }
 
-        // Stage 2: 在句子結構修復後，解析單詞免索引槽位修正 (slot_corrections)
         if (Array.isArray(parsed.slot_corrections)) {
           for (const sc of parsed.slot_corrections) {
             const slot = slotMap.get(sc.slot_id);
             if (!slot) continue;
             if (sc.action === 'KEEP_ORIGINAL') continue;
 
-            // 避免覆寫已由 Stage 1 整句結構修復處理過的範圍
             if (
               patches.some(
                 (p) =>
