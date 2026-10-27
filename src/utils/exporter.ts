@@ -1,6 +1,6 @@
 // src/utils/exporter.ts
 import JSZip from 'jszip';
-import { Segment, Speaker, WordSpan } from '../types';
+import { MeetingMinutesReport, Segment, Speaker, WordSpan } from '../types';
 
 function formatSrtTime(sec: number): string {
   const hrs = Math.floor(sec / 3600);
@@ -29,10 +29,333 @@ function escapeXml(unsafe: string): string {
 }
 
 /**
- * 將單一 WordSpan 轉換為 OpenXML <w:r> 標籤，保留三態視覺標記：
- * - auto_corrected: 柔和綠底 (#D1FAE5) + 深綠字 (#065F46) + 括號備註原字
- * - semantic_uncertain: 醒目黃底 (#FEF08A) + 候選詞提示
- * - acoustic_uncertain: 橘色波浪底線 (w:u val="wave" color="EA580C")
+ * 將會議 AI 摘要、結論與行動事項格式化為結構化 Markdown 字串
+ */
+export function formatMeetingMinutesToMarkdown(
+  report: MeetingMinutesReport
+): string {
+  const lines: string[] = [];
+  lines.push(`# ${report.title}`);
+  lines.push(
+    `> 產生時間：${new Date(report.generatedAt).toLocaleString('zh-TW')} ｜ 總語者數：${report.speakerStats.length} 位`
+  );
+  lines.push('');
+  lines.push('## 一、會議執行摘要 (Executive Summary)');
+  lines.push(report.executiveSummary);
+  lines.push('');
+
+  lines.push('## 二、重要結論與裁示事項');
+  if (report.keyConclusions.length > 0) {
+    report.keyConclusions.forEach((c, idx) => {
+      lines.push(`${idx + 1}. ${c}`);
+    });
+  } else {
+    lines.push('- （無明確結論項目）');
+  }
+  lines.push('');
+
+  lines.push('## 三、各議題討論重點與決議');
+  if (report.topicBreakdowns.length > 0) {
+    lines.push('| 議題 / 專案名稱 | 討論現況與重點 | 決議與裁示 | 時間區間 |');
+    lines.push('| :--- | :--- | :--- | :--- |');
+    report.topicBreakdowns.forEach((t) => {
+      lines.push(
+        `| **${t.topic.replace(/\|/g, '｜')}** | ${t.discussionPoints.replace(/\|/g, '｜')} | ${t.decision.replace(/\|/g, '｜')} | ${t.timeRange || '-'} |`
+      );
+    });
+  }
+  lines.push('');
+
+  lines.push('## 四、後續行動事項追蹤表 (Action Items)');
+  if (report.actionItems.length > 0) {
+    lines.push('| 編號 | 具體待辦與行動事項 | 負責語者 / 單位 | 目標時程 | 備註 / 依據 |');
+    lines.push('| :--- | :--- | :--- | :--- | :--- |');
+    report.actionItems.forEach((item, idx) => {
+      lines.push(
+        `| #${idx + 1} | **${item.task.replace(/\|/g, '｜')}** | ${item.owner.replace(/\|/g, '｜')} | ${item.deadline.replace(/\|/g, '｜')} | ${(item.contextNote || '-').replace(/\|/g, '｜')} |`
+      );
+    });
+  } else {
+    lines.push('- （未偵測到待辦行動事項）');
+  }
+  lines.push('');
+
+  if (report.speakerStats.length > 0) {
+    lines.push('## 五、與會語者發言統計');
+    lines.push('| 語者名稱 | 發言輪次 | 累計字數 |');
+    lines.push('| :--- | :---: | :---: |');
+    report.speakerStats.forEach((sp) => {
+      lines.push(`| ${sp.speakerName} | ${sp.turnCount} 次 | ${sp.charCount} 字 |`);
+    });
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * 獨立匯出「會議 AI 摘要、結論與行動事項報告 (.md)」
+ */
+export function exportMeetingMinutesAsMarkdown(
+  report: MeetingMinutesReport
+): void {
+  const md = formatMeetingMinutesToMarkdown(report);
+  triggerDownload(
+    md,
+    `會議摘要與行動事項_${new Date().toISOString().slice(0, 10)}.md`,
+    'text/markdown;charset=utf-8'
+  );
+}
+
+/**
+ * 將結構化會議摘要轉為 OpenXML 段落與表格區段（供單獨匯出或附加於逐字稿 Word 檔頂部）
+ */
+function buildMeetingMinutesOpenXmlSection(
+  report: MeetingMinutesReport
+): string {
+  const conclusionsXml = report.keyConclusions
+    .map(
+      (c, i) => `
+    <w:p>
+      <w:pPr><w:spacing w:after="80"/></w:pPr>
+      <w:r>
+        <w:rPr>
+          <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei"/>
+          <w:b/>
+          <w:color w:val="1E40AF"/>
+          <w:sz w:val="21"/>
+        </w:rPr>
+        <w:t>${i + 1}. </w:t>
+      </w:r>
+      <w:r>
+        <w:rPr>
+          <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei"/>
+          <w:color w:val="0F172A"/>
+          <w:sz w:val="21"/>
+        </w:rPr>
+        <w:t>${escapeXml(c)}</w:t>
+      </w:r>
+    </w:p>`
+    )
+    .join('');
+
+  const topicRowsXml = report.topicBreakdowns
+    .map(
+      (t) => `
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="2200" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="F8FAFC"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="1E293B"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(t.topic)}</w:t></w:r></w:p>
+          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="64748B"/><w:sz w:val="16"/></w:rPr><w:t>${escapeXml(t.timeRange || '')}</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="4300" w:type="dxa"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="334155"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(t.discussionPoints)}</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="3000" w:type="dxa"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="065F46"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(t.decision)}</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>`
+    )
+    .join('');
+
+  const actionRowsXml = report.actionItems
+    .map(
+      (a, idx) => `
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="800" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="F8FAFC"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="334155"/><w:sz w:val="20"/></w:rPr><w:t>#${idx + 1}</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="4700" w:type="dxa"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="0F172A"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(a.task)}</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="2200" w:type="dxa"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="1D4ED8"/><w:sz w:val="20"/></w:rPr><w:t>${escapeXml(a.owner)}</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:tcW w:w="1800" w:type="dxa"/></w:tcPr>
+          <w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:color w:val="B45309"/><w:sz w:val="19"/></w:rPr><w:t>${escapeXml(a.deadline)}</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>`
+    )
+    .join('');
+
+  return `
+    <w:p>
+      <w:pPr><w:spacing w:before="120" w:after="120"/></w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="1E3A8A"/></w:rPr>
+        <w:t>壹、會議執行摘要 (Executive Summary)</w:t>
+      </w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:spacing w:line="320" w:lineRule="auto" w:after="200"/></w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:sz w:val="21"/><w:color w:val="1E293B"/></w:rPr>
+        <w:t>${escapeXml(report.executiveSummary)}</w:t>
+      </w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:spacing w:before="160" w:after="120"/></w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="1E3A8A"/></w:rPr>
+        <w:t>貳、重要結論與裁示事項</w:t>
+      </w:r>
+    </w:p>
+    ${conclusionsXml}
+    <w:p>
+      <w:pPr><w:spacing w:before="200" w:after="120"/></w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="1E3A8A"/></w:rPr>
+        <w:t>參、各議題討論重點與決議</w:t>
+      </w:r>
+    </w:p>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblW w:w="9500" w:type="dxa"/>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          <w:bottom w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          <w:left w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          <w:right w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          <w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
+          <w:insideV w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
+        </w:tblBorders>
+        <w:tblCellMar>
+          <w:top w:w="120" w:type="dxa"/>
+          <w:bottom w:w="120" w:type="dxa"/>
+          <w:left w:w="150" w:type="dxa"/>
+          <w:right w:w="150" w:type="dxa"/>
+        </w:tblCellMar>
+      </w:tblPr>
+      <w:tr>
+        <w:tc><w:tcPr><w:tcW w:w="2200" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="1E3A8A"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>議題 / 時間區間</w:t></w:r></w:p></w:tc>
+        <w:tc><w:tcPr><w:tcW w:w="4300" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="1E3A8A"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>討論現況與重點</w:t></w:r></w:p></w:tc>
+        <w:tc><w:tcPr><w:tcW w:w="3000" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="1E3A8A"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>決議與裁示</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      ${topicRowsXml}
+    </w:tbl>
+    <w:p>
+      <w:pPr><w:spacing w:before="240" w:after="120"/></w:pPr>
+      <w:r>
+        <w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="1E3A8A"/></w:rPr>
+        <w:t>肆、後續行動事項追蹤表 (Action Items)</w:t>
+      </w:r>
+    </w:p>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblW w:w="9500" w:type="dxa"/>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          <w:bottom w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          <w:left w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          <w:right w:val="single" w:sz="6" w:space="0" w:color="CBD5E1"/>
+          <w:insideH w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
+          <w:insideV w:val="single" w:sz="4" w:space="0" w:color="E2E8F0"/>
+        </w:tblBorders>
+        <w:tblCellMar>
+          <w:top w:w="120" w:type="dxa"/>
+          <w:bottom w:w="120" w:type="dxa"/>
+          <w:left w:w="150" w:type="dxa"/>
+          <w:right w:w="150" w:type="dxa"/>
+        </w:tblCellMar>
+      </w:tblPr>
+      <w:tr>
+        <w:tc><w:tcPr><w:tcW w:w="800" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="0F766E"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>編號</w:t></w:r></w:p></w:tc>
+        <w:tc><w:tcPr><w:tcW w:w="4700" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="0F766E"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>具體待辦與行動事項</w:t></w:r></w:p></w:tc>
+        <w:tc><w:tcPr><w:tcW w:w="2200" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="0F766E"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>負責語者 / 單位</w:t></w:r></w:p></w:tc>
+        <w:tc><w:tcPr><w:tcW w:w="1800" w:type="dxa"/><w:shd w:val="clear" w:color="auto" w:fill="0F766E"/></w:tcPr><w:p><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:color w:val="FFFFFF"/></w:rPr><w:t>目標時程</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      ${actionRowsXml}
+    </w:tbl>
+  `;
+}
+
+/**
+ * 獨立匯出「會議 AI 摘要、結論與行動事項報告 (.docx)」
+ */
+export async function exportMeetingMinutesAsDocx(
+  report: MeetingMinutesReport
+): Promise<void> {
+  const zip = new JSZip();
+
+  zip.file(
+    '[Content_Types].xml',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default ContentType="application/vnd.openxmlformats-package.relationships+xml" Extension="rels"/>
+  <Default ContentType="application/xml" Extension="xml"/>
+  <Override ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml" PartName="/word/document.xml"/>
+</Types>`
+  );
+
+  zip.folder('_rels')?.file(
+    '.rels',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Target="word/document.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"/>
+</Relationships>`
+  );
+
+  const exportDateStr = new Date(report.generatedAt).toLocaleString('zh-TW');
+  const sectionXml = buildMeetingMinutesOpenXmlSection(report);
+
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:jc w:val="center"/><w:spacing w:after="160"/></w:pPr>
+      <w:r>
+        <w:rPr>
+          <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei"/>
+          <w:b/>
+          <w:sz w:val="32"/>
+          <w:color w:val="0F172A"/>
+        </w:rPr>
+        <w:t>${escapeXml(report.title)}</w:t>
+      </w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:jc w:val="center"/><w:spacing w:after="240"/></w:pPr>
+      <w:r>
+        <w:rPr>
+          <w:rFonts w:ascii="Microsoft JhengHei" w:eastAsia="Microsoft JhengHei"/>
+          <w:sz w:val="18"/>
+          <w:color w:val="475569"/>
+        </w:rPr>
+        <w:t>產生時間：${escapeXml(exportDateStr)} ｜ 與會語者數：${report.speakerStats.length} 位</w:t>
+      </w:r>
+    </w:p>
+    ${sectionXml}
+    <w:sectPr>
+      <w:pgSz w:w="11906" w:h="16838"/>
+      <w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134"/>
+    </w:sectPr>
+  </w:body>
+</w:document>`;
+
+  zip.folder('word')?.file('document.xml', documentXml);
+
+  const blob = await zip.generateAsync({
+    type: 'blob',
+    mimeType:
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  });
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `會議摘要與行動事項_${new Date().toISOString().slice(0, 10)}.docx`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * 將單一 WordSpan 轉換為 OpenXML <w:r> 標籤，保留三態視覺標記
  */
 function wordSpanToOpenXmlRun(w: WordSpan): string {
   const safeText = escapeXml(w.text);
@@ -50,7 +373,9 @@ function wordSpanToOpenXmlRun(w: WordSpan): string {
   }
 
   if (w.status === 'semantic_uncertain') {
-    const candNote = w.candidates?.length ? `[候選:${escapeXml(w.candidates.join('/'))}]` : '';
+    const candNote = w.candidates?.length
+      ? `[候選:${escapeXml(w.candidates.join('/'))}]`
+      : '';
     return `
       <w:r>
         <w:rPr>
@@ -86,12 +411,15 @@ function wordSpanToOpenXmlRun(w: WordSpan): string {
 }
 
 /**
- * 匯出包含「語者色彩標籤、時間戳記表格與三態校對色彩標記」之原生 Microsoft Word (.docx)
+ * 匯出包含「(選配) 會議 AI 摘要 + 語者色彩標籤、時間戳記表格與三態校對色彩標記」之原生 Microsoft Word (.docx)
  */
-export async function exportAsDocx(segments: Segment[], speakers: Record<string, Speaker>): Promise<void> {
+export async function exportAsDocx(
+  segments: Segment[],
+  speakers: Record<string, Speaker>,
+  meetingMinutes?: MeetingMinutesReport | null
+): Promise<void> {
   const zip = new JSZip();
 
-  // 1. [Content_Types].xml
   zip.file(
     '[Content_Types].xml',
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -102,7 +430,6 @@ export async function exportAsDocx(segments: Segment[], speakers: Record<string,
 </Types>`
   );
 
-  // 2. _rels/.rels
   zip.folder('_rels')?.file(
     '.rels',
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -111,7 +438,6 @@ export async function exportAsDocx(segments: Segment[], speakers: Record<string,
 </Relationships>`
   );
 
-  // 3. 組裝表格列 (每一段發言一列：左欄為語者與時間戳，右欄為含色彩標記之發言段落)
   const tableRowsXml = segments
     .map((seg) => {
       const sp = speakers[seg.speakerId];
@@ -165,8 +491,11 @@ export async function exportAsDocx(segments: Segment[], speakers: Record<string,
     .join('');
 
   const exportDateStr = new Date().toLocaleString('zh-TW');
+  const minutesSectionXml = meetingMinutes
+    ? `${buildMeetingMinutesOpenXmlSection(meetingMinutes)}
+       <w:p><w:pPr><w:spacing w:before="280" w:after="160"/></w:pPr><w:r><w:rPr><w:rFonts w:eastAsia="Microsoft JhengHei"/><w:b/><w:sz w:val="26"/><w:color w:val="0F172A"/></w:rPr><w:t>伍、會議完整逐字稿紀錄</w:t></w:r></w:p>`
+    : '';
 
-  // 4. word/document.xml
   const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -179,7 +508,7 @@ export async function exportAsDocx(segments: Segment[], speakers: Record<string,
           <w:sz w:val="32"/>
           <w:color w:val="0F172A"/>
         </w:rPr>
-        <w:t>會議逐字稿紀錄（含 AI 語境校正標記）</w:t>
+        <w:t>${escapeXml(meetingMinutes?.title || '會議逐字稿紀錄（含 AI 語境校正標記）')}</w:t>
       </w:r>
     </w:p>
     <w:p>
@@ -193,6 +522,7 @@ export async function exportAsDocx(segments: Segment[], speakers: Record<string,
         <w:t>匯出時間：${escapeXml(exportDateStr)} ｜ 色彩圖例：【綠底】AI 語境自動修正 【黃底】多候選詞待確認 【橘波浪底線】低聲學信心度</w:t>
       </w:r>
     </w:p>
+    ${minutesSectionXml}
     <w:tbl>
       <w:tblPr>
         <w:tblW w:w="9500" w:type="dxa"/>
@@ -234,7 +564,8 @@ export async function exportAsDocx(segments: Segment[], speakers: Record<string,
 
   const blob = await zip.generateAsync({
     type: 'blob',
-    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    mimeType:
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   });
 
   const url = URL.createObjectURL(blob);
@@ -245,31 +576,70 @@ export async function exportAsDocx(segments: Segment[], speakers: Record<string,
   URL.revokeObjectURL(url);
 }
 
-export function exportAsMarkdown(segments: Segment[], speakers: Record<string, Speaker>): void {
+export function exportAsMarkdown(
+  segments: Segment[],
+  speakers: Record<string, Speaker>,
+  meetingMinutes?: MeetingMinutesReport | null
+): void {
+  const headerBlock = meetingMinutes
+    ? `${formatMeetingMinutesToMarkdown(meetingMinutes)}\n---\n\n## 完整會議逐字稿\n\n`
+    : '';
   const lines = segments.map((s) => {
     const spName = speakers[s.speakerId]?.name || s.speakerId;
     const timeTag = `[${formatSrtTime(s.start).slice(0, 8)}]`;
     const text = s.words.map((w) => w.text).join('');
     return `**${spName}** ${timeTag}：${text}`;
   });
-  triggerDownload(lines.join('\n\n'), `會議逐字稿_${Date.now()}.md`, 'text/markdown;charset=utf-8');
+  triggerDownload(
+    headerBlock + lines.join('\n\n'),
+    `會議逐字稿_${Date.now()}.md`,
+    'text/markdown;charset=utf-8'
+  );
 }
 
-export function exportAsSrt(segments: Segment[], speakers: Record<string, Speaker>): void {
+export function exportAsSrt(
+  segments: Segment[],
+  speakers: Record<string, Speaker>
+): void {
   const blocks = segments.map((s, idx) => {
     const spName = speakers[s.speakerId]?.name || s.speakerId;
     const text = s.words.map((w) => w.text).join('');
     return `${idx + 1}\n${formatSrtTime(s.start)} --> ${formatSrtTime(s.end)}\n[${spName}] ${text}`;
   });
-  triggerDownload(blocks.join('\n\n'), `會議字幕_${Date.now()}.srt`, 'text/plain;charset=utf-8');
+  triggerDownload(
+    blocks.join('\n\n'),
+    `會議字幕_${Date.now()}.srt`,
+    'text/plain;charset=utf-8'
+  );
 }
 
-export function exportProjectJson(segments: Segment[], speakers: Record<string, Speaker>): void {
-  const payload = JSON.stringify({ exportedAt: new Date().toISOString(), speakers, segments }, null, 2);
-  triggerDownload(payload, `會議專案備份_${Date.now()}.json`, 'application/json');
+export function exportProjectJson(
+  segments: Segment[],
+  speakers: Record<string, Speaker>,
+  meetingMinutes?: MeetingMinutesReport | null
+): void {
+  const payload = JSON.stringify(
+    {
+      exportedAt: new Date().toISOString(),
+      meetingMinutes: meetingMinutes || null,
+      speakers,
+      segments,
+    },
+    null,
+    2
+  );
+  triggerDownload(
+    payload,
+    `會議專案備份_${Date.now()}.json`,
+    'application/json'
+  );
 }
 
-function triggerDownload(content: string, filename: string, mime: string): void {
+function triggerDownload(
+  content: string,
+  filename: string,
+  mime: string
+): void {
   const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -278,3 +648,8 @@ function triggerDownload(content: string, filename: string, mime: string): void 
   a.click();
   URL.revokeObjectURL(url);
 }
+
+export const exportToDocx = exportAsDocx;
+export const exportToMarkdown = exportAsMarkdown;
+export const exportToSrt = exportAsSrt;
+export const downloadTextFile = triggerDownload;
