@@ -1096,12 +1096,17 @@ export function usePipelineScheduler() {
               if (globalAbortFlag) break;
 
               if (batchSegments.length > 0) {
-                const latestDict = useAppStore.getState().dictionary;
-                const quickTerms = latestDict.map((d) => d.term);
+                const stateNow = useAppStore.getState();
+                const latestDict = stateNow.dictionary;
+                const verifiedSoFar = mineAdaptiveHighFreqTerms(
+                  [...stateNow.segments, ...batchSegments],
+                  latestDict,
+                  stateNow.docContextSummary
+                );
                 const { updatedSegments: instantCorrected } =
                   applySentenceLevelLocalCorrection(
                     batchSegments,
-                    quickTerms,
+                    verifiedSoFar,
                     latestDict
                   );
                 useAppStore.getState().appendSegments(instantCorrected);
@@ -1296,7 +1301,6 @@ export function usePipelineScheduler() {
               if (windowSegments.length > 0) {
                 const stateBeforeWin = useAppStore.getState();
                 const latestDict = stateBeforeWin.dictionary;
-                const quickTerms = latestDict.map((d) => d.term);
                 const existingSegs = stateBeforeWin.segments;
                 const lastPriorSeg =
                   existingSegs.length > 0
@@ -1328,20 +1332,17 @@ export function usePipelineScheduler() {
                   }
                 }
 
-                // 同時結合字典先驗與目前已驗證之高頻詞彙進行即時單句校準
+                // 僅取實際出現於本場會議語料或簡報之驗證高頻詞，嚴禁將未出現之千詞字典全數塞入強制同音收斂！
                 const verifiedSoFar = mineAdaptiveHighFreqTerms(
                   [...useAppStore.getState().segments, ...windowStage1Segments],
                   latestDict,
                   stateBeforeWin.docContextSummary
                 );
-                const mergedQuickTerms = Array.from(
-                  new Set([...quickTerms, ...verifiedSoFar])
-                );
 
                 const { updatedSegments: instantCorrected } =
                   applySentenceLevelLocalCorrection(
                     windowStage1Segments,
-                    mergedQuickTerms,
+                    verifiedSoFar,
                     latestDict
                   );
                 useAppStore.getState().appendSegments(instantCorrected);
