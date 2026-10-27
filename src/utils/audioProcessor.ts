@@ -1,8 +1,10 @@
 // src/utils/audioProcessor.ts
-// 次世代雙軌無損聲學預處理 (85Hz Zero-Phase In-Place filtfilt) + 啟動階段 3~5 秒全文聲學預分析與「底層聲學公式動態校準層 (AcousticFormulaCalibration)」
+// 次世代雙軌無損聲學預處理 (85Hz Zero-Phase In-Place filtfilt) + YIN CMNDF 基頻估計 + 遠近雙層語音響度補償 + 啟動階段 3~5 秒全文聲學預分析與「底層聲學公式動態校準層 (AcousticFormulaCalibration)」
 // 核心架構升級：
 // 1. [雙軌分流無損動態範圍保護]：語者分離軌道 (`extractAndPreprocessMacroChunk`) 嚴格維持「85Hz 零相位巴特沃斯高通濾波 + 線性無壓縮波形」，100% 保留語者間自然的能量谷底 (`dip`) 與遠近分貝階躍 (`stepDbJump`)。
-// 2. [原地 (In-Place) 零額外配置濾波與即時釋放]：`applyZeroPhaseButterworthHighpass` 改為原地雙向濾波，省去 2 倍 Float32Array 暫存配置；預分析逐視窗處理後立即釋放 PCM 切片，大幅壓低啟動階段記憶體峰值。
+// 2. [YIN CMNDF 累積均值正規化差分基頻估計]：根除傳統自相關在殘響會議室中將男聲二次諧波 (240Hz) 誤判為女聲、或將女聲次諧波 (110Hz) 誤判為男聲之倍頻誤差。
+// 3. [P02 真實靜音底噪錨定與遠距語音 AGC 響度補償]：以 2% 分位數 (`P02`) 錨定真實環境底噪，避免近距大聲主講人拉高 VAD 門檻而吞沒遠距與會者（如「24號」、「禮拜三早上」），並在送入 Whisper 前針對有聲諧波幀提供最高 +12.5 dB (4.2x) 平滑響度補償。
+// 4. [原地 (In-Place) 零額外配置濾波與即時釋放]：`applyZeroPhaseButterworthHighpass` 改為原地雙向濾波，省去 2 倍 Float32Array 暫存配置；預分析逐視窗處理後立即釋放 PCM 切片，大幅壓低啟動階段記憶體峰值。
 
 import {
   AcousticFormulaCalibration,
@@ -159,8 +161,8 @@ function alignMp3SyncHeader(bytes: Uint8Array): ArrayBuffer {
 }
 
 /**
- * 【研究報告 5.1 核心（原地低記憶體強化版）】：85 Hz 零相位雙向二階巴特沃斯高通濾波 (Zero-Phase In-Place Butterworth HPF, filtfilt)
- * 直接於傳入之 Float32Array 上原地完成正向與反向濾波，完全不額外配置兩份長陣列，降低 66% 預處理記憶體佔用！
+ * 85 Hz 零相位雙向二階巴特沃斯高通濾波 (Zero-Phase In-Place Butterworth HPF, filtfilt)
+ * 直接於傳入之 Float32Array 上原地完成正向與反向濾波，完全不額外配置兩份長陣列，降低 66% 預處理記憶體佔用。
  */
 export function applyZeroPhaseButterworthHighpass(
   input: Float32Array,
@@ -216,7 +218,86 @@ export function applyZeroPhaseButterworthHighpass(
 }
 
 /**
- * 【ASR 專用前瞻包絡響度補償器】：VAD 閘控之零相位失真前瞻包絡響度正規化與 -1 dBFS 真實峰值限制器
+ * YIN 累積均值正規化差分基頻與諧波清晰度估計器 (de Cheveigné & Kawahara 2002)
+ * 同時防止男聲二次諧波倍頻 (120Hz -> 240Hz) 與女聲次諧波減半 (210Hz -> 105Hz) 誤差。
+ */
+function estimateFramePitchAndVoicingYin(
+  samples: Float32Array,
+  startIdx: number,
+  sampleRate = TARGET_SAMPLE_RATE
+): { f0Hz: number; periodicity: number; secondDipPeriodicity: number } {
+  const W = 256;
+  const minLag = 50; // 320 Hz
+  const maxLag = 212; // 75.5 Hz
+  if (startIdx + W + maxLag >= samples.length) {
+    return { f0Hz: 0, periodicity: 0, secondDipPeriodicity: 0 };
+  }
+
+  const d = new Float32Array(maxLag + 1);
+  for (let tau = 2; tau <= maxLag; tau += 2) {
+    let sumSq = 0.0;
+    for (let i = 0; i < W; i += 2) {
+      const diff = samples[startIdx + i] - samples[startIdx + i + tau];
+      sumSq += diff * diff;
+    }
+    d[tau] = sumSq;
+    d[tau - 1] = sumSq;
+  }
+
+  const cmndf = new Float32Array(maxLag + 1);
+  cmndf[0] = 1.0;
+  let runningSum = 0.0;
+  for (let tau = 1; tau <= maxLag; tau++) {
+    runningSum += d[tau];
+    cmndf[tau] = runningSum > 1e-12 ? (d[tau] * tau) / runningSum : 1.0;
+  }
+
+  let bestTau = minLag;
+  let minVal = cmndf[minLag];
+  for (let tau = minLag + 2; tau <= maxLag; tau += 2) {
+    if (cmndf[tau] < minVal) {
+      minVal = cmndf[tau];
+      bestTau = tau;
+    }
+  }
+
+  const periodicity = Math.max(0.0, Math.min(1.0, 1.0 - minVal));
+  if (minVal > 0.54) {
+    return { f0Hz: 0, periodicity, secondDipPeriodicity: 0 };
+  }
+
+  const thresh = Math.max(0.24, minVal * 1.18);
+  let chosenTau = bestTau;
+  let secondBestVal = 1.0;
+  let foundFirst = false;
+
+  for (let tau = minLag + 2; tau <= maxLag - 2; tau += 2) {
+    const val = cmndf[tau];
+    if (val <= cmndf[tau - 2] && val <= cmndf[tau + 2]) {
+      if (!foundFirst && val <= thresh) {
+        chosenTau = tau;
+        foundFirst = true;
+      } else if (
+        foundFirst &&
+        Math.abs(tau - chosenTau * 2) > 8 &&
+        val < secondBestVal
+      ) {
+        secondBestVal = val;
+      }
+    }
+  }
+
+  return {
+    f0Hz: sampleRate / Math.max(minLag, chosenTau),
+    periodicity: Math.max(0.0, Math.min(1.0, 1.0 - cmndf[chosenTau])),
+    secondDipPeriodicity: Math.max(0.0, Math.min(1.0, 1.0 - secondBestVal)),
+  };
+}
+
+/**
+ * 【ASR 專用前瞻包絡響度補償器（支援遠近麥克風雙層動態均衡）】：
+ * 針對同一視窗內既有近距大聲講者 (RMS ~0.16) 又有遠距與會者 (RMS ~0.018，如「24號」、「禮拜三早上」) 之情境，
+ * 以 P02 底噪與諧波度/過零率雙重閘控，將遠距有聲語音平滑增益最高達 4.2x (+12.5 dB)，同時保持紙張摩擦與環境底噪為 1.0x 不放大。
  */
 export function applyVadGatedLookAheadLoudnessNormalization(
   samples: Float32Array,
@@ -249,22 +330,22 @@ export function applyVadGatedLookAheadLoudnessNormalization(
 
   const sortedRms = Array.from(frameRms).sort((a, b) => a - b);
   const noiseFloor = Math.max(
-    0.0006,
-    sortedRms[Math.floor(sortedRms.length * 0.03)] || 0.0015
+    0.0005,
+    sortedRms[Math.floor(sortedRms.length * 0.02)] || 0.0012
   );
 
-  const targetRms = 0.115;
-  const maxLinearGain = 2.45;
-  const minSpeechRms = Math.max(0.003, noiseFloor * 1.55);
+  const targetRms = 0.118;
+  const maxLinearGain = 4.2; // +12.5 dB，拉拔遠距小聲語者進入 Whisper 最佳動態區間
+  const minSpeechRms = Math.max(0.0028, noiseFloor * 1.28);
   const truePeakCeiling = 0.89125;
 
   const targetFrameGain = new Float32Array(numFrames).fill(1.0);
   const frameHarmonicity = new Float32Array(numFrames);
   const minLag = Math.floor(sampleRate / 340);
-  const maxLag = Math.floor(sampleRate / 78);
+  const maxLag = Math.floor(sampleRate / 75);
 
   for (let f = 0; f < numFrames; f++) {
-    if (frameRms[f] < minSpeechRms * 0.75) continue;
+    if (frameRms[f] < minSpeechRms * 0.72) continue;
     const start = f * frameLen;
     if (start + 380 > N) continue;
     let maxCorr = 0.0;
@@ -296,36 +377,37 @@ export function applyVadGatedLookAheadLoudnessNormalization(
     const localHarm = Math.max(frameHarmonicity[f], prevH, nextH);
 
     const snrRatio = localRms / Math.max(1e-5, noiseFloor);
+    // 僅當諧波度低且過零率偏高 (zcr > 0.28) 時才判定為翻紙摩擦雜音；保留低頻率過零率 (zcr ~ 0.09) 之遠距男聲！
     const isAperiodicFriction =
-      localHarm < 0.34 && (zcr > 0.44 || snrRatio < 2.0);
+      localHarm < 0.26 && (zcr > 0.28 || snrRatio < 1.35);
     const pVad = isAperiodicFriction
-      ? 0.08
-      : 1.0 / (1.0 + Math.exp(-2.0 * (snrRatio - 1.65)));
+      ? 0.05
+      : 1.0 / (1.0 + Math.exp(-2.4 * (snrRatio - 1.32)));
 
     const isInterVowelWeakConsonant =
-      frameHarmonicity[f] < 0.48 &&
-      (prevH >= 0.48 || nextH >= 0.48) &&
-      frameRms[f] >= minSpeechRms * 0.65 &&
-      frameRms[f] < Math.max(prevR, nextR) * 0.72;
+      frameHarmonicity[f] < 0.45 &&
+      (prevH >= 0.42 || nextH >= 0.42) &&
+      frameRms[f] >= minSpeechRms * 0.62 &&
+      frameRms[f] < Math.max(prevR, nextR) * 0.75;
     const prev2R = f >= 2 ? frameRms[f - 2] : prevR;
     const isTrailingQuestionDecay =
-      pVad >= 0.34 &&
-      prevH >= 0.45 &&
-      localRms < prev2R * 0.78 &&
-      localRms >= minSpeechRms * 0.75;
+      pVad >= 0.30 &&
+      prevH >= 0.38 &&
+      localRms < prev2R * 0.80 &&
+      localRms >= minSpeechRms * 0.70;
     const consonantClarityBonusDb =
-      (isInterVowelWeakConsonant ? 1.55 : 0.0) +
-      (isTrailingQuestionDecay ? 1.45 : 0.0);
+      (isInterVowelWeakConsonant ? 1.85 : 0.0) +
+      (isTrailingQuestionDecay ? 1.75 : 0.0);
 
-    if (pVad < 0.28 || localRms < minSpeechRms) {
+    if (pVad < 0.24 || localRms < minSpeechRms) {
       targetFrameGain[f] = 1.0;
     } else if (localRms < targetRms || consonantClarityBonusDb > 0) {
       const dbCurrent = 20.0 * Math.log10(Math.max(1e-5, localRms));
-      const dbTarget = -18.3;
+      const dbTarget = -18.0;
       const dbDeficit = Math.max(0.0, dbTarget - dbCurrent);
       const boostDb = Math.min(
-        9.8,
-        dbDeficit * 0.68 * pVad + consonantClarityBonusDb
+        12.5,
+        dbDeficit * 0.78 * pVad + consonantClarityBonusDb
       );
       targetFrameGain[f] = Math.min(
         maxLinearGain,
@@ -338,8 +420,8 @@ export function applyVadGatedLookAheadLoudnessNormalization(
 
   const smoothedFrameGain = new Float32Array(numFrames);
   let currentGain = 1.0;
-  const alphaAttack = 0.58;
-  const alphaRelease = 0.065;
+  const alphaAttack = 0.62;
+  const alphaRelease = 0.075;
 
   for (let f = 0; f < numFrames; f++) {
     let lookAheadGain = targetFrameGain[f];
@@ -635,14 +717,11 @@ export async function analyzeFullAudioAcousticProfile(
 
   onProgress?.(
     62,
-    '正在分析全場雙分位底噪、有聲母音 P15 諧波分佈與底層聲學公式動態閥值...'
+    '正在分析全場 P02 真實靜音底噪、YIN 基頻跨度與底層聲學公式動態閥值...'
   );
   await new Promise((r) => setTimeout(r, 150));
 
   const frameLen = 320;
-  const minLag = Math.floor(TARGET_SAMPLE_RATE / 340);
-  const maxLag = Math.floor(TARGET_SAMPLE_RATE / 75);
-
   const allFrameRms: number[] = [];
   const utteranceF0List: number[] = [];
   const voicedHarmList: number[] = [];
@@ -691,15 +770,16 @@ export async function analyzeFullAudioAcousticProfile(
     }
 
     const sortedLocal = Array.from(wRms).sort((a, b) => a - b);
-    const p05 = Math.max(
-      0.0006,
-      sortedLocal[Math.floor(sortedLocal.length * 0.05)] || 0.001
+    const p02 = Math.max(
+      0.0005,
+      sortedLocal[Math.floor(sortedLocal.length * 0.02)] || 0.001
     );
     const p75 = Math.max(
-      p05 * 2.2,
+      p02 * 2.2,
       sortedLocal[Math.floor(sortedLocal.length * 0.75)] || 0.015
     );
-    const vadGate = Math.max(0.0032, p05 * 1.7 + (p75 - p05) * 0.08);
+    // 以 P02 * 1.32 作為真實語音門檻，不讓近距大聲語者 (p75) 淹沒遠距與會者
+    const vadGate = Math.max(0.0032, p02 * 1.32);
 
     let prevUtteranceF0 = 0;
     let prevUtteranceHiRatio = 0;
@@ -720,8 +800,8 @@ export async function analyzeFullAudioAcousticProfile(
           const semitoneDiff = Math.abs(12 * Math.log2(iqmF0 / prevUtteranceF0));
           const hiDiff = Math.abs(iqmHi - prevUtteranceHiRatio);
           if (
-            semitoneDiff >= 2.4 ||
-            (semitoneDiff >= 1.5 && hiDiff >= 0.08)
+            semitoneDiff >= 2.5 ||
+            (semitoneDiff >= 1.6 && hiDiff >= 0.09)
           ) {
             totalTurnSwitches++;
           }
@@ -738,74 +818,35 @@ export async function analyzeFullAudioAcousticProfile(
       if (wRms[f] < vadGate) {
         totalSilenceFrames++;
       }
-      if (wRms[f] < vadGate || wZcr[f] > 0.45) {
+      if (wRms[f] < vadGate || wZcr[f] > 0.28) {
         silenceRunFrames++;
         if (silenceRunFrames >= 7) {
-          flushUtteranceIfValid(18);
+          flushUtteranceIfValid(16);
         }
         continue;
       }
 
       const base = f * frameLen;
-      if (base + maxLag + 160 >= samples.length) continue;
+      const { f0Hz, periodicity, secondDipPeriodicity } =
+        estimateFramePitchAndVoicingYin(samples, base, TARGET_SAMPLE_RATE);
 
-      const corrProfile = new Float32Array(maxLag + 1);
-      let maxCorr = 0.0;
-      for (let lag = minLag; lag <= maxLag; lag += 2) {
-        let sum = 0.0;
-        let nA = 0.0;
-        let nB = 0.0;
-        for (let i = 0; i < 160; i += 2) {
-          const a = samples[base + i];
-          const b = samples[base + i + lag];
-          sum += a * b;
-          nA += a * a;
-          nB += b * b;
-        }
-        const c = nA > 1e-8 && nB > 1e-8 ? sum / Math.sqrt(nA * nB) : 0.0;
-        corrProfile[lag] = c;
-        if (c > maxCorr) maxCorr = c;
+      if (periodicity >= 0.22) {
+        activeCandidateHarmList.push(periodicity);
       }
 
-      if (maxCorr >= 0.24) {
-        activeCandidateHarmList.push(maxCorr);
-      }
-
-      if (maxCorr < 0.36) {
+      if (f0Hz <= 0 || periodicity < 0.46) {
         silenceRunFrames++;
         continue;
       }
 
-      let chosenLag = minLag;
-      let secondPeakCorr = 0.0;
-      const firstPeakThresh = 0.86 * maxCorr;
-      let foundFirstPeak = false;
-
-      for (let lag = minLag + 2; lag <= maxLag - 2; lag += 2) {
-        const c = corrProfile[lag];
-        if (c >= corrProfile[lag - 2] && c >= corrProfile[lag + 2]) {
-          if (!foundFirstPeak && c >= firstPeakThresh) {
-            chosenLag = lag;
-            foundFirstPeak = true;
-          } else if (
-            foundFirstPeak &&
-            Math.abs(lag - chosenLag * 2) > 8 &&
-            c > secondPeakCorr
-          ) {
-            secondPeakCorr = c;
-          }
-        }
-      }
-
-      const f0Hz = TARGET_SAMPLE_RATE / Math.max(minLag, chosenLag);
       totalVoicedFrames++;
-      voicedHarmList.push(maxCorr);
+      voicedHarmList.push(periodicity);
       currentTurnF0s.push(f0Hz);
       currentTurnHiRatios.push(wHiRatio[f]);
 
       if (
-        secondPeakCorr >= 0.68 * maxCorr &&
-        maxCorr < 0.74 &&
+        secondDipPeriodicity >= 0.72 * periodicity &&
+        periodicity < 0.76 &&
         wRms[f] > p75 * 0.9
       ) {
         totalOverlapSuspectFrames++;
@@ -818,8 +859,7 @@ export async function analyzeFullAudioAcousticProfile(
       }
     }
 
-    flushUtteranceIfValid(18);
-    // 單一探針視窗統計完畢後立即釋放 PCM 陣列
+    flushUtteranceIfValid(16);
     windowSlices[wIdx] = new Float32Array(0);
   }
   windowSlices.length = 0;
@@ -828,26 +868,26 @@ export async function analyzeFullAudioAcousticProfile(
     84,
     '正在執行全場語者聲紋分佈聚類、推導底層聲學公式動態閥值與最佳化方案...'
   );
-  await new Promise((r) => setTimeout(r, 180));
+  await new Promise((r) => setTimeout(r, 160));
 
   const sortedAllRms =
     allFrameRms.length > 0
       ? [...allFrameRms].sort((a, b) => a - b)
       : [0.001, 0.02];
-  const globalP05 = Math.max(
+  const globalP02 = Math.max(
     0.0005,
-    sortedAllRms[Math.floor(sortedAllRms.length * 0.05)] || 0.001
+    sortedAllRms[Math.floor(sortedAllRms.length * 0.02)] || 0.001
   );
   const globalP85 = Math.max(
-    globalP05 * 2.0,
+    globalP02 * 2.0,
     sortedAllRms[Math.floor(sortedAllRms.length * 0.85)] || 0.03
   );
 
   const noiseFloorDb = Number(
-    Math.max(-68, Math.min(-22, 20 * Math.log10(globalP05))).toFixed(1)
+    Math.max(-68, Math.min(-22, 20 * Math.log10(globalP02))).toFixed(1)
   );
   const snrDb = Number(
-    Math.max(6, Math.min(42, 20 * Math.log10(globalP85 / globalP05))).toFixed(1)
+    Math.max(6, Math.min(42, 20 * Math.log10(globalP85 / globalP02))).toFixed(1)
   );
   const noiseLevel: 'LOW' | 'MEDIUM' | 'HIGH' =
     snrDb >= 22 ? 'LOW' : snrDb >= 14 ? 'MEDIUM' : 'HIGH';
@@ -878,9 +918,9 @@ export async function analyzeFullAudioAcousticProfile(
   const sortedCandHarm =
     activeCandidateHarmList.length > 0
       ? [...activeCandidateHarmList].sort((a, b) => a - b)
-      : [0.38, 0.65];
+      : [0.34, 0.65];
   const harmP15 =
-    sortedCandHarm[Math.floor(sortedCandHarm.length * 0.15)] || 0.38;
+    sortedCandHarm[Math.floor(sortedCandHarm.length * 0.15)] || 0.34;
 
   const clusters: Array<{ f0Semitone: number; highBandRatio: number; count: number }> =
     [];
@@ -888,15 +928,15 @@ export async function analyzeFullAudioAcousticProfile(
     let bestIdx = -1;
     let bestDist = Infinity;
     for (let c = 0; c < clusters.length; c++) {
-      const df0 = Math.abs(vec.f0Semitone - clusters[c].f0Semitone) / 2.2;
-      const dHi = Math.abs(vec.highBandRatio - clusters[c].highBandRatio) / 0.12;
+      const df0 = Math.abs(vec.f0Semitone - clusters[c].f0Semitone) / 2.6;
+      const dHi = Math.abs(vec.highBandRatio - clusters[c].highBandRatio) / 0.15;
       const dist = Math.sqrt(df0 * df0 + dHi * dHi);
       if (dist < bestDist) {
         bestDist = dist;
         bestIdx = c;
       }
     }
-    if (bestIdx >= 0 && bestDist <= 1.15) {
+    if (bestIdx >= 0 && bestDist <= 1.25) {
       const cl = clusters[bestIdx];
       const nextCount = cl.count + 1;
       cl.f0Semitone = (cl.f0Semitone * cl.count + vec.f0Semitone) / nextCount;
@@ -909,7 +949,7 @@ export async function analyzeFullAudioAcousticProfile(
   }
 
   const significantClusters = clusters.filter(
-    (c) => c.count >= Math.max(2, Math.floor(turnFeatureVectors.length * 0.08))
+    (c) => c.count >= Math.max(2, Math.floor(turnFeatureVectors.length * 0.10))
   );
   const rawClusterCount = Math.max(2, Math.min(5, significantClusters.length));
 
@@ -944,72 +984,73 @@ export async function analyzeFullAudioAcousticProfile(
       ? 'MEDIUM'
       : 'LOW';
 
+  // 【關鍵通用修正】：每個 5 分鐘微批次內可能僅有 2 位主要對話者（例如主席與單一分區報告人一問一答），
+  // 嚴禁將 estimatedMinSpeakers 強制鎖死在 3 或 4，否則聚類器會被迫把同一位男主席或女報告人拆成 3 個假語者！
+  // 因此最少語者一律設為 2（單人演講設為 1），最多語者設為 4~6，讓演算法依每塊真實聲紋自動收斂。
   const estimatedMinSpeakers =
-    turnSwitchRatePerMin < 3.0 && rawClusterCount <= 1
-      ? 1
-      : Math.max(2, Math.min(4, rawClusterCount));
+    turnSwitchRatePerMin < 2.2 && rawClusterCount <= 1 ? 1 : 2;
   const estimatedMaxSpeakers = Math.max(
-    estimatedMinSpeakers + 2,
+    4,
     Math.min(6, rawClusterCount + 2)
   );
 
   const silenceRatio = totalSilenceFrames / Math.max(1, totalSampledFrames);
   const calibratedVadNoiseQuantile = Number(
-    Math.max(0.03, Math.min(0.08, silenceRatio < 0.12 ? 0.04 : 0.05)).toFixed(3)
+    Math.max(0.015, Math.min(0.035, silenceRatio < 0.10 ? 0.018 : 0.022)).toFixed(3)
   );
   const calibratedVadSpeechMultiplier = Number(
-    Math.max(1.52, Math.min(1.88, snrDb >= 20 ? 1.65 : 1.78)).toFixed(2)
+    Math.max(1.28, Math.min(1.42, snrDb >= 20 ? 1.32 : 1.36)).toFixed(2)
   );
   const calibratedHarmGate = Number(
-    Math.max(0.34, Math.min(0.42, harmP15 * 0.95)).toFixed(3)
+    Math.max(0.28, Math.min(0.38, harmP15 * 0.90)).toFixed(3)
   );
   const calibratedFrictionCeiling = Number(
-    Math.max(0.26, Math.min(0.35, calibratedHarmGate * 0.82)).toFixed(3)
+    Math.max(0.20, Math.min(0.28, calibratedHarmGate * 0.76)).toFixed(3)
   );
   const calibratedMaxMicroTurnSec = Number(
     Math.max(
-      1.45,
+      2.4,
       Math.min(
-        1.85,
-        turnSwitchRatePerMin >= 10
-          ? 1.55
-          : turnSwitchRatePerMin >= 5.5
-          ? 1.65
-          : 1.80
+        4.2,
+        turnSwitchRatePerMin >= 12
+          ? 2.6
+          : turnSwitchRatePerMin >= 6.0
+          ? 3.2
+          : 3.8
       )
     ).toFixed(2)
   );
   const calibratedScdPeakCutoff = Number(
     Math.max(
-      0.50,
+      0.48,
       Math.min(
-        0.56,
-        turnSwitchRatePerMin >= 11 ? 0.51 : turnSwitchRatePerMin <= 4.5 ? 0.55 : 0.53
+        0.55,
+        turnSwitchRatePerMin >= 11 ? 0.49 : turnSwitchRatePerMin <= 4.5 ? 0.54 : 0.51
       )
     ).toFixed(2)
   );
   const calibratedPitchTolerance = Number(
     Math.max(
-      3.4,
-      Math.min(4.2, pitchSpreadSemitones >= 8.0 ? 3.8 : 3.5)
+      3.5,
+      Math.min(4.4, pitchSpreadSemitones >= 7.5 ? 4.0 : 3.6)
     ).toFixed(2)
   );
 
   const baseFormulaCalibration: AcousticFormulaCalibration = {
     vadNoiseQuantile: calibratedVadNoiseQuantile,
     vadSpeechMultiplier: calibratedVadSpeechMultiplier,
-    vadDynamicRangeWeight: 0.06,
+    vadDynamicRangeWeight: 0.02,
     harmonicityGateThreshold: calibratedHarmGate,
     frictionHarmonicCeiling: calibratedFrictionCeiling,
-    boundaryDipWeight: 0.45,
-    boundaryVoiceWeight: 0.55,
-    stepDbDiffFloor: 3.5,
-    formantCosDistFloor: 0.22,
+    boundaryDipWeight: 0.42,
+    boundaryVoiceWeight: 0.58,
+    stepDbDiffFloor: 3.2,
+    formantCosDistFloor: 0.21,
     scdPeakCutoff: calibratedScdPeakCutoff,
     maxMicroTurnSec: calibratedMaxMicroTurnSec,
-    ahcStopSimThreshold: voiceSimilarity === 'HIGH' ? 0.30 : 0.28,
+    ahcStopSimThreshold: voiceSimilarity === 'HIGH' ? 0.32 : 0.30,
     pitchPenaltySemitoneTolerance: calibratedPitchTolerance,
-    vbxInvTemp: 22.0,
+    vbxInvTemp: 20.0,
     vbxCoreResponsibilityGate: 0.45,
   };
 
@@ -1033,13 +1074,13 @@ export async function analyzeFullAudioAcousticProfile(
       badge: '方案 A・標準會議首選',
       title: 'Mode 0 黃金長句定錨＋自適應聲學公式（穩健平衡）',
       label: 'Mode 0 黃金長句定錨＋自適應聲學公式（穩健平衡）',
-      subtitle: '先取純淨長句建立聲紋錨點，再以自適應諧波與音節包絡公式精準切分短句與附和詞',
+      subtitle: '先取純淨長句建立聲紋錨點，再以 YIN 基頻與話輪 Viterbi 平滑兼顧長篇報告與快速問答',
       whyRecommend: `全場平均每分鐘換人 ${turnSwitchRatePerMin} 次、重疊率 ${(
         overlapRatio * 100
       ).toFixed(
         1
-      )}%，已將實測諧波門檻 (${calibratedHarmGate}) 與微觀視窗 (${calibratedMaxMicroTurnSec}s) 下放至聲學公式層，兼顧完整長句與快速問答。`,
-      bestFor: '2～6 人部門會議、專案討論、男女與同性別混合且有來回接話（「不算」、「對」）',
+      )}%，已將 P02 靜音門檻與 YIN 諧波門檻 (${calibratedHarmGate}) 下放至聲學公式層，兼顧完整長句與遠近距問答。`,
+      bestFor: '2～6 人部門會議、專案進度檢討、主席與報告人一問一答及穿插補充（「24號」、「不算」、「對」）',
       notIdealFor: '單人連續講述超過 85% 時間之大型演講',
       isRecommended: recommendedPresetId === 'preset_a_balanced',
       recommendedMinSpeakers: estimatedMinSpeakers,
@@ -1087,12 +1128,12 @@ export async function analyzeFullAudioAcousticProfile(
         formulaCalibration: {
           ...baseFormulaCalibration,
           scdPeakCutoff: Number(
-            Math.max(0.48, baseFormulaCalibration.scdPeakCutoff - 0.03).toFixed(2)
+            Math.max(0.46, baseFormulaCalibration.scdPeakCutoff - 0.03).toFixed(2)
           ),
           maxMicroTurnSec: Number(
-            Math.max(1.38, baseFormulaCalibration.maxMicroTurnSec - 0.15).toFixed(2)
+            Math.max(2.0, baseFormulaCalibration.maxMicroTurnSec - 0.4).toFixed(2)
           ),
-          stepDbDiffFloor: 3.0,
+          stepDbDiffFloor: 2.8,
         },
       },
     },
@@ -1100,13 +1141,13 @@ export async function analyzeFullAudioAcousticProfile(
       id: 'preset_c_long_speech',
       badge: '方案 C・簡報與長句防斷裂',
       title: '長篇報告防句中斷裂（主講保護模式）',
-      label: '長篇報告防句中斷裂（主講保護模式）',
-      subtitle: '拉高底層邊界公式門檻與微觀視窗上限，防止主講人換氣停頓被誤切成兩個人',
-      whyRecommend: `適合以長句闡述為主的會議，最大化保護句子完整性並防止主講人換氣時被誤判換人。`,
+      label: '長篇報告防句中講述防斷裂（主講保護模式）',
+      subtitle: '拉高底層邊界公式門檻與話輪平滑權重，防止主講人翻頁停頓被誤切成兩個人',
+      whyRecommend: `適合以長句闡述為主的會議，最大化保護句子完整性並防止主講人換氣或翻閱資料時被誤判換人。`,
       bestFor: '專題簡報、教育訓練、法說會、一人主講搭配少數 QA 提問',
       notIdealFor: '多人每秒快速搶話的圓桌討論',
       isRecommended: recommendedPresetId === 'preset_c_long_speech',
-      recommendedMinSpeakers: Math.max(1, estimatedMinSpeakers - 1),
+      recommendedMinSpeakers: Math.max(1, estimatedMinSpeakers),
       recommendedMaxSpeakers: Math.max(3, estimatedMaxSpeakers - 1),
       diarizationPatch: {
         engineMode: 'mode_b_advanced_dsp',
@@ -1124,19 +1165,19 @@ export async function analyzeFullAudioAcousticProfile(
             Math.min(0.58, baseFormulaCalibration.scdPeakCutoff + 0.04).toFixed(2)
           ),
           maxMicroTurnSec: Number(
-            Math.min(2.05, baseFormulaCalibration.maxMicroTurnSec + 0.25).toFixed(2)
+            Math.min(4.8, baseFormulaCalibration.maxMicroTurnSec + 0.8).toFixed(2)
           ),
-          stepDbDiffFloor: 4.2,
+          stepDbDiffFloor: 4.0,
         },
       },
     },
   ];
 
   const elapsedSoFar = performance.now() - startTimeMs;
-  if (elapsedSoFar < 2400) {
+  if (elapsedSoFar < 2200) {
     onProgress?.(94, '正在彙整全場聲學體檢指標與底層聲學公式校準參數...');
     await new Promise((r) =>
-      setTimeout(r, Math.min(1000, 2400 - elapsedSoFar))
+      setTimeout(r, Math.min(800, 2200 - elapsedSoFar))
     );
   }
 
@@ -1148,9 +1189,9 @@ export async function analyzeFullAudioAcousticProfile(
     coverageRatio * 100
   )}%）深度聲學掃描與公式校準：環境信噪比 ${snrDb} dB（底噪 ${
     noiseLevel === 'LOW' ? '極低' : noiseLevel === 'MEDIUM' ? '中等' : '偏高'
-  }）、話輪基頻跨度 ${f0P10Hz}~${f0P90Hz} Hz（${pitchSpreadSemitones} 半音）、有聲母音諧波門檻自動校準為 ${calibratedHarmGate}、每分鐘換人約 ${turnSwitchRatePerMin} 次（微觀切分視窗校準為 ${calibratedMaxMicroTurnSec}s）、重疊率 ${(
+  }）、話輪基頻跨度 ${f0P10Hz}~${f0P90Hz} Hz（${pitchSpreadSemitones} 半音）、YIN 諧波門檻自動校準為 ${calibratedHarmGate}、每分鐘換人約 ${turnSwitchRatePerMin} 次、重疊率 ${(
     overlapRatio * 100
-  ).toFixed(1)}%，預估約 ${estimatedMinSpeakers}~${estimatedMaxSpeakers} 位語者。系統優先推薦【${
+  ).toFixed(1)}%，建議人數範圍 ${estimatedMinSpeakers}~${estimatedMaxSpeakers} 人。系統優先推薦【${
     winningOpt.badge
   }】。`;
 
@@ -1218,10 +1259,10 @@ export async function extractAndPreprocessMacroChunk(
   if (isWav && totalDurationSec > 0 && file.size > 44) {
     const dataBytes = file.size - 44;
     const bytesPerSec = dataBytes / totalDurationSec;
-    const startByte = 44 + Math.floor((sliceAlign(chunkStartSec * bytesPerSec)) / 4) * 4;
+    const startByte = 44 + Math.floor(sliceAlign(chunkStartSec * bytesPerSec) / 4) * 4;
     const endByte = Math.min(
       file.size,
-      44 + Math.ceil((sliceAlign(chunkEndSec * bytesPerSec)) / 4) * 4
+      44 + Math.ceil(sliceAlign(chunkEndSec * bytesPerSec) / 4) * 4
     );
     const headerBuf = await file.slice(0, 44).arrayBuffer();
     const bodyBuf = await file.slice(startByte, endByte).arrayBuffer();
@@ -1564,7 +1605,7 @@ export function enhanceSubSegmentAudioForRelisten(
   const rms = Math.sqrt(sumSq / raw.length);
 
   const linearGain =
-    peakAbs > 1e-4 ? Math.min(2.6, Math.max(1.0, 0.78 / peakAbs)) : 1.0;
+    peakAbs > 1e-4 ? Math.min(3.5, Math.max(1.0, 0.78 / peakAbs)) : 1.0;
   const hasQuietDropCompensated = linearGain >= 1.45 || rms < 0.045;
 
   const normalizedSamples = new Float32Array(raw.length);
