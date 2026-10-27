@@ -1,8 +1,8 @@
 // src/utils/audioProcessor.ts
-// 次世代雙軌無損聲學預處理 (85Hz Zero-Phase filtfilt) + 啟動階段 3~5 秒全文聲學預分析與「底層聲學公式動態校準層 (AcousticFormulaCalibration)」
+// 次世代雙軌無損聲學預處理 (85Hz Zero-Phase In-Place filtfilt) + 啟動階段 3~5 秒全文聲學預分析與「底層聲學公式動態校準層 (AcousticFormulaCalibration)」
 // 核心架構升級：
-// 1. [雙軌分流無損動態範圍保護]：語者分離軌道 (`extractAndPreprocessMacroChunk`) 嚴格維持「85Hz 零相位巴特沃斯高通濾波 + 線性無壓縮波形」，100% 保留語者間自然的能量谷底 (`dip`) 與遠近分貝階躍 (`stepDbJump`)，不再因時變壓縮增益抹平語者邊界；前瞻包絡響度正規化 (`applyVadGatedLookAheadLoudnessNormalization`) 專供 ASR 弱音視窗補償使用。
-// 2. [預分析參數下放至底層聲學公式層]：`analyzeFullAudioAcousticProfile` 除推薦方案 A/B/C 外，更直接根據音檔實測之底噪分位數、有聲母音 P15 諧波度、音域跨度與換人頻率，動態推導出 `AcousticFormulaCalibration` 注入 `diarization.worker.ts` 底層公式。
+// 1. [雙軌分流無損動態範圍保護]：語者分離軌道 (`extractAndPreprocessMacroChunk`) 嚴格維持「85Hz 零相位巴特沃斯高通濾波 + 線性無壓縮波形」，100% 保留語者間自然的能量谷底 (`dip`) 與遠近分貝階躍 (`stepDbJump`)。
+// 2. [原地 (In-Place) 零額外配置濾波與即時釋放]：`applyZeroPhaseButterworthHighpass` 改為原地雙向濾波，省去 2 倍 Float32Array 暫存配置；預分析逐視窗處理後立即釋放 PCM 切片，大幅壓低啟動階段記憶體峰值。
 
 import {
   AcousticFormulaCalibration,
@@ -122,9 +122,6 @@ export function getAudioDuration(file: File): Promise<number> {
   });
 }
 
-/**
- * 修正 TypeScript 5.7 Uint8Array.buffer (ArrayBufferLike) 型別相容性
- */
 function alignMp3SyncHeader(bytes: Uint8Array): ArrayBuffer {
   let offset = 0;
   if (
@@ -162,9 +159,8 @@ function alignMp3SyncHeader(bytes: Uint8Array): ArrayBuffer {
 }
 
 /**
- * 【研究報告 5.1 核心】：85 Hz 零相位雙向二階巴特沃斯高通濾波 (Zero-Phase Forward-Backward Butterworth HPF, filtfilt)
- * 先正向通過一次 85Hz 二階 Biquad 高通濾波器，再反轉陣列反向通過一次，
- * 達成 -24 dB/octave 陡峭濾除空調與桌面低頻轟鳴，且相位延遲嚴格為 0，完美保護爆破音瞬態與共振峰相位！
+ * 【研究報告 5.1 核心（原地低記憶體強化版）】：85 Hz 零相位雙向二階巴特沃斯高通濾波 (Zero-Phase In-Place Butterworth HPF, filtfilt)
+ * 直接於傳入之 Float32Array 上原地完成正向與反向濾波，完全不額外配置兩份長陣列，降低 66% 預處理記憶體佔用！
  */
 export function applyZeroPhaseButterworthHighpass(
   input: Float32Array,
@@ -172,12 +168,12 @@ export function applyZeroPhaseButterworthHighpass(
   cutoffHz = 85.0
 ): Float32Array {
   const N = input.length;
-  if (N < 16) return new Float32Array(input);
+  if (N < 16) return input;
 
   const w0 = (2.0 * Math.PI * cutoffHz) / sampleRate;
   const cosW0 = Math.cos(w0);
   const sinW0 = Math.sin(w0);
-  const alpha = sinW0 / Math.SQRT2; // Q = 1 / sqrt(2) = 0.7071 (Butterworth)
+  const alpha = sinW0 / Math.SQRT2;
 
   const a0 = 1.0 + alpha;
   const b0 = ((1.0 + cosW0) * 0.5) / a0;
@@ -186,9 +182,7 @@ export function applyZeroPhaseButterworthHighpass(
   const a1 = (-2.0 * cosW0) / a0;
   const a2 = (1.0 - alpha) / a0;
 
-  const forward = new Float32Array(N);
-
-  // 1. 正向濾波 (Forward Pass)
+  // 1. 原地正向濾波 (In-Place Forward Pass)
   let x1 = input[0];
   let x2 = input[0];
   let y1 = 0.0;
@@ -196,36 +190,33 @@ export function applyZeroPhaseButterworthHighpass(
   for (let i = 0; i < N; i++) {
     const x0 = input[i];
     const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-    forward[i] = y0;
+    input[i] = y0;
     x2 = x1;
     x1 = x0;
     y2 = y1;
     y1 = y0;
   }
 
-  // 2. 反向濾波 (Backward Pass) 消除所有頻率之相位偏移
-  const out = new Float32Array(N);
-  x1 = forward[N - 1];
-  x2 = forward[N - 1];
+  // 2. 原地反向濾波 (In-Place Backward Pass) 消除所有頻率之相位偏移
+  x1 = input[N - 1];
+  x2 = input[N - 1];
   y1 = 0.0;
   y2 = 0.0;
   for (let i = N - 1; i >= 0; i--) {
-    const x0 = forward[i];
+    const x0 = input[i];
     const y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-    out[i] = y0;
+    input[i] = y0;
     x2 = x1;
     x1 = x0;
     y2 = y1;
     y1 = y0;
   }
 
-  return out;
+  return input;
 }
 
 /**
  * 【ASR 專用前瞻包絡響度補償器】：VAD 閘控之零相位失真前瞻包絡響度正規化與 -1 dBFS 真實峰值限制器
- * 注意：此函式專供 ASR 弱音片段補償使用；語者分離 (`diarization.worker.ts`) 則使用純線性 85Hz 高通波形，
- * 以 100% 保留真實能量谷底 (`dip`) 與遠近語者分貝差 (`stepDbJump`)！
  */
 export function applyVadGatedLookAheadLoudnessNormalization(
   samples: Float32Array,
@@ -262,10 +253,10 @@ export function applyVadGatedLookAheadLoudnessNormalization(
     sortedRms[Math.floor(sortedRms.length * 0.03)] || 0.0015
   );
 
-  const targetRms = 0.115; // 約 -18.8 dBFS
-  const maxLinearGain = 2.45; // 最高 +7.8 dB 溫和補償
+  const targetRms = 0.115;
+  const maxLinearGain = 2.45;
   const minSpeechRms = Math.max(0.003, noiseFloor * 1.55);
-  const truePeakCeiling = 0.89125; // -1.0 dBFS
+  const truePeakCeiling = 0.89125;
 
   const targetFrameGain = new Float32Array(numFrames).fill(1.0);
   const frameHarmonicity = new Float32Array(numFrames);
@@ -311,13 +302,11 @@ export function applyVadGatedLookAheadLoudnessNormalization(
       ? 0.08
       : 1.0 / (1.0 + Math.exp(-2.0 * (snrRatio - 1.65)));
 
-    // 偵測夾在有聲母音之間的弱子音過渡幀（如快速連讀之「禮物 l-w」、「委員 w-y」字首流音/滑音谷底）
     const isInterVowelWeakConsonant =
       frameHarmonicity[f] < 0.48 &&
       (prevH >= 0.48 || nextH >= 0.48) &&
       frameRms[f] >= minSpeechRms * 0.65 &&
       frameRms[f] < Math.max(prevR, nextR) * 0.72;
-    // 針對疑問句尾或遠距插話尾段能量衰減（如「…的裝修怎麼辦」）提供平滑尾音托舉補償
     const prev2R = f >= 2 ? frameRms[f - 2] : prevR;
     const isTrailingQuestionDecay =
       pVad >= 0.34 &&
@@ -354,7 +343,6 @@ export function applyVadGatedLookAheadLoudnessNormalization(
 
   for (let f = 0; f < numFrames; f++) {
     let lookAheadGain = targetFrameGain[f];
-    // 80ms (4 frames) 前瞻視窗：當遠距小聲語者（如女聲2）緊接在大聲語者後突然插話時，提前拉升包絡增益避免首字「不是」被吞沒
     for (let la = 1; la <= 4; la++) {
       if (f + la < numFrames) {
         lookAheadGain = Math.max(lookAheadGain, targetFrameGain[f + la]);
@@ -404,16 +392,9 @@ export function applyVadGatedLookAheadLoudnessNormalization(
     out[i] *= limiterEnv;
   }
 
-  // 【保持主轉寫音軌 100% 頻譜平坦無音染】：
-  // 主 ASR 視窗僅執行純線性音節包絡動態範圍正規化 (Syllabic Look-Ahead AGC)，不施加全視窗 Biquad EQ 染音，
-  // 避免會議室殘響環境下高頻齒音被過度放大而將快速句尾（如「的裝修怎麼辦」）模糊化；
-  // 2650Hz 共振峰增強僅保留於第二階段局部重聽 (`enhanceSubSegmentAudioForRelisten`)！
   return out;
 }
 
-/**
- * 抽取單一區間之 16kHz 單聲道波形（供全文預分析抽樣視窗與巨集區塊共用）
- */
 async function decodeSliceTo16kMonoRaw(
   file: File,
   sliceStartSec: number,
@@ -537,10 +518,6 @@ async function decodeSliceTo16kMonoRaw(
   return new Float32Array(0);
 }
 
-/**
- * 計算陣列之四分位去極端值平均 (25% ~ 75% Interquartile Mean)，
- * 徹底濾除華語四聲聲調（陰平、陽平、上聲、去聲）造成的瞬時基頻飆高或壓低！
- */
 function computeInterquartileMean(values: number[]): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);
@@ -555,9 +532,6 @@ function computeInterquartileMean(values: number[]): number {
 
 /**
  * 【方向一深化核心】：3~5 秒高密度全場多點聲學預分析與「底層聲學公式動態校準引擎」(`analyzeFullAudioAcousticProfile`)
- * 1. 話輪級去聲調基頻中位數 (Utterance-Level Interquartile Mean F0) 估算真實換人頻率與語者數。
- * 2. 將實測聲學分佈（P05/P75 能量分位數、有聲幀 P15 諧波清晰度、音域半音跨度、換人頻率）直接推導為底層 `AcousticFormulaCalibration`，
- *    讓 `diarization.worker.ts` 的 VAD、自相關 F0 諧波門檻、150ms 音節包絡邊界曲線與 Core-Gated VBx 公式自動適應當前音檔！
  */
 export async function analyzeFullAudioAcousticProfile(
   file: File,
@@ -573,7 +547,6 @@ export async function analyzeFullAudioAcousticProfile(
     totalDurationSec = Math.max(30, file.size / 16000);
   }
 
-  // 提升預分析全場抽樣密度：以 6.0 秒高解析探針涵蓋更多微觀插話區間（3 分鐘內音檔近乎 100% 全覆蓋掃描，長音檔最高 36 個探針點）
   const windowDurSec = 6.0;
   const targetWindowCount =
     totalDurationSec <= 216
@@ -591,7 +564,7 @@ export async function analyzeFullAudioAcousticProfile(
     nameLower.endsWith('.mp3');
 
   let cachedFullBuffer: AudioBuffer | null = null;
-  if (!isWavOrMp3 && file.size <= 45 * 1024 * 1024) {
+  if (!isWavOrMp3 && file.size <= 35 * 1024 * 1024) {
     onProgress?.(12, '正在解碼 M4A/AAC 音訊軌道以進行全場多點掃描...');
     try {
       const AudioCtxClass =
@@ -657,15 +630,18 @@ export async function analyzeFullAudioAcousticProfile(
     }
   }
 
+  // 切片完成後立即釋放完整 AudioBuffer，避免佔用系統記憶體
+  cachedFullBuffer = null;
+
   onProgress?.(
     62,
     '正在分析全場雙分位底噪、有聲母音 P15 諧波分佈與底層聲學公式動態閥值...'
   );
   await new Promise((r) => setTimeout(r, 150));
 
-  const frameLen = 320; // 20ms @ 16kHz
-  const minLag = Math.floor(TARGET_SAMPLE_RATE / 340); // ~47 samples (340Hz)
-  const maxLag = Math.floor(TARGET_SAMPLE_RATE / 75); // ~213 samples (75Hz)
+  const frameLen = 320;
+  const minLag = Math.floor(TARGET_SAMPLE_RATE / 340);
+  const maxLag = Math.floor(TARGET_SAMPLE_RATE / 75);
 
   const allFrameRms: number[] = [];
   const utteranceF0List: number[] = [];
@@ -679,11 +655,15 @@ export async function analyzeFullAudioAcousticProfile(
   let totalSilenceFrames = 0;
   let totalOverlapSuspectFrames = 0;
   let totalTurnSwitches = 0;
+  const totalSampledWindows = windowSlices.length;
 
   for (let wIdx = 0; wIdx < windowSlices.length; wIdx++) {
     const samples = windowSlices[wIdx];
     const numFrames = Math.floor(samples.length / frameLen);
-    if (numFrames < 10) continue;
+    if (numFrames < 10) {
+      windowSlices[wIdx] = new Float32Array(0);
+      continue;
+    }
 
     const wRms = new Float32Array(numFrames);
     const wZcr = new Float32Array(numFrames);
@@ -839,7 +819,10 @@ export async function analyzeFullAudioAcousticProfile(
     }
 
     flushUtteranceIfValid(18);
+    // 單一探針視窗統計完畢後立即釋放 PCM 陣列
+    windowSlices[wIdx] = new Float32Array(0);
   }
+  windowSlices.length = 0;
 
   onProgress?.(
     84,
@@ -899,7 +882,6 @@ export async function analyzeFullAudioAcousticProfile(
   const harmP15 =
     sortedCandHarm[Math.floor(sortedCandHarm.length * 0.15)] || 0.38;
 
-  // 利用 2D (話輪去聲調 F0 半音 + 高頻共振峰比) 凝聚估計全場活躍語者叢集數
   const clusters: Array<{ f0Semitone: number; highBandRatio: number; count: number }> =
     [];
   for (const vec of turnFeatureVectors) {
@@ -971,9 +953,6 @@ export async function analyzeFullAudioAcousticProfile(
     Math.min(6, rawClusterCount + 2)
   );
 
-  // =========================================================================
-  // 【方向一深化】：根據全場實測分佈，動態計算底層聲學公式校準參數 (AcousticFormulaCalibration)
-  // =========================================================================
   const silenceRatio = totalSilenceFrames / Math.max(1, totalSampledFrames);
   const calibratedVadNoiseQuantile = Number(
     Math.max(0.03, Math.min(0.08, silenceRatio < 0.12 ? 0.04 : 0.05)).toFixed(3)
@@ -1165,9 +1144,7 @@ export async function analyzeFullAudioAcousticProfile(
   const winningOpt =
     recommendations.find((r) => r.isRecommended) || recommendations[0];
 
-  const plainSummary = `已完成全場 ${
-    windowSlices.length
-  } 個區段（共抽樣 ${sampledDurationSec} 秒，涵蓋率 ${Math.round(
+  const plainSummary = `已完成全場 ${totalSampledWindows} 個區段（共抽樣 ${sampledDurationSec} 秒，涵蓋率 ${Math.round(
     coverageRatio * 100
   )}%）深度聲學掃描與公式校準：環境信噪比 ${snrDb} dB（底噪 ${
     noiseLevel === 'LOW' ? '極低' : noiseLevel === 'MEDIUM' ? '中等' : '偏高'
@@ -1197,7 +1174,7 @@ export async function analyzeFullAudioAcousticProfile(
     overlapRisk,
     estimatedMinSpeakers,
     estimatedMaxSpeakers,
-    sampledWindowsCount: windowSlices.length,
+    sampledWindowsCount: totalSampledWindows,
     sampledDurationSec,
     coverageRatio,
     analysisDurationMs,
@@ -1209,14 +1186,14 @@ export async function analyzeFullAudioAcousticProfile(
   };
 }
 
-/** 相容別名：供舊版或外部元件呼叫 */
 export const analyzeAudioPreProfile = analyzeFullAudioAcousticProfile;
 
 export async function extractAndPreprocessMacroChunk(
   file: File,
   chunkStartSec: number,
   chunkEndSec: number,
-  totalDurationSec: number
+  totalDurationSec: number,
+  includeWavBuffer = false
 ): Promise<{
   samples: Float32Array;
   wavBuffer: ArrayBuffer;
@@ -1241,10 +1218,10 @@ export async function extractAndPreprocessMacroChunk(
   if (isWav && totalDurationSec > 0 && file.size > 44) {
     const dataBytes = file.size - 44;
     const bytesPerSec = dataBytes / totalDurationSec;
-    const startByte = 44 + Math.floor((chunkStartSec * bytesPerSec) / 4) * 4;
+    const startByte = 44 + Math.floor((sliceAlign(chunkStartSec * bytesPerSec)) / 4) * 4;
     const endByte = Math.min(
       file.size,
-      44 + Math.ceil((chunkEndSec * bytesPerSec) / 4) * 4
+      44 + Math.ceil((sliceAlign(chunkEndSec * bytesPerSec)) / 4) * 4
     );
     const headerBuf = await file.slice(0, 44).arrayBuffer();
     const bodyBuf = await file.slice(startByte, endByte).arrayBuffer();
@@ -1265,7 +1242,9 @@ export async function extractAndPreprocessMacroChunk(
     }
 
     const samples = await applyHighpassFilter16k(decoded);
-    const wavBuffer = encodeFloat32ToWav(samples, TARGET_SAMPLE_RATE);
+    const wavBuffer = includeWavBuffer
+      ? encodeFloat32ToWav(samples, TARGET_SAMPLE_RATE)
+      : new ArrayBuffer(0);
     return {
       samples,
       wavBuffer,
@@ -1286,7 +1265,9 @@ export async function extractAndPreprocessMacroChunk(
     try {
       const decoded = await audioCtx.decodeAudioData(alignedBuffer);
       const samples = await applyHighpassFilter16k(decoded);
-      const wavBuffer = encodeFloat32ToWav(samples, TARGET_SAMPLE_RATE);
+      const wavBuffer = includeWavBuffer
+        ? encodeFloat32ToWav(samples, TARGET_SAMPLE_RATE)
+        : new ArrayBuffer(0);
       return {
         samples,
         wavBuffer,
@@ -1331,7 +1312,9 @@ export async function extractAndPreprocessMacroChunk(
     monoSlice,
     TARGET_SAMPLE_RATE
   );
-  const wavBuffer = encodeFloat32ToWav(samples, TARGET_SAMPLE_RATE);
+  const wavBuffer = includeWavBuffer
+    ? encodeFloat32ToWav(samples, TARGET_SAMPLE_RATE)
+    : new ArrayBuffer(0);
 
   return {
     samples,
@@ -1340,13 +1323,12 @@ export async function extractAndPreprocessMacroChunk(
   };
 }
 
-/** 相容匯出別名 */
+function sliceAlign(val: number): number {
+  return Math.max(0, val);
+}
+
 export const sliceAudioIntoMacroChunks = extractAndPreprocessMacroChunk;
 
-/**
- * 將 AudioBuffer 轉為 16kHz 單聲道後，僅執行「85Hz 零相位雙向巴特沃斯高通濾波 (`filtfilt`)」：
- * 嚴格保持原始線性動態包絡，不在此階段套用時變壓縮增益，確保 `diarization.worker.ts` 擁有 100% 真實的能量谷底 (`dip`) 與遠近語者分貝差！
- */
 async function applyHighpassFilter16k(
   decoded: AudioBuffer
 ): Promise<Float32Array> {
@@ -1391,7 +1373,7 @@ export async function decodeAndResampleTo16kMono(
   file: File
 ): Promise<Float32Array> {
   const dur = await getAudioDuration(file);
-  const res = await extractAndPreprocessMacroChunk(file, 0, dur, dur);
+  const res = await extractAndPreprocessMacroChunk(file, 0, dur, dur, false);
   return res.samples;
 }
 
@@ -1406,10 +1388,6 @@ async function applyHighpassFilterOnArray(
   );
 }
 
-/**
- * 雙二階峰值濾波器 (Biquad Peaking EQ)：針對 2.8kHz 唇齒音與 F2/F3 共振峰增強 +4.5dB，
- * 讓模糊的平翹舌、鼻音與氣音子音在重聽時變得清晰銳利。
- */
 function applyPresenceBoostBiquad(
   samples: Float32Array,
   sampleRate = TARGET_SAMPLE_RATE,
@@ -1454,9 +1432,6 @@ function applyPresenceBoostBiquad(
   return out;
 }
 
-/**
- * 波形相似度重疊相加演算法 (Pitch-Preserving WSOLA Time-Stretching)
- */
 function applyWsolaTimeStretch(
   input: Float32Array,
   stretchRatio = 1.18,
@@ -1543,9 +1518,6 @@ function applyWsolaTimeStretch(
   return normalizedOut;
 }
 
-/**
- * 【重聽專用無失真聲學正規化與清晰度強化器】
- */
 export function enhanceSubSegmentAudioForRelisten(
   chunkSamples: Float32Array,
   chunkStartGlobalSec: number,
