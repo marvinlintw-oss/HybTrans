@@ -122,7 +122,7 @@ export const UNIVERSAL_COLLOQUIAL_RULES: Array<{
     reason: 'Pass 0 依會議報告祈使語境修正為「報告主席」',
   },
   {
-    pattern: /(?:風天|風間|公空間|罐空間|光有空間|共有空間)(?=活化|盤點|改造|媒合|閒置|那邊|甚麼時候|什麼時候|[，。？?])/g,
+    pattern: /(?:風空間|風天|風間|公空間|罐空間|罐中間|光有空間|共有空間)(?=活化|盤點|改造|媒合|閒置|那邊|甚麼時候|什麼時候|[，。？?])/g,
     wrongDesc: '殘響環境「公有空間」快速連讀誤聽',
     right: '公有空間',
     reason: 'Pass 0 依空間活化與盤點語境修正為「公有空間」',
@@ -152,7 +152,7 @@ export const UNIVERSAL_COLLOQUIAL_RULES: Array<{
     reason: 'Pass 0 依子集數量語法修正「集中有 -> 其中有」',
   },
   {
-    pattern: /有(?:大陸|大入|那入)(?=[0-9一二三四五六七八九十]+月|[第下本]一次|工作會|會報|議程)/g,
+    pattern: /有(?:大陸|大入|那入)[，、\s]*(?=[0-9一二三四五六七八九十]+月|[第下本]一次|工作會|會報|議程)/g,
     wrongDesc: '「有納入」誤聽為「有大陸/那入」',
     right: '有納入',
     reason: 'Pass 0 依會議議程排入語法修正「有大陸 -> 有納入」',
@@ -164,10 +164,22 @@ export const UNIVERSAL_COLLOQUIAL_RULES: Array<{
     reason: 'Pass 0 依部會專有名詞修正為「原民會」',
   },
   {
+    pattern: /(申請|補助|接觸|請教|詢問)(?:援會|園會|願意會)/g,
+    wrongDesc: '快速連讀「原民會」縮讀為「援會/園會」',
+    right: '$1原民會',
+    reason: 'Pass 0 依動賓搭配與連音縮讀還原為「原民會」',
+  },
+  {
     pattern: /(?:徵請|真請)(?=(?:原民會|經濟部|文化部|農業部|國發會|交通部|衛福部|補助|計畫|經費))/g,
     wrongDesc: '「申請」誤聽為「徵請」',
     right: '申請',
     reason: 'Pass 0 依計畫補助動賓搭配修正「徵請 -> 申請」',
+  },
+  {
+    pattern: /(?:股材油|股茶油|古茶油|埔茶油)/g,
+    wrongDesc: '「苦茶油」同音誤聽為「股材油/古茶油」',
+    right: '苦茶油',
+    reason: 'Pass 0 依農特產專有名詞修正為「苦茶油」',
   },
   {
     pattern: /苦茶油品牌[，、]*(?:一樣|一按|以案)(?=已經|目前|這邊|他們)/g,
@@ -176,33 +188,57 @@ export const UNIVERSAL_COLLOQUIAL_RULES: Array<{
     reason: 'Pass 0 依專案列舉量詞修正「一樣 -> 一案」',
   },
   {
+    pattern: /(?:不夥合|不複合|不附合|不負合)(?=補助|辦法|規定|資格|條件|標準)/g,
+    wrongDesc: '「不符合」誤聽為「不夥合/不複合」',
+    right: '不符合',
+    reason: 'Pass 0 依補助辦法語法修正「不夥合 -> 不符合」',
+  },
+  {
+    pattern: /([兩三四五六七八九十幾])[，、\s]*盤子(?=[了嗎呢吧。，？?]|而已)/g,
+    wrongDesc: '「案子」快速連讀誤聽為「盤子」',
+    right: '$1個案子',
+    reason: 'Pass 0 依後文「總共有三案」量詞呼應修正「盤子 -> 個案子」',
+  },
+  {
+    pattern: /(?:兩人|敵人|竹人|足人)(?=已經\s*OK|同意|共識|部落)/g,
+    wrongDesc: '原民部落語境「族人」誤聽為「兩人/竹人」',
+    right: '族人',
+    reason: 'Pass 0 依原民部落會議語境修正為「族人」',
+  },
+  {
+    pattern: /文化部的(?:一天|一件|一間)(?=[，。、\s]*(?:修正|意見))/g,
+    wrongDesc: '「文化部的意見」誤聽為「文化部的一天」',
+    right: '文化部的意見',
+    reason: 'Pass 0 依審查意見修正搭配還原為「文化部的意見」',
+  },
+  {
     pattern: /(之前|裡面|計畫|工程|他們)的(?:空向|功項|公項|工相)/g,
     wrongDesc: '「工項」同音誤聽為「空向/功項」',
     right: '$1的工項',
     reason: 'Pass 0 依工程與計畫結構語境修正為「工項」',
   },
   {
-    pattern: /(第一個是|再來是|你說|這邊是)(?:堅持|監時|兼時|間時)/g,
-    wrongDesc: '鄉鎮名「尖石」同音誤聽為「堅持/監時」',
+    pattern: /(第一個是|再來是|你說|這邊是|是)(?:堅持|監持|監時|兼時|間時|間持)(?=[，、\s]*(?:現在|這邊|那邊|目前|的部分|的狀況|[。？?]))/g,
+    wrongDesc: '鄉鎮名「尖石」同音誤聽為「監持/堅持/監時」',
     right: '$1尖石',
-    reason: 'Pass 0 依分區鄉鎮盤點語境修正為「尖石」',
+    reason: 'Pass 0 依分區鄉鎮主語槽位與音韻修正為「尖石」',
   },
   {
-    pattern: /(?:堅持|監時)(這邊的狀況|的部分|那邊|目前)/g,
-    wrongDesc: '鄉鎮名「尖石」同音誤聽為「堅持/監時」',
-    right: '尖石$1',
-    reason: 'Pass 0 依分區鄉鎮盤點語境修正為「尖石」',
+    pattern: /(?:堅持|監持|監時|兼時|間時|間持)[，、\s]*(這邊的狀況|的部分|那邊|目前|現在狀況)/g,
+    wrongDesc: '鄉鎮名「尖石」同音誤聽為「監持/堅持/監時」',
+    right: '尖石，$1',
+    reason: 'Pass 0 依分區鄉鎮方位主語槽位修正為「尖石」',
   },
   {
-    pattern: /(再來是|下一個是)(?:武功|武風|五風)/g,
-    wrongDesc: '鄉鎮名「五峰」同音誤聽為「武功/武風」',
+    pattern: /(再來是|下一個是|是)(?:武蜂|武功|武風|五風|五蜂)/g,
+    wrongDesc: '鄉鎮名「五峰」同音誤聽為「武蜂/武功/武風」',
     right: '$1五峰',
     reason: 'Pass 0 依分區鄉鎮盤點語境修正為「五峰」',
   },
   {
-    pattern: /(?:武功|武風|五風)(目前|這邊|的部分|那邊)/g,
-    wrongDesc: '鄉鎮名「五峰」同音誤聽為「武功/武風」',
-    right: '五峰$1',
+    pattern: /(?:武蜂|武功|武風|五風|五蜂)(?=[，、\s]*(?:目前|這邊|的部分|那邊|大概))/g,
+    wrongDesc: '鄉鎮名「五峰」同音誤聽為「武蜂/武功/武風」',
+    right: '五峰',
     reason: 'Pass 0 依分區鄉鎮盤點語境修正為「五峰」',
   },
   {
@@ -1583,8 +1619,24 @@ export function runStage1SentenceIntegrityCheckAndRepair(
     ) {
       const midText = midSeg.words.map((w) => w.text).join('').trim();
       const midPure = midText.replace(/[，。？！、；：,.?!…\s]/g, '');
+      const prevSpkF0 = speakers[prevSeg.speakerId]?.f0Hz ?? 145;
+      const midSpkF0 = speakers[midSeg.speakerId]?.f0Hz ?? 145;
+      const isCrossGenderSandwich =
+        (prevSpkF0 < 162 && midSpkF0 >= 168) ||
+        (prevSpkF0 >= 168 && midSpkF0 < 162);
+      const prevPure = prevSeg.words
+        .map((w) => w.text)
+        .join('')
+        .replace(/[，。？！、；：,.?!…\s]/g, '');
+      const isTopicEchoTurn =
+        midPure.length >= 2 &&
+        prevPure.length >= 2 &&
+        prevPure.slice(-4).includes(midPure.slice(0, 2));
       const isStandaloneReply =
-        DIRECT_SHORT_ANSWER_REGEX.test(midText) || /[？?]$/.test(midText);
+        DIRECT_SHORT_ANSWER_REGEX.test(midText) ||
+        /[？?]$/.test(midText) ||
+        isCrossGenderSandwich ||
+        isTopicEchoTurn;
       if (midPure.length >= 1 && midPure.length <= 5 && !isStandaloneReply) {
         midSeg.speakerId = prevSeg.speakerId;
         midSeg.words = midSeg.words.map((w) => ({
@@ -2377,7 +2429,7 @@ export function applySentenceLevelLocalCorrection(
     for (const dRule of dynamicRules) {
       if (
         refinedSentence.includes(dRule.wrong) &&
-        !refinedSentence.includes(dRule.right)
+        !dRule.right.includes(dRule.wrong)
       ) {
         refinedSentence = refinedSentence.split(dRule.wrong).join(dRule.right);
         hitReasons.push(dRule);
@@ -2442,7 +2494,12 @@ export function applySentenceLevelLocalCorrection(
             !COMMON_STOP_WORDS.has(sub) &&
             !BAD_GRAMMATICAL_EDGE_REGEX.test(sub)
           ) {
-            if (toAccentInsensitivePhoneticKey(sub) === fKey) {
+            const isExactFuzzy = toAccentInsensitivePhoneticKey(sub) === fKey;
+            const isNearPhonetic =
+              !isExactFuzzy &&
+              (anchor.isPriorVerified || anchor.sovereigntyScore >= 10.0) &&
+              computeTaiwanPhoneticDistance(sub, correctTerm) <= 0.16;
+            if (isExactFuzzy || isNearPhonetic) {
               const subItem = evidenceMap.get(sub);
               const subSov = subItem?.sovereigntyScore || 0.5;
               const subProd = subItem?.compoundProductivity || 0;
@@ -2453,7 +2510,7 @@ export function applySentenceLevelLocalCorrection(
                 hitReasons.push({
                   wrong: sub,
                   right: correctTerm,
-                  reason: `Pass 1 依複合詞見證與模糊音韻主權自動收斂為「${correctTerm}」`,
+                  reason: `Pass 1 依後文實體見證與模糊音韻主權自動收斂為「${correctTerm}」`,
                 });
                 refinedSentence =
                   refinedSentence.slice(0, i) +
@@ -2681,7 +2738,10 @@ export async function runTriLevelWindowCorrection(params: {
       dictionary
     );
 
-  useAppStore.getState().replaceBatchSegments(resolvedSegments);
+  const sourceTargetIds = payload.highAttentionTargetSegments.map((s) => s.id);
+  useAppStore
+    .getState()
+    .replaceBatchSegments(resolvedSegments, sourceTargetIds);
 
   for (const rId of flaggedForRelistenIds) {
     localPatches.push({
@@ -2790,7 +2850,12 @@ export async function runGlobalRetroactiveContextPass(params: {
       useAppStore.getState().speakers
     );
 
-  useAppStore.getState().replaceBatchSegments(updatedSegments);
+  useAppStore
+    .getState()
+    .replaceBatchSegments(
+      updatedSegments,
+      allSegments.map((s) => s.id)
+    );
 
   const evidenceMap = analyzeCorpusStatisticalEvidence(
     updatedSegments,
@@ -3457,3 +3522,36 @@ export class HybridEngineRouter {
 }
 
 export const engineRouter = new HybridEngineRouter();
+
+/**
+ * 【即時跨視窗回溯同音消歧引擎 (`runIncrementalRetroactiveEntityPass`)】：
+ * 每當新視窗轉寫出高信心度詞彙（例如 02:44 清楚辨識出「尖石」、01:49 辨識出「原民會」），
+ * 立即以零 VRAM 成本掃描目前已產出之所有前段句子，將前段因口音或殘響誤聽之同音異字（如 00:39 與 00:43 之「監持」）即時回溯統一！
+ */
+export function runIncrementalRetroactiveEntityPass(): number {
+  const state = useAppStore.getState();
+  if (state.segments.length < 2) return 0;
+
+  const verifiedTerms = mineAdaptiveHighFreqTerms(
+    state.segments,
+    state.dictionary,
+    `${state.docContextSummary}\n${state.rollingMeetingSummary}`
+  );
+  if (verifiedTerms.length === 0) return 0;
+
+  const { updatedSegments, patches } = applySentenceLevelLocalCorrection(
+    state.segments,
+    verifiedTerms,
+    state.dictionary
+  );
+
+  if (patches.length > 0) {
+    useAppStore
+      .getState()
+      .replaceBatchSegments(
+        updatedSegments,
+        state.segments.map((s) => s.id)
+      );
+  }
+  return patches.length;
+}
