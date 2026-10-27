@@ -243,10 +243,49 @@ export function isSyntacticallyBoundPair(
     return true;
   }
 
-  // 8. 數詞/指示詞 + 量詞
+  // 8. 數詞/序數詞/指示詞 + 量詞 (如：第+一、一+個、三+處)
   if (
-    /[一二三四五六七八九十百千萬兩這那某每各幾]$/.test(prevClean) &&
-    /^(個|位|名|次|件|種|些|點|處|家|間|筆|項|套|場|人|天|年|月|週|案)/.test(
+    /([第]|[一二三四五六七八九十百千萬兩這那某每各幾])$/.test(prevClean) &&
+    /^([一二三四五六七八九十百千萬兩0-9]+|個|位|名|次|件|種|些|點|處|家|間|筆|項|套|場|人|天|年|月|週|案|組|部)/.test(
+      currClean
+    )
+  ) {
+    return true;
+  }
+
+  // 9. 序數/列舉主語或轉折連接詞 + 繫詞「是/為/有」 (如：第一個+是、再來+是、另外一個+是)
+  if (
+    /^(第[一二三四五六七八九十0-9]+[個處案項點次步]?|一個|兩個|三個|另外一個|最後一個|下一個|再來|接下來|那再來|這個|那個)$/.test(
+      prevClean
+    ) &&
+    /^(是|就是|為|有|在|要)/.test(currClean)
+  ) {
+    return true;
+  }
+
+  // 10. 因果/條件連詞帶主語名詞 + 謂語繫詞 (如：因為執行單位 + 是不同的)
+  if (
+    /(因為|由於|如果|要是|雖然|當)[一-龥]{1,5}$/.test(prevClean) &&
+    /^(是|不是|有|沒有|在|不在|會|不會|可以|已經|都|還|不|很|太)/.test(
+      currClean
+    )
+  ) {
+    return true;
+  }
+
+  // 11. 言談/認知/行政及物動詞 + 緊接賓語 (如：你說 + 尖石、申請 + 原民會)
+  if (
+    /(你說|我說|他說|請問|問一下|講說|提到|是指|關於|針對|報告|申請|補助|協助|聯繫|接觸)$/.test(
+      prevClean
+    ) &&
+    /^[一-龥A-Za-z0-9]{1,5}/.test(currClean)
+  ) {
+    return true;
+  }
+
+  // 12. 概數後置詞、範圍助詞與句尾限定詞 (如：十月中 + 左右、意見 + 修正而已)
+  if (
+    /^(左右|上下|前後|以內|以上|以下|之間|而已|罷了|的話|的時候|的部分|的狀況|的問題|的意見|的修正|修正而已)/.test(
       currClean
     )
   ) {
@@ -545,14 +584,15 @@ export function decodeWordLevelSpeakersViterbi(
       Math.max(0.0005, 1.0 / (1.0 + Math.exp(-logit)))
     );
 
-    // 當聲學後驗通量 flux >= 0.46 或停頓 >= 0.28s 且非強語法價鍵時，解除句中換人封鎖，讓無標點之快速問答也能精準換人！
+    // 嚴格防止線性插值時間戳偏移在「無標點子句內部」腰斬完整句子（如「因為執行單位｜是不同的」、「十月中｜左右」、「第｜一個｜是」）：
+    // 若前詞無標點 (!prevHasPunct)，僅在明確話輪邊界 (isTurnBoundary)、短促應答詞 (isCurrBackchannel) 或話輪起手詞 (isCurrInterruptionStarter) 時允許換人！
     const blockMidClauseSwitch =
       isBoundSyntacticPair ||
       isClauseClosingTail ||
       (!prevHasPunct &&
         !isTurnBoundary &&
-        flux < 0.46 &&
-        pauseSec < 0.28);
+        !isCurrBackchannel &&
+        !(isCurrInterruptionStarter && (flux >= 0.52 || pauseSec >= 0.24)));
 
     const wEm = wordEmissionWeights[i];
 
