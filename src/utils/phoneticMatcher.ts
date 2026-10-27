@@ -7,86 +7,109 @@ import { Segment, PhoneticMatchCandidate } from '../types';
  */
 const PHONETIC_GROUPS: Record<string, string> = {
   // 常見姓氏與高頻會議字根同音群組
-  '林臨淋琳霖零玲鈴齡伶翎': 'LIN',
-  '陳塵臣辰晨沉成城誠呈承程懲乘': 'CHEN',
-  '張章彰璋髒商傷湯': 'ZHANG',
-  '李里理禮裡鯉履哩': 'LI',
-  '王亡汪網往枉晚碗挽宛婉琬椀灣彎頑丸完玩': 'WAN',
-  '吳吾無蕪梧巫務物誤悟霧勿屋': 'WU',
-  '劉留流琉榴瘤': 'LIU',
-  '蔡菜採彩踩財材裁才': 'CAI',
-  '楊陽揚洋羊佯樣養仰': 'YANG',
-  '許栩詡徐須需虛噓詢尋巡': 'XU',
-  '鄭正政證症爭徵真針珍診陣鎮振': 'ZHENG',
-  '謝械卸屑蟹寫血協脅鞋': 'XIE',
-  '郭鍋國果過裹擴闊': 'GUO',
-  '洪紅宏虹鴻哄烘': 'HONG',
-  '曾增爭箏蒸真偵': 'ZENG',
-  '廖料瞭療聊撩': 'LIAO',
-  '賴來萊瀨藍蘭攔欄': 'LAI',
-  '蘇疏輸書舒樞叔屬署鼠數術述束': 'SU',
-  '周洲舟州週驟軸': 'ZHOU',
-  '葉頁業夜液腋咽謁': 'YE',
+  '林臨淋琳霖零玲鈴齡伶翎鄰鱗磷': 'LIN',
+  '陳塵臣辰晨沉成城誠呈承程懲乘盛丞': 'CHEN',
+  '張章彰璋髒商傷湯昌娼猖': 'ZHANG',
+  '李里理禮裡鯉履哩離梨黎麗利例立力歷曆隸粒勵': 'LI',
+  '王亡汪網往枉晚碗挽宛婉琬椀灣彎頑丸完玩萬腕': 'WAN',
+  '吳吾無蕪梧巫務物誤悟霧勿屋五武午舞伍侮捂塢戊': 'WU',
+  '劉留流琉榴瘤柳六陸': 'LIU',
+  '蔡菜採彩踩財材裁才猜拆差釵茶查察擦搽': 'CAI',
+  '楊陽揚洋羊佯樣養仰央泱秧癢氧': 'YANG',
+  '許栩詡徐須需虛噓詢尋巡敘序緒續蓄恤': 'XU',
+  '鄭正政證症爭徵真針珍診陣鎮振震賑貞偵幀': 'ZHENG',
+  '謝械卸屑蟹寫血協脅鞋斜邪攜些歇': 'XIE',
+  '郭鍋國果過裹擴闊括廓': 'GUO',
+  '洪紅宏虹鴻哄烘轟哄弘': 'HONG',
+  '曾增爭箏蒸真偵憎贈綜': 'ZENG',
+  '廖料瞭療聊撩遼僚繚': 'LIAO',
+  '賴來萊瀨藍蘭攔欄奈耐': 'LAI',
+  '蘇疏輸書舒樞叔屬署鼠數術述束俗宿速塑訴粟': 'SU',
+  '周洲舟州週驟軸宙晝咒奏揍': 'ZHOU',
+  '葉頁業夜液腋咽謁野也冶耶': 'YE',
   // 常見職稱、政府標案與會議高頻同音群組 (含前後鼻音/平捲舌/流音滑音/元音鬆化容錯)
-  '處觸畜築儲礎楚出初除廚': 'CHU',
-  '長場廠掌漲常償嚐腸': 'ZHANG_TITLE',
-  '委偉尾瑋偽緯位未味衛為圍違唯維微危薇': 'WEI',
-  '員元園原源圓援緣沿延研言嚴岩': 'YUAN',
-  '於余妤魚漁娛逾愚榆瑜渝雲云勻芸': 'YU',
-  '科顆棵磕苛課客克刻': 'KE',
-  '主組祖阻詛煮囑助住注駐祝著': 'ZHU',
-  '任認韌刃妊人仁忍': 'REN',
-  '秘密蜜覓冪密': 'MI',
-  '神什沈審嬸慎滲深身申伸升生聲勝聖盛': 'SHEN',
-  '如儒茹汝乳入辱盧蘆爐': 'RU',
-  '總種腫塚中忠終鐘衷眾重': 'ZONG',
-  '工功攻公宮弓恭供躬共貢': 'GONG',
-  '項向象像相巷享響想箱廂鄉香': 'XIANG',
-  '馬碼瑪螞麻嘛罵媽抹': 'MA',
-  '經精晶京驚鯨金今津斤禁近進盡勁景警井': 'JING',
-  '俊駿峻浚郡菌軍均君鈞': 'JUN',
-  '穎影營迎贏盈瑩螢沂儀宜疑移姨遺頤': 'YING_YI',
-  '博薄搏駁伯帛泊白百擺柏拍排牌': 'BO',
-  '姐姊解節結潔借界戒介屆街皆接': 'JIE',
-  '士事式市試視室是師詩失施獅濕十石時實食識史使始示世勢適釋': 'SHI',
-  '教較校酵覺交郊嬌澆焦礁角腳剿叫轎笑效肖孝': 'JIAO',
-  '授受售瘦獸收手守首壽': 'SHOU',
-  '店電墊殿奠佃甸點典': 'DIAN',
-  '面麵棉眠免勉緬': 'MIAN',
-  '翻番凡煩繁樊販範犯飯泛': 'FAN',
-  '修羞休朽秀袖繡鏽': 'XIU',
-  '開揩慨楷凱': 'KAI',
-  '新心辛欣薪馨星興腥芯': 'XIN',
-  '標彪飆錶表裱': 'BIAO',
-  '不布步部怖捕補普譜': 'BU',
-  '要耀曜藥鑰搖遙謠姚咬': 'YAO',
-  '廊狼郎良涼糧梁量藍蘭籃欄': 'LANG',
-  '帶代袋貸待怠殆大太態泰台臺抬苔': 'DAI',
-  '件見建健鍵漸踐劍薦鑑間肩堅監兼簡檢減撿': 'JIAN',
-  '群裙尋巡詢循': 'QUN',
-  '輔腐府俯釜付負附赴副富復腹覆': 'FU',
-  '導島倒禱蹈到道稻盜': 'DAO',
-  '央泱秧英應鷹迎營贏盈': 'YANG_YING',
-  '切且竊妾企契氣棄汽器': 'QIE',
-  '小曉筱少稍梢紹哨笑校效': 'XIAO',
-  '企起豈啟氣器棄契': 'QI',
-  '支之知肢織汁資姿滋諮只指止址紙至志制致置質治炙': 'ZHI',
-  '晰析息悉惜昔夕希稀犧吸西膝': 'XI',
-  '就舊救舅咎久九酒究糾': 'JIU',
-  '加家佳嘉夾挾袈': 'JIA',
-  '盟萌蒙濛盲忙茫氓': 'MENG',
-  '議意義藝亦異役疫譯翼億憶益誼一衣醫依壹架價假嫁稼駕寄記計既際季紀': 'YI',
-  '評平瓶憑萍屏貧頻品聘': 'PING',
-  '選癬險顯憲縣現限線獻': 'XUAN',
-  '核合何河荷盒和禾吉及級即極急集籍': 'HE',
-  '銷消宵霄削囂小曉': 'XIAO_2',
-  '給北被備背倍輩貝': 'GEI_BEI',
-  '裝樁莊妝裝潢': 'ZHUANG',
-  '充衝沖聰匆蔥煙': 'CHONG',
-  '足族卒竹築逐燭': 'ZU_FOOT',
-  '怎診枕整貞針': 'ZEN',
-  '麼嗎嘛麻馬媽': 'ME_PARTICLE',
-  '辦半伴扮絆版板': 'BAN',
+  '處觸畜築儲礎楚出初除廚鋤雛矗': 'CHU',
+  '長場廠掌漲常償嚐腸藏昌暢唱倡': 'ZHANG_TITLE',
+  '委偉尾瑋偽緯位未味衛為圍違唯維微危薇威巍慰胃謂餵': 'WEI',
+  '員元園原源圓援緣沿延研言嚴岩顏鹽院願怨苑猿垣': 'YUAN',
+  '於余妤魚漁娛逾愚榆瑜渝雲云勻芸育域預遇裕愈喻玉獄雨語羽與宇嶼': 'YU',
+  '科顆棵磕苛課客克刻可渴殼咳': 'KE',
+  '主組祖阻詛煮囑助住注駐祝著柱珠株諸豬竹築逐燭': 'ZHU',
+  '任認韌刃妊人仁忍稔': 'REN',
+  '秘密蜜覓冪密米迷謎彌靡': 'MI',
+  '神什沈審嬸慎滲深身申伸升生聲勝聖盛省剩甚': 'SHEN',
+  '如儒茹汝乳入辱盧蘆爐陸錄鹿路露虜魯滷': 'RU',
+  '總種腫塚中忠終鐘衷眾重宗蹤棕縱': 'ZONG',
+  '工功攻公宮弓恭供躬共貢拱鞏空孔控恐': 'GONG',
+  '項向象像相巷享響想箱廂鄉香詳祥翔降': 'XIANG',
+  '馬碼瑪螞麻嘛罵媽抹嗎': 'MA',
+  '經精晶京驚鯨金今津斤禁近進盡勁景警井境鏡敬靜淨競徑竟': 'JING',
+  '俊駿峻浚郡菌軍均君鈞窘': 'JUN',
+  '穎影營迎贏盈瑩螢沂儀宜疑移姨遺頤銀吟飲引印應鷹英櫻嬰': 'YING_YI',
+  '博薄搏駁伯帛泊白百擺柏拍排牌迫魄': 'BO',
+  '姐姊解節結潔借界戒介屆街皆接階揭劫傑竭截': 'JIE',
+  '士事式市試視室是師詩失施獅濕十石時實食識史使始示世勢適釋氏誓逝嗜拾蝕持池遲馳匙齒恥尺赤斥翅': 'SHI',
+  '教較校酵覺交郊嬌澆焦礁角腳剿叫轎笑效肖孝酵': 'JIAO',
+  '授受售瘦獸收手守首壽熟': 'SHOU',
+  '店電墊殿奠佃甸點典顛巔碘': 'DIAN',
+  '面麵棉眠免勉緬綿靦': 'MIAN',
+  '翻番凡煩繁樊販範犯飯泛反返泛汎': 'FAN',
+  '修羞休朽秀袖繡鏽宿': 'XIU',
+  '開揩慨楷凱鎧概慨': 'KAI',
+  '新心辛欣薪馨星興腥芯信釁猩': 'XIN',
+  '標彪飆錶表裱婊': 'BIAO',
+  '不布步部怖捕補普譜堡埠簿': 'BU',
+  '要耀曜藥鑰搖遙謠姚咬邀腰妖窯': 'YAO',
+  '廊狼郎良涼糧梁量藍蘭籃欄朗浪郎': 'LANG',
+  '帶代袋貸待怠殆大太態泰台臺抬苔歹逮': 'DAI',
+  '件見建健鍵漸踐劍薦鑑間肩堅監兼簡檢減撿尖奸殲艱淺潛錢前千遷牽鉛謙簽籤': 'JIAN',
+  '群裙尋巡詢循旬馴': 'QUN',
+  '輔腐府俯釜付負附赴副富復腹覆服福幅浮符扶夫膚敷賦父婦': 'FU',
+  '導島倒禱蹈到道稻盜刀叨導悼': 'DAO',
+  '央泱秧英應鷹迎營贏盈映硬': 'YANG_YING',
+  '切且竊妾企契氣棄汽器泣訖': 'QIE',
+  '小曉筱少稍梢紹哨笑校效孝嘯': 'XIAO',
+  '企起豈啟氣器棄契期欺漆戚妻棲七希溪西吸': 'QI',
+  '支之知肢織汁資姿滋諮只指止址紙至志制致置質治炙職直值植執殖秩擲': 'ZHI',
+  '晰析息悉惜昔夕希稀犧吸西膝溪熙嬉錫襲習席媳洗喜係系細戲': 'XI',
+  '就舊救舅咎久九酒究糾揪韭灸': 'JIU',
+  '加家佳嘉夾挾袈甲假價架駕嫁稼': 'JIA',
+  '盟萌蒙濛盲忙茫氓猛孟夢': 'MENG',
+  '議意義藝亦異役疫譯翼億憶益誼一衣醫依壹揖椅已以尾倚': 'YI',
+  '評平瓶憑萍屏貧頻品聘拼拚': 'PING',
+  '選癬險顯憲縣現限線獻羨腺弦賢鹹嫌鮮仙先掀': 'XUAN',
+  '核合何河荷盒和禾吉及級即極急集籍夥火伙獲惑或禍貨活': 'HE',
+  '銷消宵霄削囂小曉蕭瀟簫': 'XIAO_2',
+  '給北被備背倍輩貝悲杯碑背': 'GEI_BEI',
+  '裝樁莊妝裝潢狀撞壯創瘡窗床': 'ZHUANG',
+  '充衝沖聰匆蔥從叢崇蟲重寵': 'CHONG',
+  '足族卒竹築逐燭俗宿': 'ZU_FOOT',
+  '怎診枕整貞針陣鎮振': 'ZEN',
+  '麼嗎嘛麻馬媽抹': 'ME_PARTICLE',
+  '辦半伴扮絆版板盼判叛盤磐番班般搬斑頒': 'BAN',
+  '峰蜂風封豐瘋鋒逢縫馮鳳奉諷俸': 'FENG',
+  '苦股古谷鼓骨賈庫褲酷哭枯窟': 'KU',
+  '油由游遊尤郵猶友有右又幼誘憂優幽悠': 'YOU',
+  '民明名銘鳴敏閩眠綿皿泯冥': 'MIN',
+  '會匯繪惠慧賄悔毀回迴灰揮輝恢徽': 'HUI',
+  '納那吶捺內耐奈奶乃男南難喃': 'NA',
+  '案按暗岸胺安鞍氨俺': 'AN',
+  '培陪賠裴肥व': 'PEI',
+  '訓訊迅遜尋巡詢': 'XUN',
+  '吊釣調掉弔掉': 'DIAO',
+  '橋瞧喬僑翹竅殼': 'QIAO',
+  '巴吧疤芭八拔跋把靶爸罷霸': 'BA',
+  '連聯憐簾蓮廉臉練煉戀鏈': 'LIAN',
+  '專磚轉傳撰賺纂': 'ZHUAN',
+  '單擔丹耽眈但淡彈誕旦膽': 'DAN',
+  '獨讀毒牘犢度渡鍍肚堵賭睹': 'DU',
+  '月越粵悅閱躍嶽岳約曰': 'YUE',
+  '號好耗浩皓毫豪壕號': 'HAO',
+  '早澡藻棗找爪造皂燥躁': 'ZAO',
+  '上尚賞裳商傷湯雙': 'SHANG',
+  '天添田甜填舔': 'TIAN',
+  '三山衫刪珊散傘閃善扇擅': 'SAN',
+  '兩良涼糧梁量亮諒輛': 'LIANG',
 };
 
 const charToPhoneticCode = new Map<string, string>();
@@ -193,6 +216,29 @@ const CODE_TO_TUPLE_MAP: Record<
   ZEN: { initial: 'z', medial: '', rime: 'en', fuzzyHash: 'zen' },
   ME_PARTICLE: { initial: 'm', medial: '', rime: 'e', fuzzyHash: 'me' },
   BAN: { initial: 'b', medial: '', rime: 'an', fuzzyHash: 'ban' },
+  FENG: { initial: 'f', medial: 'u', rime: 'on', fuzzyHash: 'fon' },
+  KU: { initial: 'k', medial: 'u', rime: 'u', fuzzyHash: 'ku' },
+  YOU: { initial: 'y', medial: 'i', rime: 'ou', fuzzyHash: 'you' },
+  MIN: { initial: 'm', medial: 'i', rime: 'in', fuzzyHash: 'min' },
+  HUI: { initial: 'h', medial: 'u', rime: 'ei', fuzzyHash: 'hui' },
+  NA: { initial: 'n', medial: '', rime: 'a', fuzzyHash: 'na' },
+  AN: { initial: 'y', medial: '', rime: 'an', fuzzyHash: 'an' },
+  PEI: { initial: 'p', medial: '', rime: 'ei', fuzzyHash: 'pei' },
+  XUN: { initial: 'x', medial: 'u', rime: 'un', fuzzyHash: 'xun' },
+  DIAO: { initial: 'd', medial: 'i', rime: 'ao', fuzzyHash: 'diao' },
+  QIAO: { initial: 'q', medial: 'i', rime: 'ao', fuzzyHash: 'qiao' },
+  BA: { initial: 'b', medial: '', rime: 'a', fuzzyHash: 'ba' },
+  LIAN: { initial: 'l', medial: 'i', rime: 'an', fuzzyHash: 'lian' },
+  ZHUAN: { initial: 'z', medial: 'u', rime: 'an', fuzzyHash: 'zuan' },
+  DAN: { initial: 'd', medial: '', rime: 'an', fuzzyHash: 'dan' },
+  DU: { initial: 'd', medial: 'u', rime: 'u', fuzzyHash: 'du' },
+  YUE: { initial: 'y', medial: 'u', rime: 'ie', fuzzyHash: 'yue' },
+  HAO: { initial: 'h', medial: '', rime: 'ao', fuzzyHash: 'hao' },
+  ZAO: { initial: 'z', medial: '', rime: 'ao', fuzzyHash: 'zao' },
+  SHANG: { initial: 's', medial: '', rime: 'an', fuzzyHash: 'san' },
+  TIAN: { initial: 't', medial: 'i', rime: 'an', fuzzyHash: 'tian' },
+  SAN: { initial: 's', medial: '', rime: 'an', fuzzyHash: 'san' },
+  LIANG: { initial: 'l', medial: 'i', rime: 'an', fuzzyHash: 'lian' },
 };
 
 function charToSyllableTuple(ch: string): SyllablePhonemeTuple {
@@ -231,10 +277,6 @@ export function toTaiwanFuzzyPhoneticSyllables(text: string): string[] {
 
 /**
  * 計算兩個單音節之台式腔調與快速連讀替換成本 c_sub(s_i, t_j) \in [0, 1]
- * 支援：
- * 1. 平翹舌零成本、前後鼻音零成本
- * 2. 高元音鬆化 (si <-> su, 如「商業室」與「商業署」) 低成本 0.14
- * 3. 快速語流之舌尖流音與圓唇滑音同化 (如「禮 li <-> 如 lu/ru」、「物 wu <-> 果 guo」、「委 wei <-> 晚 wan」、「員 yuan <-> 於 yu」)
  */
 function computeSyllableSubCost(
   a: SyllablePhonemeTuple,
@@ -244,19 +286,22 @@ function computeSyllableSubCost(
 
   if (
     (a.fuzzyHash === 'su' && b.fuzzyHash === 'si') ||
-    (a.fuzzyHash === 'si' && b.fuzzyHash === 'su')
+    (a.fuzzyHash === 'si' && b.fuzzyHash === 'su') ||
+    (a.fuzzyHash === 'si' && b.fuzzyHash === 'zi') ||
+    (a.fuzzyHash === 'zi' && b.fuzzyHash === 'si')
   ) {
-    return 0.14;
+    return 0.12;
   }
   if (
     (a.fuzzyHash === 'zu' && b.fuzzyHash === 'li') ||
     (a.fuzzyHash === 'li' && b.fuzzyHash === 'zu') ||
     (a.fuzzyHash === 'lu' && b.fuzzyHash === 'li') ||
-    (a.fuzzyHash === 'li' && b.fuzzyHash === 'lu')
+    (a.fuzzyHash === 'li' && b.fuzzyHash === 'lu') ||
+    (a.fuzzyHash === 'fon' && b.fuzzyHash === 'gon') ||
+    (a.fuzzyHash === 'gon' && b.fuzzyHash === 'fon')
   ) {
-    return 0.18;
+    return 0.16;
   }
-  // 快速語流圓唇滑音與軟顎塞音弱化 (如「物 wu <-> 果 guo」、「委 wei <-> 晚 wan」、「員 yuan <-> 於 yu」、「裝 zuan <-> 充 con」、「修 xiou <-> 足 zu」)
   if (
     (a.fuzzyHash === 'wu' && b.fuzzyHash === 'guo') ||
     (a.fuzzyHash === 'guo' && b.fuzzyHash === 'wu') ||
@@ -267,9 +312,13 @@ function computeSyllableSubCost(
     (a.fuzzyHash === 'zuan' && b.fuzzyHash === 'con') ||
     (a.fuzzyHash === 'con' && b.fuzzyHash === 'zuan') ||
     (a.fuzzyHash === 'xiou' && b.fuzzyHash === 'zu') ||
-    (a.fuzzyHash === 'zu' && b.fuzzyHash === 'xiou')
+    (a.fuzzyHash === 'zu' && b.fuzzyHash === 'xiou') ||
+    (a.fuzzyHash === 'na' && b.fuzzyHash === 'dai') ||
+    (a.fuzzyHash === 'dai' && b.fuzzyHash === 'na') ||
+    (a.fuzzyHash === 'an' && b.fuzzyHash === 'ban') ||
+    (a.fuzzyHash === 'ban' && b.fuzzyHash === 'an')
   ) {
-    return 0.22;
+    return 0.20;
   }
 
   let initialCost = 1.0;
@@ -282,12 +331,11 @@ function computeSyllableSubCost(
     (a.initial === 't' && b.initial === 'd') ||
     (a.initial === 'g' && b.initial === 'k') ||
     (a.initial === 'k' && b.initial === 'g') ||
-    (['l', 'r', 'n', 'y'].includes(a.initial) &&
-      ['l', 'r', 'n', 'y'].includes(b.initial)) ||
-    (['w', 'g', 'h'].includes(a.initial) &&
-      ['w', 'g', 'h'].includes(b.initial) &&
-      a.medial === 'u' &&
-      b.medial === 'u') ||
+    (['l', 'r', 'n', 'y', 'd'].includes(a.initial) &&
+      ['l', 'r', 'n', 'y', 'd'].includes(b.initial)) ||
+    (['w', 'g', 'h', 'f'].includes(a.initial) &&
+      ['w', 'g', 'h', 'f'].includes(b.initial) &&
+      (a.medial === 'u' || b.medial === 'u')) ||
     (['j', 'q', 'x'].includes(a.initial) &&
       ['j', 'q', 'x'].includes(b.initial)) ||
     (['z', 'c', 's'].includes(a.initial) &&
@@ -295,7 +343,7 @@ function computeSyllableSubCost(
     (['j', 'q', 'x', 'z', 'c', 's'].includes(a.initial) &&
       ['j', 'q', 'x', 'z', 'c', 's'].includes(b.initial))
   ) {
-    initialCost = 0.24;
+    initialCost = 0.22;
   }
 
   let rimeCost = 1.0;
@@ -315,28 +363,31 @@ function computeSyllableSubCost(
     (a.rime === 'i' && b.rime === 'u') ||
     (a.rime === 'u' && b.rime === 'i') ||
     (a.rime === 'ie' && b.rime === 'i') ||
-    (a.rime === 'i' && b.rime === 'ie')
+    (a.rime === 'i' && b.rime === 'ie') ||
+    (a.rime === 'ai' && b.rime === 'a') ||
+    (a.rime === 'a' && b.rime === 'ai')
   ) {
-    rimeCost = 0.22;
+    rimeCost = 0.20;
   }
 
-  const medialCost = a.medial === b.medial ? 0.0 : 0.18;
+  const medialCost = a.medial === b.medial ? 0.0 : 0.16;
   return Math.min(1.0, 0.45 * initialCost + 0.45 * rimeCost + 0.1 * medialCost);
 }
 
 /**
  * 判斷雙音節 (s_{i-1}, s_i) 是否可經由快速連音縮讀 (Syllable Contraction 2 -> 1) 合併為單音節 t_j
- * 典型實例：「不 (bu) + 要 (yao)」連音縮讀為「標 (biao)」，即首字聲母 b == b 且次字韻母 ao == ao！
  */
 function canContractTwoSyllablesIntoOne(
   sPrev: SyllablePhonemeTuple,
   sCurr: SyllablePhonemeTuple,
   target: SyllablePhonemeTuple
 ): boolean {
-  if (sPrev.initial !== target.initial) return false;
+  if (sPrev.initial !== target.initial && sCurr.initial !== target.initial) {
+    return false;
+  }
   const secondHasYOrI =
     sCurr.initial === 'y' || sCurr.medial === 'i' || sCurr.rime === target.rime;
-  return secondHasYOrI && sCurr.rime === target.rime;
+  return secondHasYOrI && (sCurr.rime === target.rime || sPrev.rime === target.rime);
 }
 
 /**
@@ -359,8 +410,8 @@ export function computeTaiwanPhoneticDistance(
   const sTuples = sChars.map(charToSyllableTuple);
   const tTuples = tChars.map(charToSyllableTuple);
 
-  const indelCost = 0.75;
-  const contractCost = 0.22;
+  const indelCost = 0.72;
+  const contractCost = 0.20;
 
   const dp: number[][] = Array.from({ length: n + 1 }, () =>
     new Array(m + 1).fill(Infinity)
@@ -378,7 +429,6 @@ export function computeTaiwanPhoneticDistance(
       const ins = dp[i][j - 1] + indelCost;
       let best = Math.min(sub, del, ins);
 
-      // 2 -> 1 跨音節連音縮讀轉移項 (例如「開心不要」4字 對齊 「開新標」3字)
       if (
         i >= 2 &&
         canContractTwoSyllablesIntoOne(
@@ -390,7 +440,6 @@ export function computeTaiwanPhoneticDistance(
         best = Math.min(best, dp[i - 2][j - 1] + contractCost);
       }
 
-      // 1 -> 2 逆向連音展開轉移項
       if (
         j >= 2 &&
         canContractTwoSyllablesIntoOne(
