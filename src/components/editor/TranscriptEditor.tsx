@@ -1173,55 +1173,6 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
             </div>
           );
         })}
-
-        {/* 逐字稿底部「一鍵生成會議 AI 摘要、結論與行動事項」卡片 */}
-        {segments.length > 0 && (
-          <div className="pt-4 pb-6 border-t border-slate-200 mt-6 flex flex-col sm:flex-row items-center justify-between gap-3 bg-slate-50/70 rounded-2xl p-4">
-            <div className="space-y-0.5 text-center sm:text-left">
-              <div className="text-xs sm:text-sm font-bold text-slate-800 flex items-center justify-center sm:justify-start gap-1.5">
-                <ClipboardList className="w-4 h-4 text-emerald-600 shrink-0" />
-                <span>
-                  {meetingMinutes
-                    ? '已生成會議 AI 摘要、重要結論與行動事項報告'
-                    : '需要將上方逐字稿整理為正式會議紀錄嗎？'}
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-500">
-                自動歸納執行摘要、重要裁示結論、各議題討論重點與負責人員待辦事項追蹤表（支援離線與雲端 AI 雙模式，並可匯出 Word / Markdown）。
-              </p>
-            </div>
-
-            <div className="flex items-center gap-2 shrink-0">
-              {meetingMinutes && (
-                <button
-                  type="button"
-                  onClick={() => exportMeetingMinutesAsDocx(meetingMinutes)}
-                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl border border-emerald-300 bg-white hover:bg-emerald-50 text-emerald-800 text-xs font-semibold cursor-pointer shadow-2xs"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>下載摘要 Word</span>
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={handleGenerateAndScrollMinutes}
-                disabled={isGeneratingMinutes}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white text-xs sm:text-sm font-bold cursor-pointer shadow-sm transition-colors"
-              >
-                {isGeneratingMinutes ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Sparkles className="w-4 h-4" />
-                )}
-                <span>
-                  {meetingMinutes
-                    ? '🔄 重新生成會議 AI 摘要與結論'
-                    : '📝 生成會議 AI 摘要、結論與行動事項'}
-                </span>
-              </button>
-            </div>
-          </div>
-        )}
       </div>
     </div>
   );
