@@ -693,7 +693,26 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
     }
   }
 
-  return splitLongMonologueAtSemanticBoundaries(merged);
+  // 消除因跨視窗或 Stage 1 合併後殘留之重疊子句重複段（如前段尾端已包含後段全文）
+  const deduped: Segment[] = [];
+  for (const seg of merged) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && prev.chunkIndex === seg.chunkIndex) {
+      const prevPure = (prev.text || '').replace(/[，。？！、；：,.?!\s]/g, '');
+      const currPure = (seg.text || '').replace(/[，。？！、；：,.?!\s]/g, '');
+      if (
+        currPure.length >= 2 &&
+        currPure.length <= prevPure.length &&
+        seg.start <= prev.end + 0.8 &&
+        prevPure.slice(-Math.min(prevPure.length, currPure.length + 18)).includes(currPure)
+      ) {
+        continue;
+      }
+    }
+    deduped.push(seg);
+  }
+
+  return splitLongMonologueAtSemanticBoundaries(deduped);
 }
 
 const DEFAULT_DIARIZATION_CONFIG: DiarizationConfig = {
@@ -773,7 +792,10 @@ export interface AppState {
 
   appendSegments: (newSegments: Segment[]) => void;
   appendSegment: (newSegment: Segment) => void;
-  replaceBatchSegments: (updatedSegments: Segment[]) => void;
+  replaceBatchSegments: (
+    updatedSegments: Segment[],
+    sourceSegmentIds?: string[]
+  ) => void;
   updateSegment: (segmentId: string, partial: Partial<Segment>) => void;
   updateSegmentText: (segmentId: string, newText: string) => void;
   updateSegmentSpeaker: (segmentId: string, newSpeakerId: string) => void;
@@ -1158,18 +1180,40 @@ export const useAppStore = create<AppState>()(
       appendSegment: (newSegment) =>
         get().appendSegments([syncSegmentDerivedFields(newSegment)]),
 
-      replaceBatchSegments: (updatedSegments) =>
+      replaceBatchSegments: (updatedSegments, sourceSegmentIds) =>
         set((state) => {
           const syncedList = updatedSegments.map(syncSegmentDerivedFields);
           const map = new Map(syncedList.map((s) => [s.id, s]));
+          const sourceSet = new Set(sourceSegmentIds || []);
           const existingIdSet = new Set(state.segments.map((s) => s.id));
-          const replaced = state.segments.map((s) => map.get(s.id) || s);
+
+          // 若某個原始段落 ID 位於 sourceSegmentIds 中，但在 Stage 1 合併後已併入前段而不在 map 中，必須移除而不可保留舊複本！
+          const replaced: Segment[] = [];
+          for (const s of state.segments) {
+            if (map.has(s.id)) {
+              replaced.push(map.get(s.id)!);
+            } else if (sourceSet.has(s.id)) {
+              continue;
+            } else {
+              // 檢查是否已被 syncedList 中時間跨度擴大之段落吞併
+              const sPure = (s.text || '').replace(/[，。？！、；：,.?!\s]/g, '');
+              const isSwallowed =
+                sPure.length >= 2 &&
+                syncedList.some((u) => {
+                  if (u.id === s.id || u.chunkIndex !== s.chunkIndex) return false;
+                  if (s.start < u.start - 0.15 || s.end > u.end + 0.25) return false;
+                  const uPure = (u.text || '').replace(/[，。？！、；：,.?!\s]/g, '');
+                  return uPure.length > sPure.length && uPure.includes(sPure);
+                });
+              if (!isSwallowed) {
+                replaced.push(s);
+              }
+            }
+          }
+
           const brandNew = syncedList.filter((s) => !existingIdSet.has(s.id));
           return {
-            segments:
-              brandNew.length > 0
-                ? smartConsolidateSegments([...replaced, ...brandNew])
-                : replaced,
+            segments: smartConsolidateSegments([...replaced, ...brandNew]),
           };
         }),
 
@@ -1604,9 +1648,14 @@ export const useAppStore = create<AppState>()(
           diarizationConfig: mergedDiar,
           diarization: mergedDiar,
         };
+        const mergedDict = mergeDictLists(
+          DEFAULT_PUBLIC_DICTIONARY,
+          Array.isArray(p.dictionary) ? p.dictionary : []
+        );
         return {
           ...currentState,
           ...p,
+          dictionary: mergedDict,
           config: mergedConfig,
           engineConfig: mergedConfig,
           diarizationConfig: mergedDiar,
