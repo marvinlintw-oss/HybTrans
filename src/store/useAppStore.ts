@@ -1,8 +1,8 @@
 // src/store/useAppStore.ts
 // 升級與根因修正重點：
-// 1. [解決句子順序錯位與跨語者黏合]：在 smartConsolidateSegments 中嚴格檢查兩段落之間是否夾有其他語者的插話，且將合併間隙收緊至 <= 0.55 秒。
-// 2. [解決 localStorage 舊快取強制開啟「專屬音軌轉寫」問題]：將 Zustand persist 儲存鍵升級為 'hybrid-transcriber-storage-v9' 並加入自動遷移 (merge)，強制預設關閉 enableVirtualSpeakerTrackStitching，直接走 12~20s 靜音谷底視窗 + 字級 Viterbi 對齊。
-// 3. [方向一 + 方向二 SSOT 雙向相容擴充]：同步維護 AudioPreAnalysisProfile、推薦方案套用 (applyRecommendedPreset)、Segment 衍生欄位 (text/rawText/polishedText/sentenceIntegrity) 與完整雙向別名。
+// 1. [解決句子順序錯位與跨語者黏合]：在 smartConsolidateSegments 中嚴格檢查兩段落之間是否夾有其他語者的插話，無插話時自動跨視窗合併同語者連續發言。
+// 2. [解決 localStorage 舊快取強制開啟「專屬音軌轉寫」問題]：將 Zustand persist 儲存鍵升級並加入自動遷移 (merge)，強制預設關閉 enableVirtualSpeakerTrackStitching，直接走 12~20s 靜音谷底視窗 + 字級 Viterbi 對齊。
+// 3. [新增會議 AI 摘要、重要結論與行動事項報告狀態 (meetingMinutes)]：支援一鍵生成、檢視與匯出結構化會議紀錄。
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
@@ -17,6 +17,7 @@ import {
   EngineConfig,
   GranularityTier,
   MacroChunkState,
+  MeetingMinutesReport,
   ModelDownloadStatus,
   PhoneticMatchCandidate,
   PipelineProgress,
@@ -463,39 +464,37 @@ export function applySeamlessWordSpanReplacement(
 const DISCOURSE_TOPIC_SHIFT_REGEX =
   /^(?:然後|那|另外|再來|此外|同時|最後)?(?:第[二三四五六七八九十][個點項部分步]|另外一個(?:部分|問題|重點|面向)|再來(?:就是|是|一個)|那另外(?:就是|一個)|接下來(?:我們|就是)|至於(?:在|說)?)/;
 
-/**
- * 檢查兩段同語者連續發言的交界處是否屬於「句中跨視窗斷裂」(例如：「今年預算的。」+「狀況。」、「要能夠。」+「就是比較主導性」、「例如說。」+「假設...」)
- * 若是，回傳應如何縫合前段最後一詞之標點 ('strip' = 移除句末標點直連, 'comma' = 將句號改為逗號, 'keep' = 維持原標點)
- */
 function analyzeCrossWindowBoundaryStitchMode(
   prevLastWordText: string,
-  currFirstWordText: string
+  currFirstWordText: string,
+  pauseGap = 0.5
 ): 'strip' | 'comma' | 'keep' {
   const prevClean = prevLastWordText.replace(/[，。？！、；：,.?!\s]+$/g, '');
   const currClean = currFirstWordText.replace(/^[，。？！、；：,.?!\s]+/g, '');
   if (!prevClean || !currClean) return 'keep';
 
-  // 1. 緊密定語/介詞/比較級/動詞結構被視窗切斷（如：「今年預算的。」+「狀況」、「預算是比。」+「另外一個」、「我在。」+「白姐報價之前」、「跟那個。」+「曉玲」） -> 直接剝除假句號無縫連接！
   if (
-    /(?:[的之比在跟對向把被讓給為從到]|那個|這個|一些|一個|我們有|他們有)$/.test(
+    /(?:[的之比在跟對向把被讓給為從到]|那個|這個|一些|一個|我們有|他們有|協助他們去)$/.test(
       prevClean
     ) ||
     (/^[的之得地了嗎呢吧啊呀喔哦啦囉嘛齁吼]/.test(currClean) &&
       currClean.length <= 3) ||
-    (/(?:預算|報價|規模|問題|部分|角色|活動|合作|費用)的$/.test(prevClean) &&
-      /^(?:狀況|部分|問題|規模|方式|費用|做法)/.test(currClean))
+    (/(?:預算|報價|規模|問題|部分|角色|活動|合作|費用|計畫|補助)的$/.test(
+      prevClean
+    ) &&
+      /^(?:狀況|部分|問題|規模|方式|費用|做法|辦法|方向)/.test(currClean))
   ) {
     return 'strip';
   }
 
-  // 2. 助動詞/連接詞/舉例引導詞跨視窗子句過渡（如：「要求我們的角色要能夠。」+「就是比較主導性」、「我們看看，例如說。」+「假設你們期待的是」） -> 將句號改為逗號！
   if (
-    /(?:要能夠|能夠|可以|應該|就是|因為|所以|而且|然後|例如說|比方說|像是|主要是|或者是|但如果)$/.test(
+    /(?:要能夠|能夠|可以|應該|就是|因為|所以|而且|然後|例如說|比方說|像是|主要是|或者是|但如果|的時候|的話)$/.test(
       prevClean
     ) ||
-    /^(?:就是|因為|所以|而且|但是|可是|不過|假設|如果|例如|比方|那目前|或者是)/.test(
+    /^(?:就是|因為|所以|而且|但是|可是|不過|假設|如果|例如|比方|那目前|或者是|他們現在|現在就是|然後一個|另外一個)/.test(
       currClean
-    )
+    ) ||
+    (pauseGap <= 0.75 && !/[？！?!]$/.test(prevLastWordText.trim()))
   ) {
     return 'comma';
   }
@@ -503,10 +502,6 @@ function analyzeCrossWindowBoundaryStitchMode(
   return 'keep';
 }
 
-/**
- * 針對已無縫合併之同語者長獨白（>= 200字），自動偵測內部明確的「語意主題轉折點」（如「...這是第一個。然後第二個就是說...」、「...再來就是...」），
- * 在不切斷任何完整句子的前提下，將過長的多主題獨白拆分為語意清晰的段落！
- */
 function splitLongMonologueAtSemanticBoundaries(
   segments: Segment[]
 ): Segment[] {
@@ -519,7 +514,6 @@ function splitLongMonologueAtSemanticBoundaries(
       continue;
     }
 
-    // 尋找距離段首 >= 70 字且距離段尾 >= 60 字之明確語意轉折句邊界
     let splitWordIdx = -1;
     let accChars = 0;
 
@@ -588,13 +582,6 @@ function splitLongMonologueAtSemanticBoundaries(
   return result;
 }
 
-/**
- * 【同語者無插話智慧合併與語意分段引擎】：
- * 1. 若兩段同語者發言中間存在任何其他語者之插話或重疊 (`hasInterveningOtherSpeaker`)，絕對禁止跨越插話合併，100% 保護對話交鋒順序！
- * 2. 若同一位語者連續發言且中間沒有任何其他人講話 (`!hasInterveningOtherSpeaker`)：
- *    - 自動跨越 ASR 12~20s 視窗邊界將其合併為同一段，並自動修復視窗切點處的假句號（如「今年預算的。」+「狀況。」->「今年預算的狀況。」）！
- *    - 僅當累積字數已長且遇到明確的「語意主題分段轉折（如：然後第二個就是說...）」或長停頓換題時，才拆分為新段落！
- */
 function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
   if (allSegments.length === 0) return [];
   if (allSegments.length === 1) return [syncSegmentDerivedFields(allSegments[0])];
@@ -646,11 +633,14 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
     const currFirstText = seg.words[0]?.text || '';
 
     const stitchMode = prev
-      ? analyzeCrossWindowBoundaryStitchMode(prevLastText, currFirstText)
+      ? analyzeCrossWindowBoundaryStitchMode(
+          prevLastText,
+          currFirstText,
+          pauseGap
+        )
       : 'keep';
     const isMidSentenceCut = stitchMode === 'strip' || stitchMode === 'comma';
 
-    // 判斷是否為同語者長獨白之明確語意分段點
     const isSemanticTopicBreak =
       !isMidSentenceCut &&
       prevChars >= 140 &&
@@ -703,7 +693,6 @@ function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
     }
   }
 
-  // 對合併後的長獨白執行語意轉折點自動分段（例如將 02:25~04:10 之長獨白精準在「然後第二個就是說...」處拆為兩段）
   return splitLongMonologueAtSemanticBoundaries(merged);
 }
 
@@ -751,6 +740,8 @@ export interface AppState {
   docContextSummary: string;
   rollingMeetingSummary: string;
   briefingSummary: string;
+  meetingMinutes: MeetingMinutesReport | null;
+  isGeneratingMinutes: boolean;
   phoneticCandidates: PhoneticMatchCandidate[];
   modelDownload: ModelDownloadStatus;
   audioPreAnalysis: AudioPreAnalysisProfile | null;
@@ -807,6 +798,8 @@ export interface AppState {
   setDocContextSummary: (summary: string) => void;
   setRollingMeetingSummary: (summary: string) => void;
   setBriefingSummary: (summary: string) => void;
+  setMeetingMinutes: (report: MeetingMinutesReport | null) => void;
+  setIsGeneratingMinutes: (generating: boolean) => void;
 }
 
 const defaultTierSpec =
@@ -862,6 +855,8 @@ export const useAppStore = create<AppState>()(
       docContextSummary: '',
       rollingMeetingSummary: '',
       briefingSummary: '',
+      meetingMinutes: null,
+      isGeneratingMinutes: false,
       phoneticCandidates: [],
       modelDownload: {
         active: false,
@@ -969,7 +964,6 @@ export const useAppStore = create<AppState>()(
                 enableVirtualSpeakerTrackStitching: false,
               };
 
-        // 保留已由全場聲學預分析推導出之底層公式校準參數 (formulaCalibration)，避免切換效能模式時沖掉聲學適應閥值
         const preservedCalibration =
           currentDiar.formulaCalibration ||
           get().audioPreAnalysis?.formulaCalibration;
@@ -1236,6 +1230,8 @@ export const useAppStore = create<AppState>()(
           phoneticCandidates: [],
           rollingMeetingSummary: '',
           briefingSummary: '',
+          meetingMinutes: null,
+          isGeneratingMinutes: false,
           currentTime: 0,
           modelDownload: {
             active: false,
@@ -1540,7 +1536,7 @@ export const useAppStore = create<AppState>()(
           dictionary: state.dictionary.filter((d) => d.id !== id),
         })),
 
-      promoteDictEntryScope: (id: string, targetScope: DictScope) =>
+      promoteDictEntryScope: (id, targetScope) =>
         set((state) => ({
           dictionary: state.dictionary.map((d) =>
             d.id === id ? { ...d, scope: targetScope } : d
@@ -1552,9 +1548,11 @@ export const useAppStore = create<AppState>()(
         set({ rollingMeetingSummary: summary, briefingSummary: summary }),
       setBriefingSummary: (summary) =>
         set({ rollingMeetingSummary: summary, briefingSummary: summary }),
+      setMeetingMinutes: (report) => set({ meetingMinutes: report }),
+      setIsGeneratingMinutes: (generating) =>
+        set({ isGeneratingMinutes: generating }),
     }),
     {
-      // 獨立命名空間：確保 https://marvinlintw-oss.github.io/HybTrans/ 與同網域之 /HybTransPlus/ 的 localStorage 100% 隔離互不覆蓋
       name: 'hybtrans-rwd-storage-v10',
       partialize: (state) => ({
         config: state.config,
@@ -1565,7 +1563,6 @@ export const useAppStore = create<AppState>()(
       }),
       merge: (persistedState, currentState) => {
         let p = (persistedState || {}) as Partial<AppState>;
-        // 若首次進入 /HybTrans/ 尚未建立獨立快取，單向唯讀繼承舊版 API Key（絕不寫回舊版鍵值，保護 HybTransPlus）
         if (!p.config && typeof window !== 'undefined') {
           try {
             const legacyRaw = window.localStorage.getItem('hybrid-transcriber-storage-v9');
