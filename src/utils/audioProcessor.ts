@@ -328,24 +328,12 @@ export function applyVadGatedLookAheadLoudnessNormalization(
     frameZeroCross[f] = zc / count;
   }
 
-  const sortedRms = Array.from(frameRms).sort((a, b) => a - b);
-  const noiseFloor = Math.max(
-    0.0005,
-    sortedRms[Math.floor(sortedRms.length * 0.02)] || 0.0012
-  );
-
-  const targetRms = 0.118;
-  const maxLinearGain = 4.2; // +12.5 dB，拉拔遠距小聲語者進入 Whisper 最佳動態區間
-  const minSpeechRms = Math.max(0.0028, noiseFloor * 1.28);
-  const truePeakCeiling = 0.89125;
-
-  const targetFrameGain = new Float32Array(numFrames).fill(1.0);
-  const frameHarmonicity = new Float32Array(numFrames);
   const minLag = Math.floor(sampleRate / 340);
   const maxLag = Math.floor(sampleRate / 75);
+  const frameHarmonicity = new Float32Array(numFrames);
 
   for (let f = 0; f < numFrames; f++) {
-    if (frameRms[f] < minSpeechRms * 0.72) continue;
+    if (frameRms[f] < 0.002) continue;
     const start = f * frameLen;
     if (start + 380 > N) continue;
     let maxCorr = 0.0;
@@ -366,49 +354,81 @@ export function applyVadGatedLookAheadLoudnessNormalization(
     frameHarmonicity[f] = maxCorr;
   }
 
+  // 計算 5 幀 (100ms) 音節級諧波包絡，區分真實聲帶發聲 (syllabicHarm >= 0.42) 與冷氣底噪/桌面撞擊 (syllabicHarm < 0.34)
+  const syllabicHarm = new Float32Array(numFrames);
+  const nonHarmRmsList: number[] = [];
+  for (let f = 0; f < numFrames; f++) {
+    const windowH: number[] = [];
+    for (let k = Math.max(0, f - 2); k <= Math.min(numFrames - 1, f + 2); k++) {
+      windowH.push(frameHarmonicity[k]);
+    }
+    windowH.sort((a, b) => b - a);
+    const topMean =
+      windowH.length >= 2 ? 0.5 * (windowH[0] + windowH[1]) : windowH[0] || 0;
+    syllabicHarm[f] = topMean;
+    if (topMean < 0.36) {
+      nonHarmRmsList.push(frameRms[f]);
+    }
+  }
+
+  const sortedRms = Array.from(frameRms).sort((a, b) => a - b);
+  nonHarmRmsList.sort((a, b) => a - b);
+  // 以非諧波幀之 P40 (或全體 P12) 錨定真實環境底噪，徹底杜絕將冷氣/投影機底噪當作人聲放大！
+  const noiseFloor = Math.max(
+    0.0012,
+    nonHarmRmsList.length >= 8
+      ? nonHarmRmsList[Math.floor(nonHarmRmsList.length * 0.4)]
+      : sortedRms[Math.floor(sortedRms.length * 0.12)] || 0.003
+  );
+  const medianRms = Math.max(
+    noiseFloor * 1.4,
+    sortedRms[Math.floor(sortedRms.length * 0.5)] || 0.018
+  );
+
+  const targetRms = 0.092;
+  const maxLinearGain = 2.45; // +7.8 dB 平滑增益，兼顧遠距語音拉抬與自然停頓谷底對比
+  const minSpeechRms = Math.max(0.0038, noiseFloor * 1.18);
+  const truePeakCeiling = 0.89125;
+
+  const targetFrameGain = new Float32Array(numFrames).fill(1.0);
+
   for (let f = 0; f < numFrames; f++) {
     const prevR = f > 0 ? frameRms[f - 1] : frameRms[f];
     const nextR = f + 1 < numFrames ? frameRms[f + 1] : frameRms[f];
     const localRms = Math.max(frameRms[f], 0.5 * (prevR + nextR));
     const zcr = frameZeroCross[f];
-    const prevH = f > 0 ? frameHarmonicity[f - 1] : frameHarmonicity[f];
-    const nextH =
-      f + 1 < numFrames ? frameHarmonicity[f + 1] : frameHarmonicity[f];
-    const localHarm = Math.max(frameHarmonicity[f], prevH, nextH);
+    const sHarm = syllabicHarm[f];
+
+    // 【瞬態撞擊與麥克風敲擊抑制 (Transient De-Thumper)】：
+    // 若單幀能量暴衝 (> medianRms * 2.2) 但無聲帶諧波性 (frameHarmonicity < 0.30)，代表為拍桌/碰麥克風雜音（如 33.62s 撞擊），予以衰減避免遮蔽前後微弱語音！
+    if (
+      frameHarmonicity[f] < 0.30 &&
+      sHarm < 0.38 &&
+      frameRms[f] > Math.max(0.045, medianRms * 2.2)
+    ) {
+      targetFrameGain[f] = Math.max(
+        0.25,
+        Math.min(0.85, (medianRms * 1.25) / frameRms[f])
+      );
+      continue;
+    }
+
+    // 非諧波靜音段或高過零摩擦雜音嚴格保持 1.0x 原音，保留清晰靜音谷底供 Whisper Cross-Attention 對齊
+    if (sHarm < 0.41 || zcr > 0.30 || localRms < minSpeechRms) {
+      targetFrameGain[f] = 1.0;
+      continue;
+    }
 
     const snrRatio = localRms / Math.max(1e-5, noiseFloor);
-    // 僅當諧波度低且過零率偏高 (zcr > 0.28) 時才判定為翻紙摩擦雜音；保留低頻率過零率 (zcr ~ 0.09) 之遠距男聲！
-    const isAperiodicFriction =
-      localHarm < 0.26 && (zcr > 0.28 || snrRatio < 1.35);
-    const pVad = isAperiodicFriction
-      ? 0.05
-      : 1.0 / (1.0 + Math.exp(-2.4 * (snrRatio - 1.32)));
+    const pVad =
+      1.0 /
+      (1.0 + Math.exp(-3.0 * (snrRatio - 1.25) - 4.0 * (sHarm - 0.42)));
 
-    const isInterVowelWeakConsonant =
-      frameHarmonicity[f] < 0.45 &&
-      (prevH >= 0.42 || nextH >= 0.42) &&
-      frameRms[f] >= minSpeechRms * 0.62 &&
-      frameRms[f] < Math.max(prevR, nextR) * 0.75;
-    const prev2R = f >= 2 ? frameRms[f - 2] : prevR;
-    const isTrailingQuestionDecay =
-      pVad >= 0.30 &&
-      prevH >= 0.38 &&
-      localRms < prev2R * 0.80 &&
-      localRms >= minSpeechRms * 0.70;
-    const consonantClarityBonusDb =
-      (isInterVowelWeakConsonant ? 1.85 : 0.0) +
-      (isTrailingQuestionDecay ? 1.75 : 0.0);
-
-    if (pVad < 0.24 || localRms < minSpeechRms) {
-      targetFrameGain[f] = 1.0;
-    } else if (localRms < targetRms || consonantClarityBonusDb > 0) {
+    if (pVad >= 0.35 && localRms < targetRms) {
       const dbCurrent = 20.0 * Math.log10(Math.max(1e-5, localRms));
-      const dbTarget = -18.0;
+      const dbTarget = -20.5;
       const dbDeficit = Math.max(0.0, dbTarget - dbCurrent);
-      const boostDb = Math.min(
-        12.5,
-        dbDeficit * 0.78 * pVad + consonantClarityBonusDb
-      );
+      const boostDb = Math.min(7.8, dbDeficit * 0.68 * pVad);
       targetFrameGain[f] = Math.min(
         maxLinearGain,
         Math.pow(10.0, boostDb / 20.0)
@@ -420,18 +440,23 @@ export function applyVadGatedLookAheadLoudnessNormalization(
 
   const smoothedFrameGain = new Float32Array(numFrames);
   let currentGain = 1.0;
-  const alphaAttack = 0.62;
-  const alphaRelease = 0.075;
+  const alphaAttack = 0.38;
+  const alphaRelease = 0.14;
 
   for (let f = 0; f < numFrames; f++) {
     let lookAheadGain = targetFrameGain[f];
-    for (let la = 1; la <= 4; la++) {
-      if (f + la < numFrames) {
-        lookAheadGain = Math.max(lookAheadGain, targetFrameGain[f + la]);
+    if (lookAheadGain >= 1.0) {
+      for (let la = 1; la <= 3; la++) {
+        if (f + la < numFrames && targetFrameGain[f + la] >= 1.0) {
+          lookAheadGain = Math.max(lookAheadGain, targetFrameGain[f + la]);
+        }
       }
     }
 
-    if (lookAheadGain > currentGain) {
+    if (lookAheadGain < 0.95) {
+      // 瞬態撞擊立即衰減
+      currentGain = lookAheadGain;
+    } else if (lookAheadGain > currentGain) {
       currentGain =
         alphaAttack * lookAheadGain + (1.0 - alphaAttack) * currentGain;
     } else {
