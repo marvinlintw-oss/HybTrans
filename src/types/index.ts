@@ -1,1666 +1,762 @@
-// src/store/useAppStore.ts
-// 升級與根因修正重點：
-// 1. [解決句子順序錯位與跨語者黏合]：在 smartConsolidateSegments 中嚴格檢查兩段落之間是否夾有其他語者的插話，無插話時自動跨視窗合併同語者連續發言。
-// 2. [解決 localStorage 舊快取強制開啟「專屬音軌轉寫」問題]：將 Zustand persist 儲存鍵升級並加入自動遷移 (merge)，強制預設關閉 enableVirtualSpeakerTrackStitching，直接走 12~20s 靜音谷底視窗 + 字級 Viterbi 對齊。
-// 3. [新增會議 AI 摘要、重要結論與行動事項報告狀態 (meetingMinutes)]：支援一鍵生成、檢視與匯出結構化會議紀錄。
+// src/types/index.ts
+// [SSOT] 專案唯一型別定義來源（含 Deep Research 多階段 AI 語意推敲、方向一 3~5秒深度全文聲學預分析與底層聲學公式動態校準層、方向二 先句後詞兩階段語意修復、免索引槽位協定、不可變 Token 圖譜與次世代字級 Viterbi / Powerset EEND 耦合型別）
 
-import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
-import {
-  AtomicCharToken,
-  AudioPreAnalysisProfile,
-  AudioRecommendationOption,
-  CorrectionPatchItem,
-  DiarizationConfig,
-  DictEntry,
-  DictScope,
-  EngineConfig,
-  GranularityTier,
-  MacroChunkState,
-  MeetingMinutesReport,
-  ModelDownloadStatus,
-  PhoneticMatchCandidate,
-  PipelineProgress,
-  Segment,
-  Speaker,
-  SuspectSpanNode,
-  UncertainCandidateOption,
-  UtteranceNode,
-  WordSpan,
-} from '../types';
-import { TIER_PRESET_SPECS } from '../services/modelCacheManager';
-import { DEFAULT_PUBLIC_DICTIONARY, mergeDictLists } from '../utils/dictIO';
-import { toTaiwanFuzzyPhoneticSyllables } from '../utils/phoneticMatcher';
+export type EngineMode = 'local_webgpu' | 'byok_cloud';
 
-export function syncSegmentDerivedFields(seg: Segment): Segment {
-  const syncedWords: WordSpan[] = (seg.words || []).map((w) => ({
-    ...w,
-    word: w.text,
-    originalWord: w.originalText,
-    isPatched: w.status === 'auto_corrected',
-    isCorrected: w.status === 'auto_corrected',
-  }));
-  const joinedText = syncedWords.map((w) => w.text).join('');
-  const joinedRaw =
-    seg.rawText ||
-    syncedWords.map((w) => w.originalText || w.text).join('') ||
-    joinedText;
-  const integrityScore =
-    seg.sentenceIntegrity?.score ?? seg.sentenceIntegrityScore ?? 100;
-  const integrityIssues =
-    seg.sentenceIntegrity?.issues ?? seg.sentenceIntegrityIssues ?? [];
+export type LocalAsrModel =
+  | 'SenseVoice-Small'
+  | 'Whisper-Large-v3-Turbo'
+  | 'Breeze-ASR'
+  | 'whisper-large-v3-turbo'
+  | 'whisper-base'
+  | 'breeze-asr-25';
 
-  return {
-    ...seg,
-    words: syncedWords,
-    text: joinedText,
-    rawText: joinedRaw,
-    polishedText: joinedText,
-    isPolished: seg.isCorrected,
-    ispolished: seg.isCorrected,
-    overlapWarning:
-      seg.overlapWarning ??
-      ((seg.overlapRatio ?? 0) >= 0.25 ||
-        seg.slotTier === 'tier3_overlap_split'),
-    sentenceIntegrityScore: integrityScore,
-    sentenceIntegrityIssues: integrityIssues,
+export type LocalLlmModel =
+  | 'Qwen2.5-3B-Instruct-q4f16_1-MLC'
+  | 'gemma-2-2b-it-q4f16_1-MLC';
+
+export type GranularityTier = 'eco_safe' | 'balanced_pro' | 'ultra_studio';
+
+export type DiarizationEngineMode =
+  | 'mode_0_heritage_classic'
+  | 'mode_a_classic'
+  | 'mode_b_advanced_dsp'
+  | 'mode_c_onnx_neural';
+
+export type DiarizationStrategyMode =
+  | 'MODE_0_GOLDEN_TWO_STAGE'
+  | 'MODE_A_CLASSIC_DSP'
+  | 'MODE_B_ADVANCED_SPECTRAL'
+  | 'MODE_C_ONNX_NEURAL'
+  | DiarizationEngineMode;
+
+export type DiarizationStrategy = DiarizationStrategyMode;
+
+export type DiarizationClusterMethod =
+  | 'ahc_cosine'
+  | 'spectral_cosine'
+  | 'vbx_plda'
+  | 'e2cp_constrained_spectral';
+
+export type ClusterMethod = DiarizationClusterMethod;
+export type ClusteringMethod = DiarizationClusterMethod;
+
+export type DiarizationExecutionBackend = 'wasm' | 'webgpu';
+export type EmbeddingBackendType = DiarizationExecutionBackend;
+export type EmbeddingBackend = DiarizationExecutionBackend;
+
+export type CompliantOnnxSpeakerModel =
+  | 'wespeaker_voxceleb_resnet34_int8.onnx'
+  | 'nemo_en_titanet_small.int8.onnx'
+  | 'wespeaker_en_voxceleb_cam++.onnx'
+  | 'wespeaker-voxceleb-resnet34-LM.onnx';
+
+export type EmbeddingModelType = CompliantOnnxSpeakerModel;
+
+export type MeetingLanguageHint = 'auto_multilingual' | 'zh' | 'en' | 'ja';
+export type AcousticLanguageProfile = MeetingLanguageHint;
+
+/**
+ * 三級聲學信心度閘控等級 (3-Tier Acoustic Confidence Gating Protocol)
+ * - Tier 1 (locked_anchor): \Delta L > 1.8 且 \bar{\Omega} < 0.15，唯讀鎖定語者標籤，禁止 LLM 修改語者
+ * - Tier 2 (candidate_constrained): 0.45 <= \Delta L <= 1.8 且 \bar{\Omega} < 0.25，僅允許在 Top-1 與 Top-2 候選語者間依語用切換
+ * - Tier 3 (overlap_split): \Delta L < 0.45 或 \bar{\Omega} >= 0.25，雙人重疊搶話或插話附和，允許拆分為兩個語者槽位
+ */
+export type AcousticSlotTier =
+  | 'tier1_locked_anchor'
+  | 'tier2_candidate_constrained'
+  | 'tier3_overlap_split';
+
+/**
+ * 【方向一深化擴充】：啟動階段 3~5 秒全文聲學預分析下放至「底層聲學公式動態校準層 (Acoustic Formula Calibration Layer)」
+ * 根據單一音檔之真實物理分佈（底噪分位數、有聲母音 P15 諧波清晰度、話輪轉換頻率、基頻跨度）動態校準底層公式閥值，
+ * 解決單一全局預設常數無法同時應對「高頻搶話短句」與「遠距微弱尾音」之痛點。
+ */
+export interface AcousticFormulaCalibration {
+  /** VAD 底噪估計分位數 (預設 0.05，範圍 0.03 ~ 0.08；依全場靜音比例動態校準) */
+  vadNoiseQuantile: number;
+  /** VAD 語音啟動乘數 (預設 1.65，範圍 1.50 ~ 1.95；依全場 SNR 動態校準) */
+  vadSpeechMultiplier: number;
+  /** VAD 動態範圍補償權重 (預設 0.06，範圍 0.04 ~ 0.09) */
+  vadDynamicRangeWeight: number;
+  /** 自相關基頻與有聲母音認定門檻 (預設 0.36，範圍 0.32 ~ 0.45；由全場有聲幀 P15 諧波度自動校準，保護遠距小聲語者如女聲2不被誤判為 0Hz) */
+  harmonicityGateThreshold: number;
+  /** 翻紙與桌面摩擦雜音抑制上限 (預設 0.30，範圍 0.26 ~ 0.38；低於此值之非諧波寬頻噪音壓低 VAD) */
+  frictionHarmonicCeiling: number;
+  /** 邊界曲線之 150ms 音節包絡能量谷底權重 w_dip (預設 0.45，範圍 0.38 ~ 0.52) */
+  boundaryDipWeight: number;
+  /** 邊界曲線之聲紋/基頻/響度跳變複合權重 w_voice (預設 0.55，範圍 0.48 ~ 0.62) */
+  boundaryVoiceWeight: number;
+  /** 左右視窗分貝階躍起算門檻 dB (預設 3.2 dB，捕捉遠距小聲語者切換至近距大聲語者之零停頓換人點) */
+  stepDbDiffFloor: number;
+  /** 有聲母音 F1-F3 共振峰餘弦距離起算門檻 (預設 0.21，排除無聲子音摩擦干擾) */
+  formantCosDistFloor: number;
+  /** Stage 2 微觀話輪邊界波峰切分門檻 finePeakCutoff (預設 0.52，範圍 0.46 ~ 0.58) */
+  scdPeakCutoff: number;
+  /** Stage 2 連續無停頓發聲之微觀切分上限秒數 (預設 1.60s，範圍 1.35s ~ 1.95s；依每分鐘換人頻率自適應) */
+  maxMicroTurnSec: number;
+  /** Stage 1 超球面 AHC 聚類停止合併門檻 (256維 ONNX 預設 0.28，範圍 0.24 ~ 0.33) */
+  ahcStopSimThreshold: number;
+  /** 軟性基頻差異免罰容忍半音數 (預設 3.8 半音，範圍 3.2 ~ 4.4 半音；依全場音域跨度校準) */
+  pitchPenaltySemitoneTolerance: number;
+  /** 核心成員閘控 VBx 變分精煉之逆溫度係數 (預設 22.0，防止少數語者質心被主講人稀釋) */
+  vbxInvTemp: number;
+  /** VBx 質心更新之核心成員責任門檻 (預設 0.45，僅允許責任 >= 0.45 之核心錨點參與該語者質心計算) */
+  vbxCoreResponsibilityGate: number;
+}
+
+export interface DiarizationConfig {
+  engineMode: DiarizationEngineMode;
+  strategyMode?: DiarizationStrategyMode;
+  clusterMethod: DiarizationClusterMethod;
+  clusteringMethod?: DiarizationClusterMethod;
+  executionBackend: DiarizationExecutionBackend;
+  backend?: DiarizationExecutionBackend;
+  onnxModelFilename: CompliantOnnxSpeakerModel;
+  embeddingModel?: CompliantOnnxSpeakerModel;
+  localWasmBasePath: string;
+  localModelBasePath: string;
+  yieldEveryNUnits: number;
+  enableGlobalMeanCentering: boolean;
+  languageHint: MeetingLanguageHint;
+  shortTurnConfidenceKeepThreshold: number;
+  pingPongMaxDurSec: number;
+  enablePauseAndSemanticWeighting: boolean;
+  /** 微觀聲紋跳變曲線 d_SCD(t) 波峰切分敏感度門檻 (預設 0.22；越小切分越細敏，範圍 0.16 ~ 0.35) */
+  scdPeakThreshold?: number;
+  /** 短促附和詞保護之最小聲學邊際門檻 \Delta M(B, A) (預設 0.12；雙峰伴隨時自動折半) */
+  backchannelMarginThreshold?: number;
+  /** 雙軌無損聲紋差異強化預處理 (僅作用於聲紋分離軌，完全不影響 Whisper 原音辨識) */
+  enableAcousticDivergencePreproc?: boolean;
+  /**
+   * 啟用「長短句分流定錨 + 語者專屬虛擬音軌拼接轉寫 (Virtual Speaker-Track Stitching)」
+   * 預設為 false 以保持 Whisper 12~22s 靜音谷底連續自然語音視窗與 DTW 字級時間戳對齊
+   */
+  enableVirtualSpeakerTrackStitching?: boolean;
+  /** 啟用重疊幀排除聲紋純化 (embeddingExcludeOverlap: true，剔除 Powerset 類別 4,5,6 重疊幀) */
+  embeddingExcludeOverlap?: boolean;
+  /** 啟用 Silero VAD 閘控之零相位前瞻包絡響度正規化 (預設 true，僅作用於 Whisper ASR 音軌) */
+  enableZeroPhaseLoudnessNorm?: boolean;
+  /** Silero VAD 本地模型檔名 (預設 'silero_vad_v5.onnx'，未安裝時自動降級自適應能量 VAD) */
+  sileroVadModelFilename?: string;
+  /** Pyannote Segmentation 3.0 本地模型檔名 (預設 'segmentation-3.0.onnx'，未安裝時自動降級微觀 SCD) */
+  pyannoteSegModelFilename?: string;
+  /** VBx PLDA 轉換矩陣參數檔名 (預設 'plda-params-vbx.json'，未安裝時自動降級 E2CP 受限譜聚類) */
+  pldaParamsFilename?: string;
+  /** VBx 聲學似然縮放因子 Fa (選填) */
+  vbxFa?: number;
+  /** VBx 語者先驗正規化因子 Fb (選填) */
+  vbxFb?: number;
+  /** 【方向一深化】：由啟動階段 3~5 秒全文聲學預分析自動推導並注入之底層聲學公式動態閥值 */
+  formulaCalibration?: AcousticFormulaCalibration;
+}
+
+/**
+ * 【方向一】：全文深度聲學預分析之情境推薦方案項目
+ * 雙向相容別名：AudioRecommendationOption / RecommendedConfigOption
+ */
+export interface AudioRecommendationOption {
+  id: 'preset_a_balanced' | 'preset_b_sensitive' | 'preset_c_long_speech' | string;
+  badge: string;
+  title: string;
+  label?: string;
+  subtitle: string;
+  whyRecommend: string;
+  bestFor: string;
+  notIdealFor: string;
+  isRecommended: boolean;
+  recommendedMinSpeakers: number;
+  recommendedMaxSpeakers: number;
+  diarizationPatch: Partial<DiarizationConfig>;
+  enginePatch?: Partial<EngineConfig>;
+}
+
+export type RecommendedConfigOption = AudioRecommendationOption;
+
+/**
+ * 【方向一】：取檔後 3~5 秒深度多點全文聲學預分析設定檔
+ * 雙向相容別名：AudioPreAnalysisProfile / AudioAcousticPreAnalysis
+ */
+export interface AudioPreAnalysisProfile {
+  /** 信噪比 (dB) */
+  snrDb: number;
+  /** 環境底噪分貝 (dBFS) */
+  noiseFloorDb: number;
+  /** 噪音等級分類 */
+  noiseLevel: 'LOW' | 'MEDIUM' | 'HIGH';
+  /** 全場語音基頻跨度 (Hz, P90 - P10) */
+  f0SpreadHz: number;
+  /** 全場語音基頻半音跨度 (Semitones, 12 * log2(P90 / P10)) */
+  pitchSpreadSemitones: number;
+  /** 基頻 P10 低頻端點 (Hz) */
+  f0P10Hz: number;
+  /** 基頻 P90 高頻端點 (Hz) */
+  f0P90Hz: number;
+  /** 中位諧波清晰度 (0.0 ~ 1.0) */
+  harmonicityMedian: number;
+  /** 與會者聲線相似度評估 */
+  voiceSimilarity: 'HIGH' | 'MEDIUM' | 'LOW';
+  /** 每分鐘話輪轉換率 (次/分) */
+  turnSwitchRatePerMin: number;
+  /** 重疊搶話比例 (0.0 ~ 1.0) */
+  overlapRatio: number;
+  /** 重疊搶話風險等級 */
+  overlapRisk: 'LOW' | 'MEDIUM' | 'HIGH';
+  /** 預估最少語者人數 */
+  estimatedMinSpeakers: number;
+  /** 預估最多語者人數 */
+  estimatedMaxSpeakers: number;
+  /** 實際抽樣掃描之視窗數量 */
+  sampledWindowsCount: number;
+  /** 實際抽樣分析之語音總秒數 */
+  sampledDurationSec: number;
+  /** 抽樣涵蓋率 (0.0 ~ 1.0) */
+  coverageRatio: number;
+  /** 預分析實際耗時 (ms) */
+  analysisDurationMs: number;
+  /** 白話情境診斷摘要 */
+  plainSummary: string;
+  /** 系統推薦之最佳方案 ID */
+  recommendedPresetId: string;
+  /** 3 組白話情境化建議方案 */
+  recommendations: AudioRecommendationOption[];
+  /** 相容別名：指向同一陣列 */
+  recommendedOptions: RecommendedConfigOption[];
+  /** 【方向一深化】：根據本音檔實測分佈自動校準之底層聲學公式動態閥值 */
+  formulaCalibration?: AcousticFormulaCalibration;
+}
+
+export type AudioAcousticPreAnalysis = AudioPreAnalysisProfile;
+
+/**
+ * 【方向二】：句子語意與結構完整性問題類型（同時支援大小寫枚舉值）
+ */
+export type SentenceIntegrityIssueType =
+  | 'TAIL_DROP_TO_NEXT'
+  | 'HEAD_STOLEN_FROM_PREV'
+  | 'INCOMPLETE_SYNTAX'
+  | 'SEMANTIC_ANOMALY'
+  | 'HALLUCINATION_LOOP'
+  | 'NONE'
+  | 'tail_character_drop'
+  | 'head_stolen_from_prev'
+  | 'broken_syntax_split'
+  | 'repetition_noise_hallucination'
+  | 'unreasonable_self_qa'
+  | 'none';
+
+/**
+ * 【方向二】：單一段落之句子語意與結構完整性診斷紀錄
+ */
+export interface SentenceIntegrityDiagnostic {
+  segmentId: string;
+  /** 句子結構完整度分數 (0 ~ 100) */
+  score: number;
+  issues: SentenceIntegrityIssueType[];
+  /** 是否已在 Stage 1 自動執行結構修補 */
+  autoRepaired: boolean;
+  suggestedRepair?: string;
+  suggestedRepairHint?: string;
+  relatedSegmentId?: string;
+  diagnosticNote?: string;
+}
+
+/**
+ * 【方向二】：Stage 1 跨句結構修復動作紀錄
+ */
+export interface SentenceIntegrityRepair {
+  segmentId: string;
+  relatedSegmentId?: string;
+  issueType: SentenceIntegrityIssueType;
+  beforeText: string;
+  afterText: string;
+  description: string;
+}
+
+/** 語者分離細部時間軸單元 (含 SCD 跳變值、微觀聲紋邊際、對數勝算邊界與重疊指標) */
+export interface FineDiarizationTurn {
+  start: number;
+  end: number;
+  speakerId: string;
+  runnerUpSpeakerId?: string;
+  f0Hz: number;
+  speakerConfidence?: number;
+  speakerMargin?: number;
+  /** 對數勝算邊界 \Delta L = \ln(P_1 + \epsilon) - \ln(P_2 + \epsilon) */
+  logOddsMargin?: number;
+  /** 區段內重疊語音比例 \bar{\Omega} \in [0, 1] */
+  overlapRatio?: number;
+  /** 該時間點左側邊界之瞬時聲紋跳變度 d_SCD(t) 或語者機率通量 \Phi (0.0 ~ 2.0) */
+  boundaryScdLeft?: number;
+  /** 該時間點右側邊界之瞬時聲紋跳變度 d_SCD(t) 或語者機率通量 \Phi (0.0 ~ 2.0) */
+  boundaryScdRight?: number;
+  isProtectedBackchannel?: boolean;
+  /** 是否為參與第一輪聚類定錨之黃金長句 (Anchor Segment, 純淨非重疊時長 >= 1.2s ~ 1.5s) */
+  isAnchorTurn?: boolean;
+}
+
+export type DiarizationTurn = FineDiarizationTurn;
+
+export interface OptimalAsrWindow {
+  start: number;
+  end: number;
+}
+
+export type AsrMacroWindow = OptimalAsrWindow;
+
+/**
+ * 經重疊相加 (OLA) 重建後之全域幀級語者後驗機率矩陣封裝
+ * 供字級 Viterbi 解碼器 (`viterbiWordAligner.ts`) 進行 ~17ms 解析度中心加權發射機率計算
+ */
+export interface FrameSpeakerPosteriorMatrix {
+  /** 該矩陣對應之原始音檔起始秒數 (通常等於 chunkStartSec) */
+  chunkStartSec: number;
+  /** 相鄰兩幀之時間步長 (Pyannote Segmentation 3.0 為 10 / 589 ≈ 0.016978s；Fallback SCD 為 0.02s) */
+  frameStepSec: number;
+  /** 總幀數 T_{frames} */
+  numFrames: number;
+  /** 對應每一列索引 k \in [0, K-1] 之全域語者 ID 列表 (例如 ['Speaker_01', 'Speaker_02', ...]) */
+  speakerIds: string[];
+  /**
+   * 扁平化之全域語者幀級活躍後驗機率矩陣，長度為 numFrames * speakerIds.length
+   * 第 f 幀、第 k 位語者之機率位於索引 `f * speakerIds.length + k`
+   */
+  flatPosteriors: Float32Array;
+  /** 長度為 numFrames 之幀級重疊語音機率 P_{OSD}(t) = p_4 + p_5 + p_6 */
+  osdProbs: Float32Array;
+}
+
+/**
+ * 語者專屬虛擬音軌內之單一時間區段映射項 (Piecewise Linear Time Map Item)
+ */
+export interface VirtualTrackMapItem {
+  /** 在虛擬拼接音軌中的相對起始秒數 */
+  virtualStartSec: number;
+  /** 在虛擬拼接音軌中的相對結束秒數 */
+  virtualEndSec: number;
+  /** 在原始會議音檔中的絕對起始秒數 */
+  realStartSec: number;
+  /** 在原始會議音檔中的絕對結束秒數 */
+  realEndSec: number;
+  speakerId: string;
+  runnerUpSpeakerId?: string;
+  speakerConfidence: number;
+  speakerMargin: number;
+  boundaryScdLeft: number;
+  boundaryScdRight: number;
+}
+
+/**
+ * 單一語者之虛擬音軌轉寫批次 (約 12~22 秒純同語者語音，中間以 0.35s 靜音隔板串接)
+ */
+export interface SpeakerTrackBatch {
+  batchIndex: number;
+  speakerId: string;
+  /** 本批次涵蓋之最早原始時間 (用於進度顯示與排序) */
+  earliestRealStartSec: number;
+  /** 本批次涵蓋之最晚原始時間 */
+  latestRealEndSec: number;
+  /** 拼接後之總虛擬音軌秒數 */
+  totalVirtualDurationSec: number;
+  /** 片段間插入之零值靜音隔板秒數 (預設 0.35s) */
+  spacerDurationSec: number;
+  /** 虛擬時間軸與真實會議時間軸之分段線性映射表 */
+  timeMap: VirtualTrackMapItem[];
+}
+
+export type VirtualSpeakerTrackBatch = SpeakerTrackBatch;
+
+export type ChunkStage =
+  | 'idle'
+  | 'preprocessing'
+  | 'diarizing'
+  | 'transcribing'
+  | 'correcting'
+  | 'refining'
+  | 'relistening'
+  | 'completed'
+  | 'error'
+  | 'DIARIZING'
+  | 'TRANSCRIBING_ASR'
+  | 'LLM_REFINING'
+  | 'COMPLETED';
+
+export type WordUncertaintyStatus =
+  | 'normal'
+  | 'auto_corrected'
+  | 'acoustic_uncertain'
+  | 'semantic_uncertain';
+
+export type DictScope = 'public' | 'personal' | 'session' | 'global';
+export type DictCategory = 'person' | 'project' | 'jargon';
+
+export interface ModelDownloadStatus {
+  active: boolean;
+  modelName: string;
+  fileName: string;
+  progress: number;
+  statusText: string;
+}
+
+export interface WordSpan {
+  id: string;
+  text: string;
+  /** 相容別名：與 text 同步 */
+  word?: string;
+  originalText?: string;
+  originalWord?: string;
+  start: number;
+  end: number;
+  confidence: number;
+  status: WordUncertaintyStatus;
+  isPatched?: boolean;
+  isCorrected?: boolean;
+  reason?: string;
+  candidates?: string[];
+  /** 若該 Token 已被使用者手動點選確認，標記為鎖定以維持冪等性 */
+  userLocked?: boolean;
+  /** 字級 Viterbi 解碼指派之最佳語者 ID */
+  speakerId?: string;
+  /** 字級聲學發射機率 Top-2 競爭語者 ID */
+  runnerUpSpeakerId?: string;
+  /** 字級聲學對數勝算邊界 \Delta L_i = \ln(E_i(k_1) + \epsilon) - \ln(E_i(k_2) + \epsilon) */
+  logOddsMargin?: number;
+  /** 字級重疊語音比例 \Omega_i \in [0, 1] */
+  overlapRatio?: number;
+}
+
+export type WordTimestamp = WordSpan;
+
+export interface Segment {
+  id: string;
+  chunkIndex: number;
+  speakerId: string;
+  start: number;
+  end: number;
+  words: WordSpan[];
+  /** 雙向相容同步衍生欄位 */
+  text?: string;
+  rawText?: string;
+  polishedText?: string;
+  isCorrected: boolean;
+  isPolished?: boolean;
+  ispolished?: boolean;
+  isLocked?: boolean;
+  matchedTerms?: string[];
+  relistenCount?: number;
+  /** 聲學餘弦邊際 M(u_m)：>= 0.16 且 >= 1.2s 為 LOCKED 錨點，< 0.16 為 REVIEW 候選 */
+  acousticMargin?: number;
+  /** 子句平均聲學對數勝算邊界 \Delta L：> 1.8 為 Tier 1 鎖定，0.45~1.8 為 Tier 2 候選，< 0.45 為 Tier 3 重疊 */
+  logOddsMargin?: number;
+  /** 子句內平均重疊語音比例 \bar{\Omega} \in [0, 1] */
+  overlapRatio?: number;
+  overlapWarning?: boolean;
+  /** 三級聲學信心度閘控等級，供 ISIAL + LG-TPST LLM 決定是否允許變更語者或拆解重疊句 */
+  slotTier?: AcousticSlotTier;
+  runnerUpSpeakerId?: string;
+  /** 【方向二】：Stage 1 句子語意與結構完整性診斷 */
+  sentenceIntegrity?: SentenceIntegrityDiagnostic;
+  sentenceIntegrityScore?: number;
+  sentenceIntegrityIssues?: SentenceIntegrityIssueType[];
+}
+
+export type TranscriptSegment = Segment;
+
+/**
+ * 【問題一 & 問題二】：ISIAL 圈選出之免索引懷疑區段槽位映射項 (SlotMap Entry)
+ */
+export interface SuspectSlotItem {
+  /** 槽位唯一識別碼，例如 "#S1" ~ "#S5" */
+  slotId: string;
+  segmentId: string;
+  /** 對應 Segment.words 之起始索引 (含) */
+  startWordIdx: number;
+  /** 對應 Segment.words 之結束索引 (不含) */
+  endWordIdx: number;
+  originalText: string;
+  leftContext: string;
+  rightContext: string;
+  anomalyScore: number;
+  anomalyType:
+    | 'orphan_char_chain'
+    | 'phonetic_gravity_tension'
+    | 'collocation_surprisal'
+    | 'contraction_split';
+  /** 三源混淆集候選網格 (Confusion Set Lattice) Top-K 候選詞 */
+  candidates: string[];
+}
+
+export type SuspectSlot = SuspectSlotItem;
+
+/**
+ * 【問題二 2.3】：XGrammar / Gemini 結構化槽位填空與語用拆句輸出格式
+ */
+export interface SlotCorrectionOutputItem {
+  slot_id: string;
+  /** 15 字以內微推理 (Micro-CoT)，必須在 action 與 selected_text 前生成 */
+  brief_reason: string;
+  action: 'KEEP_ORIGINAL' | 'APPLY_HIGH_CONF' | 'MARK_UNCERTAIN';
+  selected_text: string;
+  uncertain_candidates: string[];
+}
+
+export type LlmSlotCorrection = SlotCorrectionOutputItem;
+
+export interface TurnSplitOutputItem {
+  utterance_id: string;
+  pragmatic_type:
+    | 'NO_SPLIT'
+    | 'QA_SPEAKER_CHANGE'
+    | 'RHETORICAL_SELF_ANSWER'
+    | 'BACKCHANNEL_INTERJECTION';
+  /** 若為 QA_SPEAKER_CHANGE 或 BACKCHANNEL_INTERJECTION，填寫回答句/附和句開頭的精確 2~4 個字作為切分錨點 */
+  split_before_anchor: string;
+  new_speaker_id: string;
+}
+
+export type LlmTurnSplitSuggestion = TurnSplitOutputItem;
+export type LlmTurnSplitProposal = TurnSplitOutputItem;
+
+export interface ContextualFixOutputItem {
+  utterance_id: string;
+  /** 15 字以內說明前後文語意呼應或標點修正理由 (Micro-CoT) */
+  brief_reason: string;
+  /** 原句中之同音誤植、語意不合脈絡或標點缺漏片段 (2~10 字，須精確出現於原句中) */
+  wrong_span: string;
+  /** 根據上下文脈絡修正後之詞句或含標點片段 */
+  corrected_span: string;
+}
+
+export interface StructuredSlotGerResponse {
+  slot_corrections: SlotCorrectionOutputItem[];
+  contextual_fixes?: ContextualFixOutputItem[];
+  turn_splits: TurnSplitOutputItem[];
+}
+
+/**
+ * 【問題五 5.1】：不可變 Token 圖譜資料結構定義 (Immutable Token Graph)
+ */
+export interface AtomicCharToken {
+  readonly tokenId: string;
+  char: string;
+  pinyinKey: string;
+  startTimeMs: number;
+  endTimeMs: number;
+  acousticConf: number;
+  speakerId: string;
+}
+
+export interface UncertainCandidateOption {
+  readonly optionId: string;
+  text: string;
+  pinyinSequence: string[];
+  source: 'ORIGINAL' | 'LLM_PASS2' | 'BOOTSTRAPPED_HOTWORD' | 'DOMAIN_DICT';
+  reason?: string;
+}
+
+export interface SuspectSpanNode {
+  readonly spanId: string;
+  status: 'CLEAN' | 'AUTO_CORRECTED' | 'SEMANTIC_UNCERTAIN' | 'USER_LOCKED';
+  activeTokens: AtomicCharToken[];
+  originalTokens: AtomicCharToken[];
+  candidates: UncertainCandidateOption[];
+  selectedOptionId: string;
+}
+
+export interface UtteranceNode {
+  readonly utteranceId: string;
+  segments: Array<AtomicCharToken | SuspectSpanNode>;
+}
+
+export interface CorrectionPatchItem {
+  segmentId: string;
+  /** 若為詞彙修正則為 >= 0 之起始詞索引；若為整段語者轉移或拆句 (LG-TPST) 則為 -1 */
+  wordIndex: number;
+  /** 槽位涵蓋之結束詞索引 (不含)，供多詞無縫消融替換使用 */
+  endWordIndex?: number;
+  originalText: string;
+  status: 'auto_corrected' | 'semantic_uncertain';
+  correctedText?: string;
+  /** 當 [REVIEW] / [OVERLAP] 段落經對話語用學判定需切換語者時，填入新語者 ID (例如 runnerUpSpeakerId) */
+  newSpeakerId?: string;
+  /** 若為段內問答對拆句 (QA_SPEAKER_CHANGE) 或重疊附和拆解，指定回答句開頭錨點字串 */
+  splitBeforeAnchor?: string;
+  candidates?: string[];
+  reason: string;
+  requireRelisten?: boolean;
+}
+
+export type LlmCorrectionPatch = CorrectionPatchItem;
+
+export interface TriLevelContextPayload {
+  lowAttentionGlobalMemory: {
+    docSummary: string;
+    verifiedTerms: string[];
+    earlierTopicDigest: string;
   };
+  mediumAttentionRollingText: string;
+  highAttentionTargetSegments: Segment[];
+  /** 免索引槽位映射表 (#S1 ~ #S5) */
+  suspectSlots?: SuspectSlotItem[];
+  /** 已嵌入 ⟪#S1: 原詞 | 候選: ...⟫ 槽位標記之待校對文本 */
+  slottedPromptTranscript?: string;
 }
 
-export function applySeamlessSpanReplacement(
-  utterance: UtteranceNode,
-  targetSpanId: string,
-  candidate: UncertainCandidateOption
-): UtteranceNode {
-  const flatTokens: AtomicCharToken[] = [];
-  let spanStartIdx = -1;
-  let spanEndIdx = -1;
-
-  for (const seg of utterance.segments) {
-    if ('spanId' in seg) {
-      if (seg.spanId === targetSpanId) {
-        spanStartIdx = flatTokens.length;
-        flatTokens.push(...seg.activeTokens);
-        spanEndIdx = flatTokens.length;
-      } else {
-        flatTokens.push(...seg.activeTokens);
-      }
-    } else {
-      flatTokens.push(seg);
-    }
-  }
-
-  if (spanStartIdx === -1) return utterance;
-
-  const candChars = Array.from(candidate.text);
-  const candPinyins =
-    candidate.pinyinSequence &&
-    candidate.pinyinSequence.length === candChars.length
-      ? candidate.pinyinSequence
-      : toTaiwanFuzzyPhoneticSyllables(candidate.text);
-  const M = candChars.length;
-
-  const isTokenMatch = (
-    tok: AtomicCharToken,
-    char: string,
-    pinyin: string
-  ): boolean => {
-    return (
-      tok.char === char || (tok.pinyinKey !== '' && tok.pinyinKey === pinyin)
-    );
-  };
-
-  let bestKL = 0;
-  const maxCheckL = Math.min(M - 1, spanStartIdx);
-  for (let k = maxCheckL; k >= 1; k--) {
-    let matchAll = true;
-    for (let i = 0; i < k; i++) {
-      const leftTok = flatTokens[spanStartIdx - k + i];
-      if (!isTokenMatch(leftTok, candChars[i], candPinyins[i])) {
-        matchAll = false;
-        break;
-      }
-    }
-    if (matchAll) {
-      bestKL = k;
-      break;
-    }
-  }
-
-  let bestKR = 0;
-  const maxCheckR = Math.min(M - 1 - bestKL, flatTokens.length - spanEndIdx);
-  for (let k = maxCheckR; k >= 1; k--) {
-    let matchAll = true;
-    for (let i = 0; i < k; i++) {
-      const rightTok = flatTokens[spanEndIdx + i];
-      const candIdx = M - k + i;
-      if (!isTokenMatch(rightTok, candChars[candIdx], candPinyins[candIdx])) {
-        matchAll = false;
-        break;
-      }
-    }
-    if (matchAll) {
-      bestKR = k;
-      break;
-    }
-  }
-
-  const absorbedStart = spanStartIdx - bestKL;
-  const absorbedEnd = spanEndIdx + bestKR;
-
-  let effectiveCandChars = candChars;
-  let effectiveCandPinyins = candPinyins;
-
-  if (
-    absorbedStart > 0 &&
-    effectiveCandChars.length >= 2 &&
-    flatTokens[absorbedStart - 1].char === effectiveCandChars[0] &&
-    effectiveCandChars[0] === effectiveCandChars[1]
-  ) {
-    effectiveCandChars = effectiveCandChars.slice(1);
-    effectiveCandPinyins = effectiveCandPinyins.slice(1);
-  }
-
-  if (
-    absorbedEnd < flatTokens.length &&
-    effectiveCandChars.length >= 2 &&
-    flatTokens[absorbedEnd].char ===
-      effectiveCandChars[effectiveCandChars.length - 1] &&
-    effectiveCandChars[effectiveCandChars.length - 1] ===
-      effectiveCandChars[effectiveCandChars.length - 2]
-  ) {
-    effectiveCandChars = effectiveCandChars.slice(0, -1);
-    effectiveCandPinyins = effectiveCandPinyins.slice(0, -1);
-  }
-
-  const sliceStartTime = flatTokens[absorbedStart].startTimeMs;
-  const sliceEndTime = flatTokens[absorbedEnd - 1].endTimeMs;
-  const totalDuration = Math.max(
-    sliceEndTime - sliceStartTime,
-    effectiveCandChars.length * 40
-  );
-  const stepMs = totalDuration / Math.max(1, effectiveCandChars.length);
-  const dominantSpeaker = flatTokens[spanStartIdx].speakerId;
-  const avgConf =
-    flatTokens
-      .slice(absorbedStart, absorbedEnd)
-      .reduce((acc, t) => acc + t.acousticConf, 0) /
-    Math.max(1, absorbedEnd - absorbedStart);
-
-  const newSpanTokens: AtomicCharToken[] = effectiveCandChars.map(
-    (ch, idx) => ({
-      tokenId: `${targetSpanId}_opt_${candidate.optionId}_${idx}`,
-      char: ch,
-      pinyinKey: effectiveCandPinyins[idx] || '',
-      startTimeMs: Math.round(sliceStartTime + idx * stepMs),
-      endTimeMs: Math.round(sliceStartTime + (idx + 1) * stepMs),
-      acousticConf: avgConf,
-      speakerId: dominantSpeaker,
-    })
-  );
-
-  const updatedSegments: Array<AtomicCharToken | SuspectSpanNode> = [];
-  let cursor = 0;
-
-  for (const seg of utterance.segments) {
-    if ('spanId' in seg) {
-      const segLen = seg.activeTokens.length;
-      if (seg.spanId === targetSpanId) {
-        const expandedOriginal = flatTokens.slice(absorbedStart, absorbedEnd);
-        updatedSegments.push({
-          ...seg,
-          status: 'USER_LOCKED',
-          activeTokens: newSpanTokens,
-          originalTokens:
-            seg.originalTokens.length < expandedOriginal.length
-              ? expandedOriginal
-              : seg.originalTokens,
-          selectedOptionId: candidate.optionId,
-        });
-      } else {
-        const kept = seg.activeTokens.filter((_, idx) => {
-          const pos = cursor + idx;
-          return pos < absorbedStart || pos >= absorbedEnd;
-        });
-        if (kept.length > 0) {
-          updatedSegments.push({ ...seg, activeTokens: kept });
-        }
-      }
-      cursor += segLen;
-    } else {
-      if (cursor < absorbedStart || cursor >= absorbedEnd) {
-        updatedSegments.push(seg);
-      }
-      cursor += 1;
-    }
-  }
-
-  return {
-    ...utterance,
-    segments: updatedSegments,
-  };
+export interface TierPresetSpec {
+  tier: GranularityTier;
+  label: string;
+  badgeText: string;
+  hardwareHint: string;
+  chunkDurationSec: number;
+  keepModelsCoResident: boolean;
+  recommendedLlm: LocalLlmModel;
+  asrBeamSize: number;
+  highAttentionChars: number;
+  mediumAttentionChars: number;
+  maxRelistenQuotaPerChunk: number;
+  relistenPaddingSec: number;
 }
 
-export function applySeamlessWordSpanReplacement(
-  words: WordSpan[],
-  startWordIdx: number,
-  endWordIdx: number,
-  replacementText: string,
-  options?: {
-    status?: WordSpan['status'];
-    reason?: string;
-    candidates?: string[];
-    userLocked?: boolean;
-  }
-): WordSpan[] {
-  if (
-    words.length === 0 ||
-    startWordIdx < 0 ||
-    startWordIdx >= words.length
-  ) {
-    return words;
-  }
-  const safeEndWordIdx = Math.max(
-    startWordIdx + 1,
-    Math.min(words.length, endWordIdx)
-  );
-
-  interface FlatCharItem {
-    char: string;
-    pinyinKey: string;
-    wordIdx: number;
-    startSec: number;
-    endSec: number;
-    conf: number;
-  }
-
-  const flatChars: FlatCharItem[] = [];
-  let charSpanStart = -1;
-  let charSpanEnd = -1;
-
-  for (let wIdx = 0; wIdx < words.length; wIdx++) {
-    const w = words[wIdx];
-    if (wIdx === startWordIdx) charSpanStart = flatChars.length;
-
-    const chars = Array.from(w.text);
-    const pinyins = toTaiwanFuzzyPhoneticSyllables(w.text);
-    const dur = Math.max(0.04, w.end - w.start);
-    const step = dur / Math.max(1, chars.length);
-
-    chars.forEach((ch, cIdx) => {
-      flatChars.push({
-        char: ch,
-        pinyinKey: pinyins[cIdx] || '',
-        wordIdx: wIdx,
-        startSec: w.start + cIdx * step,
-        endSec: w.start + (cIdx + 1) * step,
-        conf: w.confidence,
-      });
-    });
-
-    if (wIdx === safeEndWordIdx - 1) charSpanEnd = flatChars.length;
-  }
-
-  if (charSpanStart === -1 || charSpanEnd === -1) return words;
-
-  const candChars = Array.from(replacementText);
-  const candPinyins = toTaiwanFuzzyPhoneticSyllables(replacementText);
-  const M = candChars.length;
-
-  const isCharOrPhoneticMatch = (
-    item: FlatCharItem,
-    ch: string,
-    py: string
-  ): boolean => {
-    if (!/^[\u4e00-\u9fa5]$/.test(item.char) || !/^[\u4e00-\u9fa5]$/.test(ch)) {
-      return item.char === ch;
-    }
-    return item.char === ch || (item.pinyinKey !== '' && item.pinyinKey === py);
-  };
-
-  let bestKL = 0;
-  const maxCheckL = Math.min(M - 1, charSpanStart);
-  for (let k = maxCheckL; k >= 1; k--) {
-    let matchAll = true;
-    for (let i = 0; i < k; i++) {
-      const leftItem = flatChars[charSpanStart - k + i];
-      if (!isCharOrPhoneticMatch(leftItem, candChars[i], candPinyins[i])) {
-        matchAll = false;
-        break;
-      }
-    }
-    if (matchAll) {
-      bestKL = k;
-      break;
-    }
-  }
-
-  let bestKR = 0;
-  const maxCheckR = Math.min(M - 1 - bestKL, flatChars.length - charSpanEnd);
-  for (let k = maxCheckR; k >= 1; k--) {
-    let matchAll = true;
-    for (let i = 0; i < k; i++) {
-      const rightItem = flatChars[charSpanEnd + i];
-      const candIdx = M - k + i;
-      if (
-        !isCharOrPhoneticMatch(rightItem, candChars[candIdx], candPinyins[candIdx])
-      ) {
-        matchAll = false;
-        break;
-      }
-    }
-    if (matchAll) {
-      bestKR = k;
-      break;
-    }
-  }
-
-  const absorbedCharStart = charSpanStart - bestKL;
-  const absorbedCharEnd = charSpanEnd + bestKR;
-
-  let effectiveText = replacementText;
-  if (
-    absorbedCharStart > 0 &&
-    effectiveText.length >= 2 &&
-    flatChars[absorbedCharStart - 1].char === effectiveText[0]
-  ) {
-    effectiveText = effectiveText.slice(1);
-  }
-  if (
-    absorbedCharEnd < flatChars.length &&
-    effectiveText.length >= 2 &&
-    flatChars[absorbedCharEnd].char === effectiveText[effectiveText.length - 1]
-  ) {
-    effectiveText = effectiveText.slice(0, -1);
-  }
-
-  const absorbedWordStart = flatChars[absorbedCharStart].wordIdx;
-  const absorbedWordEnd = flatChars[absorbedCharEnd - 1].wordIdx + 1;
-
-  const firstWordChars = flatChars.filter(
-    (c, idx) => c.wordIdx === absorbedWordStart && idx < absorbedCharStart
-  );
-  const lastWordChars = flatChars.filter(
-    (c, idx) => c.wordIdx === absorbedWordEnd - 1 && idx >= absorbedCharEnd
-  );
-
-  const prefixKeep = firstWordChars.map((c) => c.char).join('');
-  const suffixKeep = lastWordChars.map((c) => c.char).join('');
-
-  const expandedOriginalText = flatChars
-    .slice(absorbedCharStart, absorbedCharEnd)
-    .map((c) => c.char)
-    .join('');
-
-  const targetAnchorWord = words[startWordIdx];
-  const preservedOriginal =
-    targetAnchorWord.originalText &&
-    targetAnchorWord.originalText.length >= expandedOriginalText.length
-      ? targetAnchorWord.originalText
-      : expandedOriginalText;
-
-  const newStartSec = Number(flatChars[absorbedCharStart].startSec.toFixed(2));
-  const newEndSec = Number(
-    Math.max(
-      newStartSec + 0.15,
-      flatChars[absorbedCharEnd - 1].endSec
-    ).toFixed(2)
-  );
-
-  const resultWords: WordSpan[] = [];
-
-  for (let i = 0; i < absorbedWordStart; i++) {
-    resultWords.push(words[i]);
-  }
-
-  if (prefixKeep) {
-    resultWords.push({
-      ...words[absorbedWordStart],
-      id: `${words[absorbedWordStart].id}_pre`,
-      text: prefixKeep,
-      word: prefixKeep,
-      end: newStartSec,
-    });
-  }
-
-  const finalTxt = effectiveText || replacementText;
-  resultWords.push({
-    ...targetAnchorWord,
-    text: finalTxt,
-    word: finalTxt,
-    originalText: preservedOriginal,
-    originalWord: preservedOriginal,
-    start: newStartSec,
-    end: newEndSec,
-    confidence:
-      options?.status === 'auto_corrected'
-        ? 0.96
-        : targetAnchorWord.confidence,
-    status: options?.status ?? 'normal',
-    isPatched: options?.status === 'auto_corrected',
-    isCorrected: options?.status === 'auto_corrected',
-    reason: options?.reason ?? targetAnchorWord.reason,
-    candidates: options?.candidates ?? targetAnchorWord.candidates,
-    userLocked: options?.userLocked ?? targetAnchorWord.userLocked,
-  });
-
-  if (suffixKeep) {
-    resultWords.push({
-      ...words[absorbedWordEnd - 1],
-      id: `${words[absorbedWordEnd - 1].id}_suf`,
-      text: suffixKeep,
-      word: suffixKeep,
-      start: newEndSec,
-    });
-  }
-
-  for (let i = absorbedWordEnd; i < words.length; i++) {
-    resultWords.push(words[i]);
-  }
-
-  return resultWords;
+export interface HardwareProbeResult {
+  hasWebGPU: boolean;
+  adapterName: string;
+  isDiscreteGpu: boolean;
+  maxBufferSizeMB: number;
+  estimatedCacheUsageMB: number;
+  recommendedTier: GranularityTier;
+  warningMessage?: string;
 }
 
-const DISCOURSE_TOPIC_SHIFT_REGEX =
-  /^(?:然後|那|另外|再來|此外|同時|最後)?(?:第[二三四五六七八九十][個點項部分步]|另外一個(?:部分|問題|重點|面向)|再來(?:就是|是|一個)|那另外(?:就是|一個)|接下來(?:我們|就是)|至於(?:在|說)?)/;
-
-function analyzeCrossWindowBoundaryStitchMode(
-  prevLastWordText: string,
-  currFirstWordText: string,
-  pauseGap = 0.5
-): 'strip' | 'comma' | 'keep' {
-  const prevClean = prevLastWordText.replace(/[，。？！、；：,.?!\s]+$/g, '');
-  const currClean = currFirstWordText.replace(/^[，。？！、；：,.?!\s]+/g, '');
-  if (!prevClean || !currClean) return 'keep';
-
-  if (
-    /(?:[的之比在跟對向把被讓給為從到]|那個|這個|一些|一個|我們有|他們有|協助他們去)$/.test(
-      prevClean
-    ) ||
-    (/^[的之得地了嗎呢吧啊呀喔哦啦囉嘛齁吼]/.test(currClean) &&
-      currClean.length <= 3) ||
-    (/(?:預算|報價|規模|問題|部分|角色|活動|合作|費用|計畫|補助)的$/.test(
-      prevClean
-    ) &&
-      /^(?:狀況|部分|問題|規模|方式|費用|做法|辦法|方向)/.test(currClean))
-  ) {
-    return 'strip';
-  }
-
-  if (
-    /(?:要能夠|能夠|可以|應該|就是|因為|所以|而且|然後|例如說|比方說|像是|主要是|或者是|但如果|的時候|的話)$/.test(
-      prevClean
-    ) ||
-    /^(?:就是|因為|所以|而且|但是|可是|不過|假設|如果|例如|比方|那目前|或者是|他們現在|現在就是|然後一個|另外一個)/.test(
-      currClean
-    ) ||
-    (pauseGap <= 0.75 && !/[？！?!]$/.test(prevLastWordText.trim()))
-  ) {
-    return 'comma';
-  }
-
-  return 'keep';
+export interface Speaker {
+  id: string;
+  name: string;
+  color: string;
+  centroid?: number[];
+  f0Hz?: number;
+  /** 品質加權主重心 Master Centroid (L2-normalized) */
+  embedding?: number[];
+  /** 多原型代表性錨點庫 Anchor Exemplar Sub-Bank (上限 M=15 個高純度向量，防止跨 5 分鐘區塊質心漂移) */
+  anchorBank?: number[][];
+  /** 累積有效高純度發聲秒數 W_g */
+  accumulatedMass?: number;
+  featureMode?: DiarizationEngineMode;
+  mergedFrom: string[];
 }
 
-function splitLongMonologueAtSemanticBoundaries(
-  segments: Segment[]
-): Segment[] {
-  const result: Segment[] = [];
-
-  for (const seg of segments) {
-    const totalChars = seg.words.reduce((acc, w) => acc + w.text.length, 0);
-    if (totalChars < 200 || seg.words.length < 12) {
-      result.push(seg);
-      continue;
-    }
-
-    let splitWordIdx = -1;
-    let accChars = 0;
-
-    for (let i = 0; i < seg.words.length - 3; i++) {
-      accChars += seg.words[i].text.length;
-      const remChars = totalChars - accChars;
-      if (accChars < 70 || remChars < 60) continue;
-
-      const currW = seg.words[i].text.trim();
-      const lookaheadText = seg.words
-        .slice(i + 1, Math.min(seg.words.length, i + 5))
-        .map((w) => w.text)
-        .join('')
-        .trim();
-
-      const prevEndsSentence = /[。？！.?!]$/.test(currW);
-      const prevEndsTopicSummary =
-        /(?:這是第[一二三]個|這是另一個|有點不太一樣|比較好|標示出來|先說明一下)[，。？！.?!]*$/.test(
-          seg.words
-            .slice(Math.max(0, i - 2), i + 1)
-            .map((w) => w.text)
-            .join('')
-        );
-
-      if (
-        (prevEndsSentence || prevEndsTopicSummary) &&
-        DISCOURSE_TOPIC_SHIFT_REGEX.test(lookaheadText)
-      ) {
-        splitWordIdx = i + 1;
-        break;
-      }
-    }
-
-    if (splitWordIdx > 0 && splitWordIdx < seg.words.length) {
-      const firstWords = seg.words.slice(0, splitWordIdx).map((w, idx, arr) => {
-        if (idx === arr.length - 1 && !/[。？！.?!]$/.test(w.text)) {
-          const clean = w.text.replace(/[，、；：,:;\s]+$/g, '');
-          return { ...w, text: `${clean}。`, word: `${clean}。` };
-        }
-        return w;
-      });
-      const secondWords = seg.words.slice(splitWordIdx);
-      const splitTime = Number(secondWords[0].start.toFixed(2));
-
-      const firstSeg = syncSegmentDerivedFields({
-        ...seg,
-        id: `${seg.id}_p1`,
-        end: Math.max(seg.start + 0.2, splitTime),
-        words: firstWords,
-      });
-      const secondSeg = syncSegmentDerivedFields({
-        ...seg,
-        id: `${seg.id}_p2`,
-        start: splitTime,
-        words: secondWords,
-      });
-
-      result.push(
-        ...splitLongMonologueAtSemanticBoundaries([firstSeg, secondSeg])
-      );
-    } else {
-      result.push(seg);
-    }
-  }
-
-  return result;
+export interface PhoneticMatchCandidate {
+  segmentId: string;
+  wordIndex: number;
+  matchedText: string;
+  targetSpeakerName: string;
+  contextPreview: string;
+  selected: boolean;
 }
 
-function smartConsolidateSegments(allSegments: Segment[]): Segment[] {
-  if (allSegments.length === 0) return [];
-  if (allSegments.length === 1) return [syncSegmentDerivedFields(allSegments[0])];
-
-  const sorted: Segment[] = allSegments
-    .map((s) =>
-      syncSegmentDerivedFields({
-        ...s,
-        words: [...s.words],
-      })
-    )
-    .sort((a, b) => {
-      if (Math.abs(a.start - b.start) > 0.08) return a.start - b.start;
-      return a.end - b.end;
-    });
-
-  const merged: Segment[] = [];
-  for (let i = 0; i < sorted.length; i++) {
-    const seg = sorted[i];
-    if (seg.words.length === 0) continue;
-    const prev = merged[merged.length - 1];
-    const prevChars = prev
-      ? prev.words.reduce((acc, w) => acc + w.text.length, 0)
-      : 0;
-    const currChars = seg.words.reduce((acc, w) => acc + w.text.length, 0);
-
-    let hasInterveningOtherSpeaker = false;
-    if (prev && prev.speakerId === seg.speakerId) {
-      for (let j = 0; j < sorted.length; j++) {
-        const other = sorted[j];
-        if (other.id === prev.id || other.id === seg.id) continue;
-        if (
-          other.speakerId !== prev.speakerId &&
-          other.end > prev.start + 0.05 &&
-          other.start < seg.end - 0.05
-        ) {
-          hasInterveningOtherSpeaker = true;
-          break;
-        }
-      }
-    }
-
-    const pauseGap = prev ? seg.start - prev.end : 999;
-    const prevLastText =
-      prev && prev.words.length > 0
-        ? prev.words[prev.words.length - 1].text
-        : '';
-    const currFullText = seg.words.map((w) => w.text).join('');
-    const currFirstText = seg.words[0]?.text || '';
-
-    const stitchMode = prev
-      ? analyzeCrossWindowBoundaryStitchMode(
-          prevLastText,
-          currFirstText,
-          pauseGap
-        )
-      : 'keep';
-    const isMidSentenceCut = stitchMode === 'strip' || stitchMode === 'comma';
-
-    const isSemanticTopicBreak =
-      !isMidSentenceCut &&
-      prevChars >= 140 &&
-      (DISCOURSE_TOPIC_SHIFT_REGEX.test(currFullText.trim()) ||
-        (prevChars >= 240 && pauseGap >= 2.2) ||
-        prevChars + currChars > 380);
-
-    if (
-      prev &&
-      !hasInterveningOtherSpeaker &&
-      prev.chunkIndex === seg.chunkIndex &&
-      prev.speakerId === seg.speakerId &&
-      seg.start >= prev.end - 0.25 &&
-      pauseGap <= 12.0 &&
-      (isMidSentenceCut || !isSemanticTopicBreak)
-    ) {
-      const prevWords = [...prev.words];
-      if (prevWords.length > 0) {
-        const lastW = prevWords[prevWords.length - 1];
-        const cleanLast = lastW.text.replace(/[，。？！、；：,.?!\s]+$/g, '');
-        if (stitchMode === 'strip') {
-          prevWords[prevWords.length - 1] = {
-            ...lastW,
-            text: cleanLast,
-            word: cleanLast,
-          };
-        } else if (stitchMode === 'comma') {
-          prevWords[prevWords.length - 1] = {
-            ...lastW,
-            text: `${cleanLast}，`,
-            word: `${cleanLast}，`,
-          };
-        } else if (!/[，。？！、；：,.?!]$/.test(lastW.text)) {
-          prevWords[prevWords.length - 1] = {
-            ...lastW,
-            text: `${lastW.text}，`,
-            word: `${lastW.text}，`,
-          };
-        }
-      }
-      prev.words = [...prevWords, ...seg.words];
-      prev.end = Math.max(prev.end, seg.end);
-      prev.acousticMargin = Math.max(
-        prev.acousticMargin ?? 0.15,
-        seg.acousticMargin ?? 0.15
-      );
-      merged[merged.length - 1] = syncSegmentDerivedFields(prev);
-    } else {
-      merged.push(syncSegmentDerivedFields(seg));
-    }
-  }
-
-  // 消除因跨視窗或 Stage 1 合併後殘留之重疊子句重複段（如前段尾端已包含後段全文）
-  const deduped: Segment[] = [];
-  for (const seg of merged) {
-    const prev = deduped[deduped.length - 1];
-    if (prev && prev.chunkIndex === seg.chunkIndex) {
-      const prevPure = (prev.text || '').replace(/[，。？！、；：,.?!\s]/g, '');
-      const currPure = (seg.text || '').replace(/[，。？！、；：,.?!\s]/g, '');
-      if (
-        currPure.length >= 2 &&
-        currPure.length <= prevPure.length &&
-        seg.start <= prev.end + 0.8 &&
-        prevPure.slice(-Math.min(prevPure.length, currPure.length + 18)).includes(currPure)
-      ) {
-        continue;
-      }
-    }
-    deduped.push(seg);
-  }
-
-  return splitLongMonologueAtSemanticBoundaries(deduped);
+export interface DictEntry {
+  id: string;
+  term: string;
+  category: DictCategory;
+  scope: DictScope;
+  aliases?: string[];
+  weight?: number;
+  boostWeight?: number;
+  phonetic?: string;
+  phoneticKey?: string;
+  notes?: string;
+  definition?: string;
 }
 
-const DEFAULT_DIARIZATION_CONFIG: DiarizationConfig = {
-  engineMode: 'mode_0_heritage_classic',
-  strategyMode: 'MODE_0_GOLDEN_TWO_STAGE',
-  clusterMethod: 'ahc_cosine',
-  clusteringMethod: 'ahc_cosine',
-  executionBackend: 'wasm',
-  backend: 'wasm',
-  onnxModelFilename: 'wespeaker_voxceleb_resnet34_int8.onnx',
-  embeddingModel: 'wespeaker_voxceleb_resnet34_int8.onnx',
-  localWasmBasePath: './wasm/',
-  localModelBasePath: './models/',
-  yieldEveryNUnits: 14,
-  enableGlobalMeanCentering: false,
-  languageHint: 'zh',
-  shortTurnConfidenceKeepThreshold: 0.66,
-  pingPongMaxDurSec: 1.6,
-  enablePauseAndSemanticWeighting: true,
-  scdPeakThreshold: 0.22,
-  backchannelMarginThreshold: 0.12,
-  enableAcousticDivergencePreproc: true,
-  enableVirtualSpeakerTrackStitching: false,
-  embeddingExcludeOverlap: true,
-};
+export type DictionaryEntry = DictEntry;
 
-export interface AppState {
-  config: EngineConfig;
-  engineConfig: EngineConfig;
+export interface MacroChunkState {
+  index: number;
+  startTime: number;
+  endTime: number;
+  stage: ChunkStage;
+  engineUsed: EngineMode;
+  progress: number;
+  detailText?: string;
+  relistenUsed?: number;
+  error?: string;
+}
+
+export interface PipelineProgress {
+  active: boolean;
+  currentChunkIndex: number;
+  totalChunks: number;
+  stage: ChunkStage;
+  overallProgress: number;
+  detailText: string;
+}
+
+export interface EngineConfig {
+  mode: EngineMode;
+  granularityTier: GranularityTier;
+  localAsrModel: LocalAsrModel;
+  localLlmModel: LocalLlmModel;
+  groqApiKey: string;
+  geminiApiKey: string;
+  minSpeakers: number;
+  maxSpeakers: number;
+  acousticThreshold: number;
+  chunkDurationSec: number;
+  keepModelsCoResident: boolean;
+  asrBeamSize: number;
+  highAttentionChars: number;
+  mediumAttentionChars: number;
+  maxRelistenQuota: number;
+  relistenPaddingSec: number;
   diarizationConfig: DiarizationConfig;
-  activeDiarizationBackend: string;
-  audioFile: File | null;
-  audioUrl: string | null;
-  duration: number;
-  currentTime: number;
-  isPlaying: boolean;
-  chunks: MacroChunkState[];
-  isRunning: boolean;
-  progress: PipelineProgress;
-  segments: Segment[];
-  activeSegmentId: string | null;
-  speakers: Record<string, Speaker>;
-  dictionary: DictEntry[];
-  docContextSummary: string;
-  rollingMeetingSummary: string;
-  briefingSummary: string;
-  meetingMinutes: MeetingMinutesReport | null;
-  isGeneratingMinutes: boolean;
-  phoneticCandidates: PhoneticMatchCandidate[];
-  modelDownload: ModelDownloadStatus;
-  audioPreAnalysis: AudioPreAnalysisProfile | null;
-  isPreAnalyzingAudio: boolean;
-  preAnalysisProgress: { percent: number; detailText: string };
-  selectedPresetId: string;
-
-  updateConfig: (partial: Partial<EngineConfig>) => void;
-  setEngineConfig: (partial: Partial<EngineConfig>) => void;
-  updateDiarizationConfig: (partial: Partial<DiarizationConfig>) => void;
-  setDiarizationConfig: (partial: Partial<DiarizationConfig>) => void;
-  setActiveDiarizationBackend: (backend: string) => void;
-  applyGranularityTier: (tier: GranularityTier) => void;
-  applyRecommendedPreset: (preset: AudioRecommendationOption | string) => void;
-
-  setAudioFile: (file: File | null, url?: string | null) => void;
-  setDuration: (sec: number) => void;
-  setCurrentTime: (sec: number) => void;
-  setIsPlaying: (playing: boolean) => void;
-  setAudioPreAnalysis: (profile: AudioPreAnalysisProfile | null) => void;
-  setIsPreAnalyzingAudio: (analyzing: boolean) => void;
-  setPreAnalysisProgress: (percent: number, detailText: string) => void;
-
-  initChunks: (totalDurationSec: number) => void;
-  updateChunkState: (index: number, partial: Partial<MacroChunkState>) => void;
-  setIsRunning: (running: boolean) => void;
-  setProgress: (partial: Partial<PipelineProgress>) => void;
-  setModelDownload: (status: Partial<ModelDownloadStatus>) => void;
-
-  appendSegments: (newSegments: Segment[]) => void;
-  appendSegment: (newSegment: Segment) => void;
-  replaceBatchSegments: (
-    updatedSegments: Segment[],
-    sourceSegmentIds?: string[]
-  ) => void;
-  updateSegment: (segmentId: string, partial: Partial<Segment>) => void;
-  updateSegmentText: (segmentId: string, newText: string) => void;
-  updateSegmentSpeaker: (segmentId: string, newSpeakerId: string) => void;
-  toggleSegmentLock: (segmentId: string) => void;
-  applyCorrectionPatches: (
-    patches: CorrectionPatchItem[],
-    markSegmentIdsCorrected?: string[]
-  ) => void;
-  replaceSegmentAfterRelisten: (segmentId: string, newWords: WordSpan[]) => void;
-  revertWord: (segmentId: string, wordIndex: number, newText?: string) => void;
-  setActiveSegmentId: (segmentId: string | null) => void;
-  clearTranscript: (clearSessionDictOrEvent?: boolean | unknown) => void;
-
-  upsertSpeakers: (list: Speaker[] | Record<string, Speaker>) => void;
-  mergeSpeakers: (sourceId: string, targetId: string) => void;
-  renameSpeaker: (speakerId: string, newName: string) => void;
-  setPhoneticCandidates: (candidates: PhoneticMatchCandidate[]) => void;
-  applyPhoneticReplacements: () => void;
-  addDictEntries: (entries: DictEntry[]) => void;
-  removeDictEntry: (id: string) => void;
-  promoteDictEntryScope: (id: string, targetScope: DictScope) => void;
-  setDocContextSummary: (summary: string) => void;
-  setRollingMeetingSummary: (summary: string) => void;
-  setBriefingSummary: (summary: string) => void;
-  setMeetingMinutes: (report: MeetingMinutesReport | null) => void;
-  setIsGeneratingMinutes: (generating: boolean) => void;
+  /** 相容別名：與 diarizationConfig 同步 */
+  diarization?: DiarizationConfig;
 }
 
-const defaultTierSpec =
-  TIER_PRESET_SPECS.balanced_pro || TIER_PRESET_SPECS.eco_safe;
 
-const INITIAL_ENGINE_CONFIG: EngineConfig = {
-  mode: 'local_webgpu',
-  granularityTier: 'balanced_pro',
-  localAsrModel: 'Whisper-Large-v3-Turbo',
-  localLlmModel: defaultTierSpec.recommendedLlm,
-  groqApiKey: '',
-  geminiApiKey: '',
-  minSpeakers: 2,
-  maxSpeakers: 6,
-  acousticThreshold: 0.72,
-  chunkDurationSec: defaultTierSpec.chunkDurationSec,
-  keepModelsCoResident: defaultTierSpec.keepModelsCoResident,
-  asrBeamSize: defaultTierSpec.asrBeamSize,
-  highAttentionChars: defaultTierSpec.highAttentionChars,
-  mediumAttentionChars: defaultTierSpec.mediumAttentionChars,
-  maxRelistenQuota: defaultTierSpec.maxRelistenQuotaPerChunk,
-  relistenPaddingSec: defaultTierSpec.relistenPaddingSec,
-  diarizationConfig: DEFAULT_DIARIZATION_CONFIG,
-  diarization: DEFAULT_DIARIZATION_CONFIG,
-};
+// ============================================================================
+// 【會議 AI 摘要、重要結論與行動事項報告 (`MeetingMinutesReport`)】
+// ============================================================================
 
-export const useAppStore = create<AppState>()(
-  persist(
-    (set, get) => ({
-      config: INITIAL_ENGINE_CONFIG,
-      engineConfig: INITIAL_ENGINE_CONFIG,
-      diarizationConfig: DEFAULT_DIARIZATION_CONFIG,
-      activeDiarizationBackend: 'WeSpeaker 256D + Dual-Stage Anchor',
-      audioFile: null,
-      audioUrl: null,
-      duration: 0,
-      currentTime: 0,
-      isPlaying: false,
-      chunks: [],
-      isRunning: false,
-      progress: {
-        active: false,
-        currentChunkIndex: 0,
-        totalChunks: 0,
-        stage: 'idle',
-        overallProgress: 0,
-        detailText: '等待載入音檔',
-      },
-      segments: [],
-      activeSegmentId: null,
-      speakers: {},
-      dictionary: DEFAULT_PUBLIC_DICTIONARY,
-      docContextSummary: '',
-      rollingMeetingSummary: '',
-      briefingSummary: '',
-      meetingMinutes: null,
-      isGeneratingMinutes: false,
-      phoneticCandidates: [],
-      modelDownload: {
-        active: false,
-        modelName: '',
-        fileName: '',
-        progress: 0,
-        statusText: '',
-      },
-      audioPreAnalysis: null,
-      isPreAnalyzingAudio: false,
-      preAnalysisProgress: {
-        percent: 0,
-        detailText: '',
-      },
-      selectedPresetId: 'preset_a_balanced',
+export interface MeetingMinutesSpeakerStat {
+  speakerId: string;
+  speakerName: string;
+  turnCount: number;
+  charCount: number;
+}
 
-      updateConfig: (partial) =>
-        set((state) => {
-          const nextDiar = partial.diarizationConfig
-            ? {
-                ...state.config.diarizationConfig,
-                ...partial.diarizationConfig,
-              }
-            : state.config.diarizationConfig;
-          const nextConfig: EngineConfig = {
-            ...state.config,
-            ...partial,
-            diarizationConfig: nextDiar,
-            diarization: nextDiar,
-          };
-          return {
-            config: nextConfig,
-            engineConfig: nextConfig,
-            diarizationConfig: nextDiar,
-          };
-        }),
+export interface MeetingTopicDecisionItem {
+  topic: string;
+  /** 討論現況與重點（與 keyPoints 雙向同步，相容 UI 與匯出器） */
+  discussionPoints: string;
+  keyPoints: string;
+  /** 決議與裁示（與 conclusion 雙向同步，相容 UI 與匯出器） */
+  decision: string;
+  conclusion: string;
+  /** 對應會議時間區間（例如 "00:00–02:15"） */
+  timeRange?: string;
+}
 
-      setEngineConfig: (partial) => get().updateConfig(partial),
+export interface MeetingActionItem {
+  id: string;
+  task: string;
+  owner: string;
+  /** 目標時程或期限（與 deadlineOrTimeline 雙向同步，相容 UI 與匯出器） */
+  deadline: string;
+  deadlineOrTimeline: string;
+  /** 備註 / 依據（與 statusNote 雙向同步，相容 UI 與匯出器） */
+  contextNote?: string;
+  statusNote: string;
+}
 
-      updateDiarizationConfig: (partial) =>
-        set((state) => {
-          const nextDiar: DiarizationConfig = {
-            ...(state.config.diarizationConfig || DEFAULT_DIARIZATION_CONFIG),
-            ...partial,
-          };
-          const nextConfig: EngineConfig = {
-            ...state.config,
-            diarizationConfig: nextDiar,
-            diarization: nextDiar,
-          };
-          return {
-            config: nextConfig,
-            engineConfig: nextConfig,
-            diarizationConfig: nextDiar,
-          };
-        }),
-
-      setDiarizationConfig: (partial) => get().updateDiarizationConfig(partial),
-
-      setActiveDiarizationBackend: (backend) =>
-        set({ activeDiarizationBackend: backend }),
-
-      applyGranularityTier: (tier) => {
-        const spec = TIER_PRESET_SPECS[tier];
-        const currentDiar =
-          get().config.diarizationConfig || DEFAULT_DIARIZATION_CONFIG;
-
-        const tierDiarPatch: Partial<DiarizationConfig> =
-          tier === 'eco_safe'
-            ? {
-                engineMode: 'mode_a_classic',
-                strategyMode: 'MODE_A_CLASSIC_DSP',
-                clusterMethod: 'ahc_cosine',
-                yieldEveryNUnits: 8,
-                scdPeakThreshold: 0.28,
-                backchannelMarginThreshold: 0.16,
-                shortTurnConfidenceKeepThreshold: 0.72,
-                pingPongMaxDurSec: 1.4,
-                enableAcousticDivergencePreproc: true,
-                enableVirtualSpeakerTrackStitching: false,
-              }
-            : tier === 'balanced_pro'
-            ? {
-                engineMode: 'mode_0_heritage_classic',
-                strategyMode: 'MODE_0_GOLDEN_TWO_STAGE',
-                clusterMethod: 'ahc_cosine',
-                yieldEveryNUnits: 14,
-                scdPeakThreshold: 0.22,
-                backchannelMarginThreshold: 0.12,
-                shortTurnConfidenceKeepThreshold: 0.66,
-                pingPongMaxDurSec: 1.6,
-                enableAcousticDivergencePreproc: true,
-                enableVirtualSpeakerTrackStitching: false,
-              }
-            : {
-                engineMode: 'mode_c_onnx_neural',
-                strategyMode: 'MODE_C_ONNX_NEURAL',
-                clusterMethod: 'ahc_cosine',
-                yieldEveryNUnits: 24,
-                scdPeakThreshold: 0.19,
-                backchannelMarginThreshold: 0.1,
-                shortTurnConfidenceKeepThreshold: 0.6,
-                pingPongMaxDurSec: 1.8,
-                enableAcousticDivergencePreproc: true,
-                enableVirtualSpeakerTrackStitching: false,
-              };
-
-        const preservedCalibration =
-          currentDiar.formulaCalibration ||
-          get().audioPreAnalysis?.formulaCalibration;
-
-        const nextDiar: DiarizationConfig = {
-          ...currentDiar,
-          ...tierDiarPatch,
-          ...(preservedCalibration
-            ? { formulaCalibration: preservedCalibration }
-            : {}),
-        };
-
-        set((state) => {
-          const nextConfig: EngineConfig = {
-            ...state.config,
-            granularityTier: tier,
-            localLlmModel: spec.recommendedLlm,
-            chunkDurationSec: spec.chunkDurationSec,
-            keepModelsCoResident: spec.keepModelsCoResident,
-            asrBeamSize: spec.asrBeamSize,
-            highAttentionChars: spec.highAttentionChars,
-            mediumAttentionChars: spec.mediumAttentionChars,
-            maxRelistenQuota: spec.maxRelistenQuotaPerChunk,
-            relistenPaddingSec: spec.relistenPaddingSec,
-            diarizationConfig: nextDiar,
-            diarization: nextDiar,
-          };
-          return {
-            config: nextConfig,
-            engineConfig: nextConfig,
-            diarizationConfig: nextDiar,
-          };
-        });
-      },
-
-      applyRecommendedPreset: (presetOrId) => {
-        const state = get();
-        const resolvedPreset: AudioRecommendationOption | undefined =
-          typeof presetOrId === 'string'
-            ? state.audioPreAnalysis?.recommendations.find(
-                (r) => r.id === presetOrId
-              )
-            : presetOrId;
-
-        if (!resolvedPreset) return;
-
-        const nextDiar: DiarizationConfig = {
-          ...(state.config.diarizationConfig || DEFAULT_DIARIZATION_CONFIG),
-          ...resolvedPreset.diarizationPatch,
-        };
-        const nextConfig: EngineConfig = {
-          ...state.config,
-          ...(resolvedPreset.enginePatch || {}),
-          minSpeakers: resolvedPreset.recommendedMinSpeakers,
-          maxSpeakers: resolvedPreset.recommendedMaxSpeakers,
-          diarizationConfig: nextDiar,
-          diarization: nextDiar,
-        };
-
-        set({
-          config: nextConfig,
-          engineConfig: nextConfig,
-          diarizationConfig: nextDiar,
-          selectedPresetId: resolvedPreset.id,
-        });
-      },
-
-      setAudioFile: (file, url) =>
-        set((state) => {
-          if (state.audioUrl && state.audioUrl !== url) {
-            try {
-              URL.revokeObjectURL(state.audioUrl);
-            } catch {
-              // ignore
-            }
-          }
-          const nextUrl =
-            url !== undefined
-              ? url
-              : file
-              ? URL.createObjectURL(file)
-              : null;
-          return {
-            audioFile: file,
-            audioUrl: nextUrl,
-          };
-        }),
-
-      setDuration: (sec) => set({ duration: sec }),
-      setCurrentTime: (sec) => set({ currentTime: sec }),
-      setIsPlaying: (playing) => set({ isPlaying: playing }),
-      setAudioPreAnalysis: (profile) =>
-        set({
-          audioPreAnalysis: profile,
-          selectedPresetId:
-            profile?.recommendedPresetId || get().selectedPresetId,
-        }),
-      setIsPreAnalyzingAudio: (analyzing) =>
-        set({ isPreAnalyzingAudio: analyzing }),
-      setPreAnalysisProgress: (percent, detailText) =>
-        set({
-          preAnalysisProgress: { percent, detailText },
-        }),
-
-      initChunks: (totalDurationSec) => {
-        const chunkSec = get().config.chunkDurationSec || 300;
-        const count = Math.max(1, Math.ceil(totalDurationSec / chunkSec));
-        const mode = get().config.mode;
-        const chunks: MacroChunkState[] = Array.from(
-          { length: count },
-          (_, idx) => ({
-            index: idx,
-            startTime: idx * chunkSec,
-            endTime: Math.min(totalDurationSec, (idx + 1) * chunkSec),
-            stage: 'idle',
-            engineUsed: mode,
-            progress: 0,
-            detailText: '等待處理',
-            relistenUsed: 0,
-          })
-        );
-        set({
-          chunks,
-          duration: totalDurationSec,
-          progress: {
-            active: true,
-            currentChunkIndex: 0,
-            totalChunks: count,
-            stage: 'idle',
-            overallProgress: 0,
-            detailText: '準備開始微批次處理',
-          },
-        });
-      },
-
-      updateChunkState: (index, partial) =>
-        set((state) => {
-          const nextChunks = state.chunks.map((c) =>
-            c.index === index ? { ...c, ...partial } : c
-          );
-          const total = Math.max(1, nextChunks.length);
-          const completed = nextChunks.filter(
-            (c) => c.stage === 'completed' || c.stage === 'COMPLETED'
-          ).length;
-          const active = nextChunks[index];
-          const overallProgress = Math.min(
-            100,
-            Math.round(
-              ((completed * 100 +
-                (active &&
-                active.stage !== 'completed' &&
-                active.stage !== 'COMPLETED'
-                  ? active.progress
-                  : 0)) /
-                (total * 100)) *
-                100
-            )
-          );
-          return {
-            chunks: nextChunks,
-            progress: {
-              active: completed < total,
-              currentChunkIndex: index,
-              totalChunks: total,
-              stage: partial.stage || active?.stage || 'idle',
-              overallProgress,
-              detailText:
-                partial.detailText || active?.detailText || '處理中...',
-            },
-          };
-        }),
-
-      setIsRunning: (running) => set({ isRunning: running }),
-      setProgress: (partial) =>
-        set((state) => ({
-          progress: { ...state.progress, ...partial },
-        })),
-
-      setModelDownload: (partial) =>
-        set((state) => ({
-          modelDownload: { ...state.modelDownload, ...partial },
-        })),
-
-      appendSegments: (newSegments) =>
-        set((state) => ({
-          segments: smartConsolidateSegments([
-            ...state.segments,
-            ...newSegments.map(syncSegmentDerivedFields),
-          ]),
-        })),
-
-      appendSegment: (newSegment) =>
-        get().appendSegments([syncSegmentDerivedFields(newSegment)]),
-
-      replaceBatchSegments: (updatedSegments, sourceSegmentIds) =>
-        set((state) => {
-          const syncedList = updatedSegments.map(syncSegmentDerivedFields);
-          const map = new Map(syncedList.map((s) => [s.id, s]));
-          const sourceSet = new Set(sourceSegmentIds || []);
-          const existingIdSet = new Set(state.segments.map((s) => s.id));
-
-          // 若某個原始段落 ID 位於 sourceSegmentIds 中，但在 Stage 1 合併後已併入前段而不在 map 中，必須移除而不可保留舊複本！
-          const replaced: Segment[] = [];
-          for (const s of state.segments) {
-            if (map.has(s.id)) {
-              replaced.push(map.get(s.id)!);
-            } else if (sourceSet.has(s.id)) {
-              continue;
-            } else {
-              // 檢查是否已被 syncedList 中時間跨度擴大之段落吞併
-              const sPure = (s.text || '').replace(/[，。？！、；：,.?!\s]/g, '');
-              const isSwallowed =
-                sPure.length >= 2 &&
-                syncedList.some((u) => {
-                  if (u.id === s.id || u.chunkIndex !== s.chunkIndex) return false;
-                  if (s.start < u.start - 0.15 || s.end > u.end + 0.25) return false;
-                  const uPure = (u.text || '').replace(/[，。？！、；：,.?!\s]/g, '');
-                  return uPure.length > sPure.length && uPure.includes(sPure);
-                });
-              if (!isSwallowed) {
-                replaced.push(s);
-              }
-            }
-          }
-
-          const brandNew = syncedList.filter((s) => !existingIdSet.has(s.id));
-          return {
-            segments: smartConsolidateSegments([...replaced, ...brandNew]),
-          };
-        }),
-
-      updateSegment: (segmentId, partial) =>
-        set((state) => ({
-          segments: state.segments.map((seg) =>
-            seg.id === segmentId
-              ? syncSegmentDerivedFields({ ...seg, ...partial })
-              : seg
-          ),
-        })),
-
-      updateSegmentText: (segmentId, newText) =>
-        set((state) => ({
-          segments: state.segments.map((seg) => {
-            if (seg.id !== segmentId) return seg;
-            const replacedWords = applySeamlessWordSpanReplacement(
-              seg.words,
-              0,
-              seg.words.length,
-              newText,
-              { status: 'normal', userLocked: true }
-            );
-            return syncSegmentDerivedFields({
-              ...seg,
-              words: replacedWords,
-              isCorrected: true,
-            });
-          }),
-        })),
-
-      updateSegmentSpeaker: (segmentId, newSpeakerId) =>
-        set((state) => ({
-          segments: state.segments.map((seg) =>
-            seg.id === segmentId
-              ? syncSegmentDerivedFields({ ...seg, speakerId: newSpeakerId })
-              : seg
-          ),
-        })),
-
-      toggleSegmentLock: (segmentId) =>
-        set((state) => ({
-          segments: state.segments.map((seg) =>
-            seg.id === segmentId
-              ? syncSegmentDerivedFields({ ...seg, isLocked: !seg.isLocked })
-              : seg
-          ),
-        })),
-
-      setActiveSegmentId: (segmentId) => set({ activeSegmentId: segmentId }),
-
-      clearTranscript: (clearSessionDictOrEvent) => {
-        const shouldClearSession = clearSessionDictOrEvent === true;
-        set((state) => ({
-          chunks: [],
-          segments: [],
-          speakers: {},
-          phoneticCandidates: [],
-          rollingMeetingSummary: '',
-          briefingSummary: '',
-          meetingMinutes: null,
-          isGeneratingMinutes: false,
-          currentTime: 0,
-          modelDownload: {
-            active: false,
-            modelName: '',
-            fileName: '',
-            progress: 0,
-            statusText: '',
-          },
-          dictionary: shouldClearSession
-            ? state.dictionary.filter((d) => d.scope !== 'session')
-            : state.dictionary,
-        }));
-      },
-
-      applyCorrectionPatches: (patches, markSegmentIdsCorrected = []) =>
-        set((state) => {
-          const patchMap = new Map<string, CorrectionPatchItem[]>();
-          for (const p of patches) {
-            const list = patchMap.get(p.segmentId) || [];
-            list.push(p);
-            patchMap.set(p.segmentId, list);
-          }
-          const correctedSet = new Set(markSegmentIdsCorrected);
-          let hasSpeakerTransfer = false;
-
-          const updatedSegments: Segment[] = [];
-
-          for (const seg of state.segments) {
-            const segPatches = patchMap.get(seg.id);
-            const shouldMarkCorrected =
-              correctedSet.has(seg.id) || Boolean(segPatches?.length);
-            if (!segPatches && !shouldMarkCorrected) {
-              updatedSegments.push(seg);
-              continue;
-            }
-
-            const speakerPatch = segPatches?.find(
-              (p) =>
-                Boolean(p.newSpeakerId) && p.newSpeakerId !== seg.speakerId
-            );
-
-            if (speakerPatch && speakerPatch.newSpeakerId) {
-              hasSpeakerTransfer = true;
-              const anchor = (speakerPatch.splitBeforeAnchor || '').trim();
-              if (anchor.length >= 2) {
-                const fullSegText = seg.words.map((w) => w.text).join('');
-                const anchorCharIdx = fullSegText.indexOf(anchor);
-                if (anchorCharIdx > 2) {
-                  let charAcc = 0;
-                  let splitWordIdx = -1;
-                  for (let wIdx = 0; wIdx < seg.words.length; wIdx++) {
-                    if (charAcc >= anchorCharIdx) {
-                      splitWordIdx = wIdx;
-                      break;
-                    }
-                    charAcc += seg.words[wIdx].text.length;
-                  }
-                  if (splitWordIdx > 0 && splitWordIdx < seg.words.length) {
-                    const beforeWords = seg.words.slice(0, splitWordIdx);
-                    const afterWords = seg.words.slice(splitWordIdx);
-                    const splitTime = Number(
-                      beforeWords[beforeWords.length - 1].end.toFixed(2)
-                    );
-                    updatedSegments.push(
-                      syncSegmentDerivedFields({
-                        ...seg,
-                        end: splitTime,
-                        words: beforeWords,
-                        isCorrected: true,
-                      }),
-                      syncSegmentDerivedFields({
-                        ...seg,
-                        id: `${seg.id}_tpst`,
-                        speakerId: speakerPatch.newSpeakerId,
-                        runnerUpSpeakerId: seg.speakerId,
-                        start: splitTime,
-                        end: Math.max(splitTime + 0.25, seg.end),
-                        words: afterWords.map((w, idx) =>
-                          idx === 0
-                            ? {
-                                ...w,
-                                status: 'auto_corrected',
-                                reason:
-                                  speakerPatch.reason ||
-                                  'LG-TPST 問答對語者拆句移轉',
-                              }
-                            : w
-                        ),
-                        isCorrected: true,
-                      })
-                    );
-                    continue;
-                  }
-                }
-              }
-            }
-
-            const nextSpeakerId = speakerPatch?.newSpeakerId || seg.speakerId;
-            let currentWords = [...seg.words];
-
-            const wordPatches = (segPatches || [])
-              .filter((p) => p.wordIndex >= 0 && !p.newSpeakerId)
-              .sort((a, b) => b.wordIndex - a.wordIndex);
-
-            for (const wp of wordPatches) {
-              if (wp.wordIndex >= currentWords.length) continue;
-              if (currentWords[wp.wordIndex]?.userLocked) continue;
-
-              const endIdx =
-                typeof wp.endWordIndex === 'number' &&
-                wp.endWordIndex > wp.wordIndex
-                  ? wp.endWordIndex
-                  : wp.wordIndex + 1;
-
-              if (wp.status === 'auto_corrected' && wp.correctedText) {
-                currentWords = applySeamlessWordSpanReplacement(
-                  currentWords,
-                  wp.wordIndex,
-                  endIdx,
-                  wp.correctedText,
-                  {
-                    status: 'auto_corrected',
-                    reason: wp.reason,
-                    candidates: wp.candidates,
-                  }
-                );
-              } else if (wp.status === 'semantic_uncertain') {
-                currentWords = currentWords.map((w, idx) =>
-                  idx === wp.wordIndex
-                    ? {
-                        ...w,
-                        status: 'semantic_uncertain',
-                        candidates: wp.candidates || w.candidates,
-                        reason: wp.reason || w.reason,
-                      }
-                    : w
-                );
-              }
-            }
-
-            updatedSegments.push(
-              syncSegmentDerivedFields({
-                ...seg,
-                speakerId: nextSpeakerId,
-                words: currentWords,
-                isCorrected: seg.isCorrected || shouldMarkCorrected,
-              })
-            );
-          }
-
-          return {
-            segments: hasSpeakerTransfer
-              ? smartConsolidateSegments(updatedSegments)
-              : updatedSegments,
-          };
-        }),
-
-      replaceSegmentAfterRelisten: (segmentId, newWords) =>
-        set((state) => ({
-          segments: state.segments.map((seg) =>
-            seg.id === segmentId
-              ? syncSegmentDerivedFields({
-                  ...seg,
-                  words: newWords,
-                  isCorrected: true,
-                  relistenCount: (seg.relistenCount || 0) + 1,
-                })
-              : seg
-          ),
-        })),
-
-      revertWord: (segmentId, wordIndex, newText) =>
-        set((state) => ({
-          segments: state.segments.map((seg) => {
-            if (seg.id !== segmentId) return seg;
-            const targetW = seg.words[wordIndex];
-            if (!targetW) return seg;
-
-            const resolvedText =
-              newText !== undefined
-                ? newText
-                : targetW.originalText || targetW.text;
-
-            const newWords = applySeamlessWordSpanReplacement(
-              seg.words,
-              wordIndex,
-              wordIndex + 1,
-              resolvedText,
-              {
-                status: 'normal',
-                userLocked: true,
-              }
-            );
-
-            return syncSegmentDerivedFields({ ...seg, words: newWords });
-          }),
-        })),
-
-      upsertSpeakers: (listOrRecord) =>
-        set((state) => {
-          const list = Array.isArray(listOrRecord)
-            ? listOrRecord
-            : Object.values(listOrRecord || {});
-          const next = { ...state.speakers };
-          for (const sp of list) {
-            if (!next[sp.id]) {
-              next[sp.id] = sp;
-            } else {
-              next[sp.id] = {
-                ...next[sp.id],
-                centroid: sp.centroid || next[sp.id].centroid,
-                f0Hz: sp.f0Hz ?? next[sp.id].f0Hz,
-                embedding: sp.embedding || next[sp.id].embedding,
-                anchorBank: sp.anchorBank || next[sp.id].anchorBank,
-                accumulatedMass:
-                  sp.accumulatedMass ?? next[sp.id].accumulatedMass,
-                featureMode: sp.featureMode || next[sp.id].featureMode,
-              };
-            }
-          }
-          return { speakers: next };
-        }),
-
-      mergeSpeakers: (sourceId, targetId) =>
-        set((state) => {
-          if (sourceId === targetId || !state.speakers[targetId]) return state;
-          const nextSpeakers = { ...state.speakers };
-          const target = nextSpeakers[targetId];
-          nextSpeakers[targetId] = {
-            ...target,
-            mergedFrom: Array.from(new Set([...target.mergedFrom, sourceId])),
-          };
-          delete nextSpeakers[sourceId];
-
-          const nextSegments = state.segments.map((seg) =>
-            seg.speakerId === sourceId
-              ? syncSegmentDerivedFields({ ...seg, speakerId: targetId })
-              : seg
-          );
-          return {
-            speakers: nextSpeakers,
-            segments: smartConsolidateSegments(nextSegments),
-          };
-        }),
-
-      renameSpeaker: (speakerId, newName) =>
-        set((state) => {
-          const sp = state.speakers[speakerId];
-          if (!sp) return state;
-          return {
-            speakers: {
-              ...state.speakers,
-              [speakerId]: { ...sp, name: newName },
-            },
-          };
-        }),
-
-      setPhoneticCandidates: (candidates) =>
-        set({ phoneticCandidates: candidates }),
-
-      applyPhoneticReplacements: () =>
-        set((state) => {
-          const selected = state.phoneticCandidates.filter((c) => c.selected);
-          if (selected.length === 0) return state;
-
-          const nextSegments = state.segments.map((seg) => {
-            const matches = selected.filter((c) => c.segmentId === seg.id);
-            if (matches.length === 0) return seg;
-            const words = seg.words.map((w, idx) => {
-              const m = matches.find((c) => c.wordIndex === idx);
-              if (!m) return w;
-              return {
-                ...w,
-                originalText: w.originalText ?? w.text,
-                originalWord: w.originalText ?? w.text,
-                text: m.targetSpeakerName,
-                word: m.targetSpeakerName,
-                status: 'auto_corrected' as const,
-                isPatched: true,
-                isCorrected: true,
-                reason: '語者姓名同音連動修正',
-              };
-            });
-            return syncSegmentDerivedFields({ ...seg, words });
-          });
-
-          return {
-            segments: nextSegments,
-            phoneticCandidates: state.phoneticCandidates.filter(
-              (c) => !c.selected
-            ),
-          };
-        }),
-
-      addDictEntries: (entries) =>
-        set((state) => ({
-          dictionary: mergeDictLists(state.dictionary, entries),
-        })),
-
-      removeDictEntry: (id) =>
-        set((state) => ({
-          dictionary: state.dictionary.filter((d) => d.id !== id),
-        })),
-
-      promoteDictEntryScope: (id, targetScope) =>
-        set((state) => ({
-          dictionary: state.dictionary.map((d) =>
-            d.id === id ? { ...d, scope: targetScope } : d
-          ),
-        })),
-
-      setDocContextSummary: (summary) => set({ docContextSummary: summary }),
-      setRollingMeetingSummary: (summary) =>
-        set({ rollingMeetingSummary: summary, briefingSummary: summary }),
-      setBriefingSummary: (summary) =>
-        set({ rollingMeetingSummary: summary, briefingSummary: summary }),
-      setMeetingMinutes: (report) => set({ meetingMinutes: report }),
-      setIsGeneratingMinutes: (generating) =>
-        set({ isGeneratingMinutes: generating }),
-    }),
-    {
-      name: 'hybtrans-rwd-storage-v10',
-      partialize: (state) => ({
-        config: state.config,
-        dictionary: mergeDictLists(
-          DEFAULT_PUBLIC_DICTIONARY,
-          state.dictionary.filter((d) => d.scope !== 'session')
-        ),
-      }),
-      merge: (persistedState, currentState) => {
-        let p = (persistedState || {}) as Partial<AppState>;
-        if (!p.config && typeof window !== 'undefined') {
-          try {
-            const legacyRaw = window.localStorage.getItem('hybrid-transcriber-storage-v9');
-            if (legacyRaw) {
-              const legacyParsed = JSON.parse(legacyRaw) as {
-                state?: {
-                  config?: {
-                    geminiApiKey?: string;
-                    groqApiKey?: string;
-                  };
-                };
-              };
-              const legacyCfg = legacyParsed?.state?.config;
-              if (legacyCfg) {
-                p = {
-                  ...p,
-                  config: {
-                    ...currentState.config,
-                    geminiApiKey:
-                      legacyCfg.geminiApiKey || currentState.config.geminiApiKey,
-                    groqApiKey:
-                      legacyCfg.groqApiKey || currentState.config.groqApiKey,
-                  },
-                };
-              }
-            }
-          } catch {
-            // 忽略單向讀取異常
-          }
-        }
-        const mergedDiar: DiarizationConfig = {
-          ...DEFAULT_DIARIZATION_CONFIG,
-          ...(p.config?.diarizationConfig || {}),
-          enableVirtualSpeakerTrackStitching: false,
-        };
-        const mergedConfig: EngineConfig = {
-          ...currentState.config,
-          ...(p.config || {}),
-          diarizationConfig: mergedDiar,
-          diarization: mergedDiar,
-        };
-        const mergedDict = mergeDictLists(
-          DEFAULT_PUBLIC_DICTIONARY,
-          Array.isArray(p.dictionary) ? p.dictionary : []
-        );
-        return {
-          ...currentState,
-          ...p,
-          dictionary: mergedDict,
-          config: mergedConfig,
-          engineConfig: mergedConfig,
-          diarizationConfig: mergedDiar,
-        };
-      },
-    }
-  )
-);
+export interface MeetingMinutesReport {
+  generatedAt: string;
+  engineUsed: 'gemini_cloud' | 'local_webllm' | 'hybrid_discourse_analyzer';
+  /** 會議標題（與 meetingTitle 雙向同步，相容 UI 與匯出器） */
+  title: string;
+  meetingTitle: string;
+  executiveSummary: string;
+  keyConclusions: string[];
+  topicBreakdowns: MeetingTopicDecisionItem[];
+  actionItems: MeetingActionItem[];
+  /** 與會語者發言輪次與字數統計 */
+  speakerStats: MeetingMinutesSpeakerStat[];
+}
