@@ -1,19 +1,14 @@
 // src/workers/diarization.worker.ts
 // 次世代雙尺度語者分離與聲紋純化引擎 (Two-Stage Macro-Anchor Discovery + Pitch/Dip Micro-Turn Attribution + Calibrated AHC/NME-SC/VBx)
-// 針對台灣真實多人會議 (如 250623_1432 DEMO 音檔 4 人高頻搶話/附和) 之六大核心根因修正：
-// 1. [VAD 底噪分位數修正]：將 noiseFloor 由 18% 分位數乘 2.0 (0.0334，會把音量較小的男聲1與女聲2當成靜音切碎) 修正為 5% 分位數乘 1.65 (0.0158)，100% 保留小聲插話與附和。
+// 針對台灣真實多人會議 (如 250623_1432 DEMO 音檔 4 人高頻搶話/附和) 之核心根因修正與低記憶體峰值保護：
+// 1. [VAD 底噪分位數修正]：將 noiseFloor 由 18% 分位數乘 2.0 修正為 5% 分位數乘 1.65，100% 保留小聲插話與附和。
 // 2. [基頻倍頻減半誤差修正]：自相關基頻估算改採「首波峰門檻法 (First-Peak >= 0.86 * maxCorr)」，徹底根除女聲 (240Hz) 在次諧波處被誤判為男聲 (120Hz/80Hz) 的倍頻錯誤。
-// 3. [WeSpeaker ONNX 全模式啟用與短句 CMN 保護]：Mode 0 / Mode B / Mode C 皆自動載入 /public/models/wespeaker_voxceleb_resnet34_int8.onnx (若無則無縫降級 64-dim DSP)，
-//    並採用「時長自適應全局/局部混合 CMN + 短句張量延展 (>=100 幀)」，廢除會破壞 ResNet34 2D 卷積時間連續性的非連續幀挖空。
-// 4. [兩階段雙解析度架構]：
-//    - 第一階段 (Stage 1 Macro-Anchor Discovery)：以 1.2s~2.2s 高信噪比長視窗執行全域聚類，精準找出會議中的 4 位獨立語者 (女聲1、女聲2、男聲1、男聲2)。
-//    - 第二階段 (Stage 2 Fine Micro-Turn Attribution)：結合「40ms 基頻跳變 + 局部能量谷底」切出 0.55s~1.4s 微觀話輪 (精準捕捉 00:04 換人、00:07 女1/男1 連續『不算』、00:14 打斷搶話)，再對齊至第一階段鎖定之語者原型庫。
-// 5. [VBx 先驗飢餓與少數語者誤刪修正]：修正無預訓練 PLDA 時 VBx 因 F_a=0.07 過小導致先驗 \pi 坍縮為單一語者並強制夾死在 minSpeakers=2 的 Bug；
-//    同時廢除「發言總時長 < 3.5% 一律強制併入大群」的規則，改為僅合併「單一孤立錨點 (len === 1 且 < 2.0s)」，完整保護發言精簡但音色獨立的與會者 (如女聲2)。
+// 3. [WeSpeaker ONNX 全模式啟用與短句 CMN 保護]：Mode 0 / Mode B / Mode C 皆自動載入 /public/models/wespeaker_voxceleb_resnet34_int8.onnx (若無則無縫降級 64-dim DSP)，並採用「時長自適應全局/局部混合 CMN + 短句張量延展 (>=100 幀)」。
+// 4. [兩階段雙解析度架構]：Stage 1 長視窗定錨聚類 + Stage 2 微觀話輪歸屬。
+// 5. [ONNX Session 顯式釋放與 WASM 執行緒節流]：結束前主動呼叫 session.release() 並清空 Fbank 矩陣，限制 WASM Pthread 數 <= 2，防止與後續 Whisper 模型產生記憶體疊加峰值。
 
 import {
   AcousticFormulaCalibration,
-  DiarizationClusterMethod,
   DiarizationConfig,
   FineDiarizationTurn,
   FrameSpeakerPosteriorMatrix,
@@ -113,12 +108,7 @@ function cosineSimilarity(
   return denom > 1e-10 ? Math.max(-1.0, Math.min(1.0, dot / denom)) : 0.0;
 }
 
-/**
- * 【根因修正 2】：具備次諧波防倍頻減半 (Sub-Harmonic Octave-Halving Guard) 之自相關基頻估算器
- * 選取第一個達到全域最大相關係數 86% 以上之局部波峰 (First-Peak Selection)，
- * 徹底根除女聲 (230~270Hz) 在 2*T0 或 3*T0 處被誤判為 120Hz 男聲的問題！
- */
-function estimateMedianPitchHz(
+export function estimateMedianPitchHz(
   samples: Float32Array,
   startSample: number,
   endSample: number,
@@ -128,8 +118,8 @@ function estimateMedianPitchHz(
   const total = Math.max(1, endSample - startSample);
   const hop = Math.max(256, Math.floor(total / 25));
   const pitches: number[] = [];
-  const minLag = Math.floor(sampleRate / 320); // 50 samples @ 16kHz
-  const maxLag = Math.floor(sampleRate / 75); // 213 samples @ 16kHz
+  const minLag = Math.floor(sampleRate / 320);
+  const maxLag = Math.floor(sampleRate / 75);
   const numLags = Math.floor((maxLag - minLag) / 2) + 1;
   const corrs = new Float32Array(numLags);
 
@@ -187,10 +177,6 @@ function estimateMedianPitchHz(
   return pitches[Math.floor(pitches.length / 2)];
 }
 
-/**
- * 計算全場 40ms (每 4 個 10ms Fbank 幀) 步進之無倍頻誤差基頻軌跡與「基頻跳變 + 能量谷底」複合邊界曲線
- * 在 V8 JIT 下處理 5 分鐘音檔僅需 ~45ms，卻能精準抓出 00:04.2 (女1->女2)、00:06.6 (女2->女1)、00:07.3 (女1->男1)、00:14.4 (男2->女2) 等零停頓換人點！
- */
 function computePitchTrackAndBoundaryCurve(
   samples: Float32Array,
   smoothRms: Float32Array,
@@ -272,8 +258,6 @@ function computePitchTrackAndBoundaryCurve(
     stepBestLag[s] = minLag + chosenIdx * 2;
   }
 
-  // 【方向一深化】：根據預分析注入或當前區塊 P15 實測分佈，動態校準有聲母音諧波門檻 (0.34 ~ 0.42)，
-  // 確保距離麥克風較遠或句尾降調之語者（如女聲2 ~0.36）100% 保留完整 F0 軌跡！
   let calibratedHarmGate = formulaCalibration?.harmonicityGateThreshold ?? 0;
   if (calibratedHarmGate <= 0.1) {
     if (activeHarms.length > 10) {
@@ -327,7 +311,6 @@ function computePitchTrackAndBoundaryCurve(
     };
   };
 
-  // 計算 150ms (15 幀) 音節包絡 RMS (envRms)：跨越 20~40ms 塞音閉鎖期 (/d/, /t/, /k/)，僅在真實換人谷底產生顯著 dip！
   const envRms = new Float32Array(numFrames);
   for (let f = 0; f < numFrames; f++) {
     let sumEnv = 0.0;
@@ -339,8 +322,6 @@ function computePitchTrackAndBoundaryCurve(
     envRms[f] = sumEnv / Math.max(1, cntEnv);
   }
 
-  // 建立「有聲母音專屬 F1-F3 共振峰頻帶 (Mel bins 10..48, 約 250Hz~3400Hz)」之前綴積分表：
-  // 僅累加具備聲帶諧波 (stepHarmonicity >= calibratedHarmGate) 之母音幀，徹底排除無聲擦音 (/zh/, /ch/, /s/) 造成的假性頻譜跳變！
   const formantBins = 38;
   const binOffset = 10;
   const hasFbank = Array.isArray(allFbankFrames) && allFbankFrames.length >= numFrames;
@@ -384,7 +365,7 @@ function computePitchTrackAndBoundaryCurve(
   const stepDbFloor = formulaCalibration?.stepDbDiffFloor ?? 3.5;
   const cosDistFloor = formulaCalibration?.formantCosDistFloor ?? 0.22;
 
-  const winF = 55; // 550ms 左右對比視窗
+  const winF = 55;
   for (let f = 58; f < numFrames - 58; f += 2) {
     let sumL = 0.0;
     let sumR = 0.0;
@@ -400,7 +381,6 @@ function computePitchTrackAndBoundaryCurve(
 
     const dip = Math.max(0.0, 1.0 - envRms[f] / (locAvg + 1e-5));
 
-    // 左右視窗分貝階躍 (捕捉遠距小聲語者切換至近距大聲語者之零停頓換人點，如 00:06.46 女2->女1「不算」)
     const dbDiff = Math.abs(20.0 * Math.log10((rmsR + 1e-5) / (rmsL + 1e-5)));
     const stepJump = Math.max(0.0, Math.min(1.0, (dbDiff - stepDbFloor) / 8.0));
 
@@ -463,10 +443,6 @@ function computePitchTrackAndBoundaryCurve(
   };
 }
 
-/**
- * 軟性基頻差異懲罰 (Soft Pitch Compatibility Penalty)：
- * 支援由預分析公式校準層動態傳入之免罰半音容忍度 (toleranceSemitones)
- */
 function computeSoftPitchCompatibilityPenalty(
   f0A: number,
   f0B: number,
@@ -479,9 +455,6 @@ function computeSoftPitchCompatibilityPenalty(
   return Math.min(maxPen, (semitoneDiff - toleranceSemitones) * 0.026);
 }
 
-/**
- * 四狀態雙門檻遲滯平滑狀態機 (4-State Hysteresis State Machine)
- */
 export function runFourStateHysteresisBinarization(
   probTrace: Float32Array,
   frameStepSec: number,
@@ -547,10 +520,6 @@ export function runFourStateHysteresisBinarization(
   return segments;
 }
 
-/**
- * 靜音谷底最佳化視窗切分演算法 (VAD-Guided Optimal Chunking: 12~20 秒)
- * 優先切在語者換人且伴隨靜音谷底處，確保送入 Whisper 的視窗語境完整且不跨句切斷。
- */
 export function buildOptimalVadGuidedAsrWindows(
   frameVadProbs: Float32Array,
   frameRms: Float32Array,
@@ -771,7 +740,7 @@ export class KaldiFbankExtractor {
       for (let n = 0; n < this.frameLength; n++) {
         const rawSample = pcmFloat32[offset + n];
         rawEnergySq += rawSample * rawSample;
-        const scaledVal = rawSample * 32768.0; // WeSpeaker Int16 scale
+        const scaledVal = rawSample * 32768.0;
         frameBuf[n] = scaledVal;
         mean += scaledVal;
       }
@@ -858,11 +827,6 @@ export class KaldiFbankExtractor {
     return { globalChannelMean, globalChannelStd };
   }
 
-  /**
-   * 【根因修正 3】：時長自適應全局/局部混合 CMN (Duration-Adaptive Hybrid CMN)
-   * 當片段較短 (< 1.5s，如「不算」、「對」) 時，按比例混入 globalChannelMean，
-   * 防止單一母音之局部均值把語者個人的靜態聲道共振峰特徵一併減除！
-   */
   public sliceAndApplyCMN(
     allFrames: Float32Array[],
     startFrame: number,
@@ -1129,10 +1093,14 @@ class SileroVadRunner {
       if (!loaded) return false;
 
       this.ortModule = await import('onnxruntime-web');
+      if (this.ortModule.env) {
+        this.ortModule.env.logLevel = 'error';
+      }
       const wasmRootUrl = resolvePublicRootUrl('wasm/');
       if (this.ortModule.env?.wasm) {
         this.ortModule.env.wasm.wasmPaths = wasmRootUrl;
         this.ortModule.env.wasm.simd = true;
+        this.ortModule.env.wasm.numThreads = 1;
       }
 
       this.session = await this.ortModule.InferenceSession.create(
@@ -1149,6 +1117,17 @@ class SileroVadRunner {
     } catch {
       return false;
     }
+  }
+
+  public async release(): Promise<void> {
+    if (this.session && typeof this.session.release === 'function') {
+      try {
+        await this.session.release();
+      } catch {
+        // ignore
+      }
+    }
+    this.session = null;
   }
 
   public async computeFrameVadProbabilities(
@@ -1371,10 +1350,6 @@ export class AutoTuningSpectralClusterer {
     return { eigenvalues: sortedVals, eigenvectors: sortedVecs };
   }
 
-  /**
-   * 【根因修正】：修正 E2CP 約束傳播中對角線 Z[i,i]=1.0 導致全矩陣親和度膨脹 (>0.65) 的問題
-   * 僅針對非對角線之明確時序約束項傳播，保持原始超球面正交性！
-   */
   public static applyE2cpConstraintPropagation(
     affinityMatrix: Float64Array,
     N: number,
@@ -1452,11 +1427,6 @@ export class AutoTuningSpectralClusterer {
     return Astar;
   }
 
-  /**
-   * 階層式餘弦聚類 (Average-Linkage AHC)
-   * 在 256-dim WeSpeaker 超球面上，同語者餘弦相似度分佈於 0.45~0.88，不同語者 (含同性別) 分佈於 -0.10~0.25，
-   * 設定 stopSimThreshold = 0.28 可精準切開同性別不同語者 (如女聲1 vs 女聲2、男聲1 vs 男聲2)！
-   */
   public static clusterManifoldAhcCosine(
     affinityMatrix: Float64Array,
     N: number,
@@ -1510,7 +1480,6 @@ export class AutoTuningSpectralClusterer {
       clusters.splice(bestB, 1);
     }
 
-    // 僅將單一孤立錨點 (len === 1) 併入最相近之有效群，完整保護擁有 >= 2 個錨點的少數發言者 (如女聲2)！
     while (clusters.length > effectiveMinK) {
       const singleIdx = clusters.findIndex((c) => c.length === 1);
       if (singleIdx === -1) break;
@@ -1542,11 +1511,6 @@ export class AutoTuningSpectralClusterer {
     return { labels, optimalK: clusters.length };
   }
 
-  /**
-   * 密度感知譜聚類 (Density-Aware NME-SC + 子群純度分裂保護)
-   * 解決傳統拉普拉斯最大特徵間隙在混合性別會議中永遠卡在 k=2 (男 vs 女) 的瓶頸：
-   * 若譜聚類初步分群內部的離散子群相似度低於 stopSimThreshold，自動分裂出同性別獨立語者！
-   */
   public static clusterManifoldNmeSc(
     affinityMatrix: Float64Array,
     N: number,
@@ -1558,7 +1522,6 @@ export class AutoTuningSpectralClusterer {
       return { labels: new Int32Array(N).fill(0), optimalK: 1, optimalP: 1 };
     }
 
-    // 先透過 AHC 探測自然聲學群數 K_ahc，防止最大特徵間隙被男女宏觀差異鎖死在 k=2
     const ahcProbe = this.clusterManifoldAhcCosine(
       affinityMatrix,
       N,
@@ -1591,7 +1554,6 @@ export class AutoTuningSpectralClusterer {
       }
     }
 
-    // 若譜特徵間隙停在 k=2 但 AHC 確認存在 >2 個正交聲紋群 (如 2女+2男)，採用兩者之較高解析度 K
     const targetK = Math.min(
       effectiveMaxK,
       Math.max(bestK, ahcProbe.optimalK)
@@ -1627,11 +1589,6 @@ export class AutoTuningSpectralClusterer {
     return { labels, optimalK: targetK, optimalP: p };
   }
 
-  /**
-   * 【根因修正 5】：針對超球面餘弦空間校準之溫和先驗 VBx 變分精煉器 (Tempered-Prior Cosine VBx)
-   * 解決舊版因未載入外部 PLDA 特徵值且直接套用 F_a=0.07 導致先驗 \pi 坍縮為 [1, 0, 0, 0] 的致命 Bug！
-   * 採用阻尼先驗 \pi_s^\tau (\tau = 0.25) 防止高發言量語者 (女聲1) 吞併少數發言者 (女聲2)。
-   */
   public static refineClustersWithVariationalBayesVbx(
     embeddings: Float32Array[],
     initialLabels: Int32Array,
@@ -1681,8 +1638,6 @@ export class AutoTuningSpectralClusterer {
         for (let n = 0; n < N; n++) {
           const g = gamma[n][s];
           sumG += g;
-          // 【核心成員閘控質心更新 (Core-Member Gated Centroid Update)】：
-          // 僅累加對該語者責任 >= 0.45 之核心錨點，徹底防止高發言量主講人 (如女聲1, 58段) 透過微小軟責任污染少數發言者 (如女聲2, 5段) 之質心！
           if (g >= coreGate) {
             coreCount++;
             const emb = embeddings[n];
@@ -1730,7 +1685,6 @@ export class AutoTuningSpectralClusterer {
       }
     }
 
-    // 計算每個語者群的有效責任總和，只要有效錨點數 >= 1.4 個即完整保留
     const clusterMass = new Float64Array(S);
     for (let n = 0; n < N; n++) {
       for (let s = 0; s < S; s++) {
@@ -1928,8 +1882,6 @@ class WeSpeakerOnnxRunner {
   constructor(private config: DiarizationConfig) {}
 
   public async init(): Promise<boolean> {
-    // 僅在「Mode A：極速輕量 DSP 模式」強制跳過 ONNX；
-    // Mode 0 / Mode B / Mode C 只要 /public/models/ 下有 wespeaker_voxceleb_resnet34_int8.onnx 皆自動啟用 256 維神經聲紋！
     if (this.config.engineMode === 'mode_a_classic') {
       this.checked = true;
       this.embeddingDim = 64;
@@ -1955,13 +1907,17 @@ class WeSpeakerOnnxRunner {
       if (!loaded) return false;
 
       this.ortModule = await import('onnxruntime-web');
+      if (this.ortModule.env) {
+        this.ortModule.env.logLevel = 'error';
+      }
       const wasmRootUrl = resolvePublicRootUrl('wasm/');
       if (this.ortModule.env?.wasm) {
         this.ortModule.env.wasm.wasmPaths = wasmRootUrl;
         this.ortModule.env.wasm.simd = true;
+        // 限制 WASM 執行緒數 <= 2，避免開啟過多 SharedArrayBuffer Pthread 佔用系統已認可記憶體
         this.ortModule.env.wasm.numThreads = Math.max(
           1,
-          Math.min(4, Math.floor((navigator.hardwareConcurrency || 4) / 2))
+          Math.min(2, Math.floor((navigator.hardwareConcurrency || 4) / 2))
         );
       }
 
@@ -2000,6 +1956,17 @@ class WeSpeakerOnnxRunner {
     }
   }
 
+  public async release(): Promise<void> {
+    if (this.session && typeof this.session.release === 'function') {
+      try {
+        await this.session.release();
+      } catch {
+        // ignore
+      }
+    }
+    this.session = null;
+  }
+
   public isReady(): boolean {
     return Boolean(this.session && this.ortModule);
   }
@@ -2036,8 +2003,6 @@ class WeSpeakerOnnxRunner {
       const ort = this.ortModule;
       const inputNames: string[] = this.session.inputNames || ['feats'];
 
-      // 針對短於 1.0 秒 (< 100 幀，如「不算」、「對」) 的語音段進行週期延展 (Tiling to 100 frames)，
-      // 防止 ResNet34 統計池化層 (TSTP) 在短片段上因時序維度過短而方差失真！
       let effectiveFrames = numFrames;
       let effectiveCmn = cmnTensor;
       if (numFrames > 0 && numFrames < 100) {
@@ -2120,9 +2085,6 @@ interface MacroAnchorNode {
   embedding: Float32Array;
 }
 
-/**
- * 建構「語者專屬虛擬音軌批次 (SpeakerTrackBatch[])」
- */
 function buildVirtualSpeakerTrackBatches(
   fineTurns: FineDiarizationTurn[],
   chunkStartSec: number,
@@ -2296,7 +2258,6 @@ self.onmessage = async (event: MessageEvent) => {
       data.diarizationConfig?.backchannelMarginThreshold ?? 0.12,
     enableAcousticDivergencePreproc:
       data.diarizationConfig?.enableAcousticDivergencePreproc ?? true,
-    // 強制預設關閉會造成跨語者錯位拼接的 Virtual Speaker-Track Stitching
     enableVirtualSpeakerTrackStitching:
       data.diarizationConfig?.enableVirtualSpeakerTrackStitching ?? false,
     embeddingExcludeOverlap:
@@ -2320,11 +2281,11 @@ self.onmessage = async (event: MessageEvent) => {
     (chunkStartSec + samples.length / sampleRate).toFixed(2)
   );
 
-  try {
-    const fbankExtractor = new KaldiFbankExtractor();
-    const onnxRunner = new WeSpeakerOnnxRunner(diarConfig);
-    const sileroRunner = new SileroVadRunner(diarConfig);
+  const fbankExtractor = new KaldiFbankExtractor();
+  const onnxRunner = new WeSpeakerOnnxRunner(diarConfig);
+  const sileroRunner = new SileroVadRunner(diarConfig);
 
+  try {
     await Promise.all([onnxRunner.init(), sileroRunner.init()]);
 
     self.postMessage({
@@ -2342,6 +2303,7 @@ self.onmessage = async (event: MessageEvent) => {
     } = fbankExtractor.computeGlobalFbank(samples);
 
     if (numFrames < 40) {
+      await Promise.all([onnxRunner.release(), sileroRunner.release()]);
       self.postMessage({
         type: 'DIARIZE_SUCCESS',
         turns: [],
@@ -2352,8 +2314,6 @@ self.onmessage = async (event: MessageEvent) => {
       return;
     }
 
-    // 【通用自適應雙分位數底噪估算】：結合 5% 底噪分位數 (P05) 與 75% 語音動態範圍分位數 (P75)，
-    // 兼顧高密度連續討論與稀疏發言會議，保護遠端或較小聲與會者的語音不被當成靜音切碎
     const sortedRms = Array.from(frameRms).sort((a, b) => a - b);
     const noiseQuantile = formulaCal?.vadNoiseQuantile ?? 0.05;
     const speechMult = formulaCal?.vadSpeechMultiplier ?? 1.65;
@@ -2385,6 +2345,9 @@ self.onmessage = async (event: MessageEvent) => {
       vadThreshold
     );
 
+    // Silero VAD 完成後立即釋放其 ONNX Session 降低峰值記憶體
+    await sileroRunner.release();
+
     const {
       stepHarmonicity,
       calibratedHarmGate,
@@ -2400,7 +2363,9 @@ self.onmessage = async (event: MessageEvent) => {
       formulaCal
     );
 
-    // 【自適應非諧波摩擦噪音抑制 (Calibrated Paper Rustling & Friction Noise Suppression)】：
+    // 原始 PCM 樣本於基頻軌跡提取後即可釋放參考
+    samples = null;
+
     const frictionCeiling =
       formulaCal?.frictionHarmonicCeiling ??
       Math.max(0.26, Math.min(0.35, calibratedHarmGate * 0.82));
@@ -2419,10 +2384,6 @@ self.onmessage = async (event: MessageEvent) => {
       }
     }
 
-    // =========================================================================
-    // 【第一階段 Stage 1：Macro-Anchor Discovery (1.20s ~ 2.15s 純淨長句錨點聚類)】
-    // 只取 1.2s~2.15s 的高信噪比視窗定錨分群，精確鎖定全場所有獨立語者 (包含僅發言數次的少數語者如女聲2)！
-    // =========================================================================
     const macroAnchorBounds: Array<{ startF: number; endF: number }> = [];
     let inSp = false;
     let sf = 0;
@@ -2472,8 +2433,6 @@ self.onmessage = async (event: MessageEvent) => {
       macroAnchorBounds.push({ startF: sf, endF: numFrames });
     }
 
-    // 過濾掉純紙張摩擦、翻書或桌椅碰撞等非諧波雜音區段 (voicedRatio < 0.40 或 medianHarm < 0.48)，
-    // 確保第一階段定錨聚類 100% 由真實人聲母音構成！
     const harmonicMacroBounds = macroAnchorBounds.filter((b) => {
       const { voicedRatio, medianHarm } = queryVoicedHarmonicRatio(
         b.startF,
@@ -2486,7 +2445,6 @@ self.onmessage = async (event: MessageEvent) => {
       macroAnchorBounds.push(...harmonicMacroBounds);
     }
 
-    // 若音檔極短 (< 10s) 導致 >= 1.18s 的視窗不足，放寬至 >= 0.70s
     if (macroAnchorBounds.length < Math.max(3, minSpeakers)) {
       macroAnchorBounds.length = 0;
       for (let f = 0; f + 90 <= numFrames; f += 75) {
@@ -2545,7 +2503,6 @@ self.onmessage = async (event: MessageEvent) => {
     const embDim = macroAnchors[0]?.embedding.length || 256;
     const isOnnx256 = embDim >= 128;
 
-    // 建立 Macro-Anchor 親和矩陣 A (結合 WeSpeaker 餘弦相似度與軟性基頻相容懲罰)
     const anchorAffinity = new Float64Array(M * M);
     for (let i = 0; i < M; i++) {
       anchorAffinity[i * M + i] = 1.0;
@@ -2632,7 +2589,6 @@ self.onmessage = async (event: MessageEvent) => {
       const medF0 = pitches[Math.floor(pitches.length / 2)] || 155;
       const normCentroid = l2Normalize(meanVec);
 
-      // 每個語者群固定挑選與質心最接近的前 4 個高純度代表錨點，徹底消除因群大小不同造成的 max-bias！
       const topExemplars = memberIndices
         .map((mIdx) => ({
           mIdx,
@@ -2653,9 +2609,6 @@ self.onmessage = async (event: MessageEvent) => {
       });
     }
 
-    // 【超球面 L2 正規化質心衛星群收斂 (Hyperspherical L2 Centroid Satellite Consolidation)】：
-    // 修正 256 維超球面上當同一主講人發言極多 (如 >50 段) 時，未正規化均值範數收縮 (||u|| ~ 0.60)
-    // 導致同一語者的少數高音/笑聲片段分裂為獨立衛星群 (如語者 04 與語者 01 同人分裂) 的問題！
     while (localClusters.length > minSpeakers) {
       let bestI = -1;
       let bestJ = -1;
@@ -2741,12 +2694,10 @@ self.onmessage = async (event: MessageEvent) => {
       localClusters.splice(removeIdx, 1);
     }
 
-    // 依首次出場時間或累積發言排序並限制於 maxSpeakers 內
     if (localClusters.length > maxSpeakers) {
       localClusters.sort((a, b) => b.totalDurSec - a.totalDurSec);
       localClusters.length = maxSpeakers;
     }
-    // 依首次出場順序排列，讓語者 01、02、03、04 符合時間軸直覺
     localClusters.sort((a, b) => a.earliestStartSec - b.earliestStartSec);
 
     const updatedSpeakers: Speaker[] = existingSpeakers.map((sp) => ({
@@ -2854,7 +2805,6 @@ self.onmessage = async (event: MessageEvent) => {
       }
     }
 
-    // 確保跨 5 分鐘 Macro-Chunk 時，前序區塊已建立之語者（即便在本區塊僅有短促插話而未形成長句群）仍保留於活躍比對庫中
     for (const sp of updatedSpeakers) {
       if (
         !activeProfiles.has(sp.id) &&
@@ -2883,10 +2833,6 @@ self.onmessage = async (event: MessageEvent) => {
       });
     }
 
-    // =========================================================================
-    // 【第二階段 Stage 2：Fine Micro-Turn Attribution (自適應微觀話輪切分與歸屬)】
-    // 利用經 150ms 音節包絡與有聲母音共振峰校準後之 boundaryScoreCurve 切出細粒度子段，再對齊至 Stage 1 鎖定之語者原型庫！
-    // =========================================================================
     const scdSensitivity = diarConfig.scdPeakThreshold ?? 0.22;
     const finePeakCutoff =
       formulaCal?.scdPeakCutoff ??
@@ -2910,7 +2856,6 @@ self.onmessage = async (event: MessageEvent) => {
         silFrames = 0;
         const curLen = fCursor - sf;
 
-        // 若滿 0.55s 且遇到顯著「基頻跳變 + 有聲共振峰通量 + 分貝階躍 + 150ms 音節包絡谷底」波峰，立即切開微觀話輪
         if (curLen >= 55 && boundaryScoreCurve[fCursor] >= finePeakCutoff) {
           const checkStart = Math.max(sf + 45, fCursor - 15);
           const checkEnd = Math.min(numFrames, fCursor + 15);
@@ -2929,8 +2874,6 @@ self.onmessage = async (event: MessageEvent) => {
           }
         }
 
-        // 依預分析校準之微觀視窗上限 (預設 1.65s = 165 幀)，在 [0.85s .. maxMicroTurnFrames+0.1s] 尋找最佳邊界切點，
-        // 確保連續無停頓搶話區段（如 00:04~00:11 之 4 次快速換人）能逐一精確切出並歸屬正確語者！
         if (curLen >= maxMicroTurnFrames) {
           const wStart = sf + 85;
           const wEnd = Math.min(numFrames, sf + maxMicroTurnFrames + 10);
@@ -2995,7 +2938,6 @@ self.onmessage = async (event: MessageEvent) => {
         b.startF,
         b.endF
       );
-      // 若該微觀區段完全缺乏聲帶諧波 (如純翻紙、碰撞或麥克風摩擦雜音)，直接跳過不產生假語者話輪
       if (voicedRatio < 0.22 && medianHarm < 0.42) {
         continue;
       }
@@ -3037,7 +2979,6 @@ self.onmessage = async (event: MessageEvent) => {
           prof.f0Hz,
           0.14
         );
-        // 採用質心與前 4 代表錨點之平均相似度，消除大群對小群 (如女聲1對女聲2) 的極值吸附偏差！
         const compScore = 0.6 * cSim + 0.4 * avgASim - pitchPen;
         rawScores[pIdx] = compScore;
 
@@ -3126,7 +3067,10 @@ self.onmessage = async (event: MessageEvent) => {
       }
     }
 
-    // 合併相鄰同語者且停頓 <= 0.55s 之微觀子段，形成乾淨連續的語者話輪 (FineDiarizationTurn[])
+    // 顯式釋放 WeSpeaker ONNX Session 與 Fbank 矩陣，讓瀏覽器立即回收 WASM 堆積記憶體
+    await onnxRunner.release();
+    allFbankFrames.length = 0;
+
     const fineTimelineTurns: FineDiarizationTurn[] = [];
     for (const item of rawFineTurns) {
       const prev = fineTimelineTurns[fineTimelineTurns.length - 1];
@@ -3151,8 +3095,6 @@ self.onmessage = async (event: MessageEvent) => {
       }
     }
 
-    // 雙向同語者連續子句與換氣保護：
-    // (A) 前向延續：若相鄰兩話輪間隔極短 (<= 0.42s)、基頻相近 (< 2.8 半音)，且後段聲學邊際較小 (< 0.075) 且無明顯邊界跳變，延續前段語者身份
     for (let i = 1; i < fineTimelineTurns.length; i++) {
       const prev = fineTimelineTurns[i - 1];
       const curr = fineTimelineTurns[i];
@@ -3171,9 +3113,6 @@ self.onmessage = async (event: MessageEvent) => {
       }
     }
 
-    // 註：Core-Gated VBx 已確保同語者起手與後段分入同一質心群，無須強制覆寫前段獨立語者
-
-    // 消除夾在同語者之間、極短 (< 0.35s) 且無明顯邊界跳變之單一毛刺
     for (let i = 1; i < fineTimelineTurns.length - 1; i++) {
       const prev = fineTimelineTurns[i - 1];
       const curr = fineTimelineTurns[i];
@@ -3230,6 +3169,7 @@ self.onmessage = async (event: MessageEvent) => {
       posteriorMatrix,
     });
   } catch (err) {
+    await Promise.all([onnxRunner.release(), sileroRunner.release()]);
     self.postMessage({
       type: 'DIARIZE_ERROR',
       error: (err as Error).message || '語者分離發生未知錯誤',
