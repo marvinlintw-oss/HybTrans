@@ -716,26 +716,47 @@ export interface EngineConfig {
 // 【會議 AI 摘要、重要結論與行動事項報告 (`MeetingMinutesReport`)】
 // ============================================================================
 
+export interface MeetingMinutesSpeakerStat {
+  speakerId: string;
+  speakerName: string;
+  turnCount: number;
+  charCount: number;
+}
+
 export interface MeetingTopicDecisionItem {
   topic: string;
+  /** 討論現況與重點（與 keyPoints 雙向同步，相容 UI 與匯出器） */
+  discussionPoints: string;
   keyPoints: string;
+  /** 決議與裁示（與 conclusion 雙向同步，相容 UI 與匯出器） */
+  decision: string;
   conclusion: string;
+  /** 對應會議時間區間（例如 "00:00–02:15"） */
+  timeRange?: string;
 }
 
 export interface MeetingActionItem {
   id: string;
   task: string;
   owner: string;
+  /** 目標時程或期限（與 deadlineOrTimeline 雙向同步，相容 UI 與匯出器） */
+  deadline: string;
   deadlineOrTimeline: string;
+  /** 備註 / 依據（與 statusNote 雙向同步，相容 UI 與匯出器） */
+  contextNote?: string;
   statusNote: string;
 }
 
 export interface MeetingMinutesReport {
   generatedAt: string;
   engineUsed: 'gemini_cloud' | 'local_webllm' | 'hybrid_discourse_analyzer';
+  /** 會議標題（與 meetingTitle 雙向同步，相容 UI 與匯出器） */
+  title: string;
   meetingTitle: string;
   executiveSummary: string;
   keyConclusions: string[];
   topicBreakdowns: MeetingTopicDecisionItem[];
   actionItems: MeetingActionItem[];
+  /** 與會語者發言輪次與字數統計 */
+  speakerStats: MeetingMinutesSpeakerStat[];
 }
