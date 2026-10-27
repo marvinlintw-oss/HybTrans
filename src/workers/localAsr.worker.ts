@@ -438,7 +438,9 @@ async function purgeOversizedLegacyModelCache(): Promise<void> {
         req.url.includes('whisper-large-v3-turbo') &&
         (req.url.endsWith('/encoder_model_fp16.onnx') ||
           req.url.endsWith('/encoder_model.onnx') ||
-          req.url.endsWith('/encoder_model.onnx_data'))
+          req.url.endsWith('/encoder_model.onnx_data') ||
+          req.url.endsWith('/encoder_model_quantized.onnx') ||
+          req.url.endsWith('/encoder_model_int8.onnx'))
       ) {
         await cache.delete(req);
       }
@@ -647,18 +649,11 @@ async function ensureAsrPipeline(
   isIntegratedOrLowMemDevice =
     isIntegratedGpu || maxBufferSizeMB < 2048 || granularityTier === 'eco_safe';
 
-  // 【黃金混合量化策略】：
-  // - 標準平衡 (`balanced_pro`) 與高精細模式 (`ultra_studio`)：Encoder 採用 8-bit `q8` (645MB，保留完整頻譜注意力精度，解決殘響環境把「公有空間」聽成「風天」之失真)，Decoder 採用 `q4f16 / q4` (194MB)，總計 839MB，兼顧零 OOM 與高辨識率！
-  // - 效能安全模式 (`eco_safe`) 或極低顯存裝置 (< 768MB)：Encoder 與 Decoder 皆採用 `q4f16 / q4` (564MB)。
-  const useHighPrecisionQ8Encoder =
-    granularityTier !== 'eco_safe' && maxBufferSizeMB >= 768;
-
-  const preferredWebGpuDtype = useHighPrecisionQ8Encoder
-    ? ({
-        encoder_model: 'q8',
-        decoder_model_merged: supportsFp16 ? 'q4f16' : 'q4',
-      } as const)
-    : supportsFp16
+  // 【WebGPU 原生精度對齊策略】：
+  // WebGPU Execution Provider 必須使 Encoder 與 Decoder 同時採用對齊之 4-bit 浮點激活格式 (`q4f16` 或 `q4`)，
+  // 嚴禁在 WebGPU 混用 `encoder_model: 'q8'` (CPU 專用動態整數量化 ConvInteger/MatMulInteger + fp32 激活) 與 `decoder_model_merged: 'q4f16'`，
+  // 否則會因跨注意力張量精度不匹配導致解碼器退化為單一英文詞 (如 "but")！
+  const preferredWebGpuDtype = supportsFp16
     ? ({
         encoder_model: 'q4f16',
         decoder_model_merged: 'q4f16',
@@ -1193,17 +1188,13 @@ async function runWhisperWithWordTimestampsAndFallback(
   } | null = null;
   let isWordLevel = false;
 
-  const safeBeams = isIntegratedOrLowMemDevice
-    ? 1
-    : Math.max(1, Math.min(3, Math.round(asrBeamSize || 1)));
-  const effectiveChunkSec =
-    safeBeams === 1 ? Math.min(25, chunkLengthSec) : chunkLengthSec;
-  const effectiveStrideSec =
-    safeBeams === 1
-      ? Math.min(3, strideLengthSec)
-      : safeBeams >= 3
-      ? Math.max(6, strideLengthSec)
-      : strideLengthSec;
+  void asrBeamSize;
+  const effectiveChunkSec = isIntegratedOrLowMemDevice
+    ? Math.min(25, chunkLengthSec)
+    : chunkLengthSec;
+  const effectiveStrideSec = isIntegratedOrLowMemDevice
+    ? Math.min(3, strideLengthSec)
+    : strideLengthSec;
 
   try {
     output = await transcriber(audioInput, {
@@ -1212,7 +1203,6 @@ async function runWhisperWithWordTimestampsAndFallback(
       return_timestamps: true,
       chunk_length_s: effectiveChunkSec,
       stride_length_s: effectiveStrideSec,
-      num_beams: safeBeams,
     });
     isWordLevel = false;
   } catch {
@@ -1242,8 +1232,13 @@ async function runWhisperWithWordTimestampsAndFallback(
       ? output.text
       : (output?.chunks || []).map((c) => c.text).join('');
   const compRatio = estimateRepetitionCompressionRatio(fullText);
+  const trimmedFull = fullText.trim();
+  const isDegenerateAsciiStub =
+    resolvedWhisperLang === 'chinese' &&
+    audioInput.length >= 16000 * 1.5 &&
+    /^[a-zA-Z,.?!\s]{1,12}$/.test(trimmedFull);
 
-  if (compRatio > 2.4) {
+  if (compRatio > 2.4 || isDegenerateAsciiStub) {
     console.warn(
       `⚠️ [LocalASR] 偵測到壓縮比異常 (${compRatio} > 2.4)，啟動防跳針退火重試...`
     );
