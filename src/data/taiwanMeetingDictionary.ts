@@ -45,6 +45,8 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
       '原名會',
       '人民會',
       '員民會',
+      '援會',
+      '園會',
     ],
   },
   {
@@ -337,7 +339,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '產業培訓',
     category: 'project',
-    aliases: ['產業陪訓', '產業賠訓', '展業培訓'],
+    aliases: ['產業陪訓', '產業賠訓', '展業培訓', '產業培訊'],
   },
   {
     term: '配合款',
@@ -402,6 +404,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
     term: '公有空間活化',
     category: 'project',
     aliases: [
+      '風空間活化',
       '風天活化',
       '風間活化',
       '公空間活化',
@@ -413,7 +416,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '公有空間',
     category: 'project',
-    aliases: ['罐空間', '光有空間', '共有空間', '公空間'],
+    aliases: ['罐空間', '罐中間', '風空間', '光有空間', '共有空間', '公空間'],
   },
   {
     term: '優先推動區',
@@ -429,7 +432,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '苦茶油',
     category: 'project',
-    aliases: ['埔茶油', '古茶油', '苦茶由', '苦茶遊'],
+    aliases: ['股材油', '股茶油', '埔茶油', '古茶油', '苦茶由', '苦茶遊'],
   },
   {
     term: '幸福巴士',
@@ -519,12 +522,12 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '尖石',
     category: 'jargon',
-    aliases: ['監時', '堅石', '兼時', '間時'],
+    aliases: ['監持', '監時', '堅石', '兼時', '間時', '間持'],
   },
   {
     term: '五峰',
     category: 'jargon',
-    aliases: ['武功', '武風', '五風', '午峰'],
+    aliases: ['武蜂', '武功', '武風', '五風', '午峰', '五蜂'],
   },
   {
     term: '石磊部落',
