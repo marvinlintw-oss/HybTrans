@@ -316,8 +316,16 @@ const COMMON_STOP_WORDS = new Set([
   '覺得', '應該', '知道', '部分', '問題', '意思', '可能', '已經', '還是',
   '然後', '是說', '上次', '不會', '是要', '那我', '對對', '不用', '他要',
   '他的', '我的', '你的', '比較', '其實', '基本', '後面', '裡面', '怎麼',
-  '什麼', '那邊', '這邊', '大家', '有些', '確定', '建議', '發現', '開始',
+  '什麼', '甚麼', '那邊', '這邊', '大家', '有些', '確定', '建議', '發現', '開始',
   '出來', '起來', '過去', '進來', '東西', '事情', '的話', '來說', '這件',
+  '狀況', '工項', '協助', '目前', '溝通', '路線', '辦法', '方向', '類別',
+  '經費', '編列', '資料', '補充', '工程', '補助', '規劃', '設計', '接觸',
+  '專員', '對口', '聯繫', '細節', '持續', '當中', '通過', '納入', '會議',
+  '會報', '推動', '活化', '空間', '主持', '主席', '報告', '案子', '品牌',
+  '計畫', '分線', '執行', '單位', '不同', '總共', '只有', '兩個', '三個',
+  '另外', '前面', '上面', '下面', '謝謝', '很快', '責任', '作業', '影響',
+  '其中', '五處', '三處', '兩處', '幾處', '早上', '下午', '禮拜', '工作',
+  '創生', '釐清', '偏向', '調整', '申請', '以及', '還有', '還沒', '而已',
 ]);
 
 const BAD_GRAMMATICAL_EDGE_REGEX =
@@ -500,13 +508,34 @@ export function analyzeCorpusStatisticalEvidence(
     }
   };
 
+  const fullCorpusText = converter(
+    `${docSummary}\n${allSegments
+      .map((s) => s.words.map((w) => w.text).join(''))
+      .join('\n')}`
+  );
+
   for (const d of dictionary) {
-    if (d.term.length >= 2 && d.term.length <= 4) {
-      registerOrAdd(d.term, 20.0, true);
+    const cleanT = converter(d.term.trim());
+    if (cleanT.length >= 2 && cleanT.length <= 4) {
+      const { typoAliases } = classifyDictEntryAliases(d);
+      const isMentionedInCorpus =
+        fullCorpusText.includes(cleanT) ||
+        typoAliases.some((al) => fullCorpusText.includes(al));
+      if (isMentionedInCorpus) {
+        registerOrAdd(cleanT, 20.0, true);
+      } else {
+        priorVerifiedList.push({
+          term: cleanT,
+          exactSig: toPhoneticSignature(cleanT),
+          fuzzySig: toAccentInsensitivePhoneticKey(cleanT),
+        });
+      }
     }
   }
   for (const sf of spokenShortFormSet) {
-    registerOrAdd(sf, 16.0, true);
+    if (fullCorpusText.includes(sf)) {
+      registerOrAdd(sf, 16.0, true);
+    }
   }
   const summaryWords = docSummary.match(/[\u4e00-\u9fa5]{2,4}/g) || [];
   for (const sw of summaryWords) {
@@ -622,28 +651,11 @@ export function evaluateSentenceIntelligibility(
     segFuzzySyls.map((s) => s[0] || '').filter(Boolean)
   );
 
+  void segInitialSet;
   for (const d of dictionary) {
-    const cleanT = converter(d.term.trim());
     const { typoAliases } = classifyDictEntryAliases(d);
     for (const cleanAl of typoAliases) {
       aliasSet.add(cleanAl);
-    }
-    if (!evidenceMap.has(cleanT) && cleanT.length >= 2 && cleanT.length <= 4) {
-      const fSig = toAccentInsensitivePhoneticKey(cleanT);
-      const hasInitialOverlap = fSig
-        .split('-')
-        .some((syl) => syl && segInitialSet.has(syl[0]));
-      if (hasInitialOverlap) {
-        highSovereigntyEntities.push({
-          term: cleanT,
-          exactSig: toPhoneticSignature(cleanT),
-          fuzzySig: fSig,
-          evidenceScore: 22.0,
-          compoundProductivity: 3,
-          sovereigntyScore: 34.0,
-          isPriorVerified: true,
-        });
-      }
     }
   }
 
@@ -788,9 +800,20 @@ export function evaluateSentenceIntelligibility(
   }
 
   let maxPhoneticGravityTension = 0.0;
+  const tokenBoundarySet = new Set<number>([0]);
+  let accCharLen = 0;
+  for (const w of seg.words) {
+    const wClean = converter(w.text).replace(/[，。？！、；：,.?!\s]+$/g, "");
+    tokenBoundarySet.add(accCharLen + wClean.length);
+    accCharLen += converter(w.text).length;
+    tokenBoundarySet.add(accCharLen);
+  }
 
   for (let len = 4; len >= 2; len--) {
     for (let i = 0; i <= fullText.length - len; i++) {
+      if (!tokenBoundarySet.has(i) || !tokenBoundarySet.has(i + len)) {
+        continue;
+      }
       const sub = fullText.slice(i, i + len);
       if (
         !/^[\u4e00-\u9fa5]+$/.test(sub) ||
@@ -2320,8 +2343,19 @@ export function applySentenceLevelLocalCorrection(
     state.docContextSummary
   );
 
+  const fullCorpusText = converter(
+    `${state.docContextSummary}\n${allSegs
+      .map((s) => s.words.map((w) => w.text).join(''))
+      .join('\n')}`
+  );
+
   for (const vt of verifiedTerms) {
-    if (!evidenceMap.has(vt) && vt.length >= 2 && vt.length <= 4) {
+    if (
+      !evidenceMap.has(vt) &&
+      vt.length >= 2 &&
+      vt.length <= 4 &&
+      fullCorpusText.includes(vt)
+    ) {
       evidenceMap.set(vt, {
         term: vt,
         exactSig: toPhoneticSignature(vt),
@@ -2346,6 +2380,7 @@ export function applySentenceLevelLocalCorrection(
           ? '個人字典'
           : '會議字典';
       for (const alias of typoAliases) {
+        if (COMMON_STOP_WORDS.has(alias)) continue;
         dynamicRules.push({
           wrong: alias,
           right: entry.term.trim(),
@@ -2442,15 +2477,30 @@ export function applySentenceLevelLocalCorrection(
       .replace(/店店面/g, '店面')
       .replace(/翻修修/g, '翻修');
 
+    // 建立自然詞界索引集合，嚴禁跨詞切割（如防止從「協助他們」切出「助他」誤替換）
+    const preTokens = segmentNaturalLanguageTokens(refinedSentence);
+    const refinedBoundarySet = new Set<number>([0]);
+    let bCursor = 0;
+    for (const pt of preTokens) {
+      const ptPure = pt.replace(/[，。？！、；：,.?!\s]+$/g, "");
+      refinedBoundarySet.add(bCursor + ptPure.length);
+      bCursor += pt.length;
+      refinedBoundarySet.add(bCursor);
+    }
+
     for (const [sig, anchor] of exactEntries) {
       const correctTerm = anchor.term;
       if (
         sig.includes('-') &&
         correctTerm.length >= 2 &&
-        correctTerm.length <= 4
+        correctTerm.length <= 4 &&
+        fullCorpusText.includes(correctTerm)
       ) {
         const len = correctTerm.length;
         for (let i = 0; i <= refinedSentence.length - len; i++) {
+          if (!refinedBoundarySet.has(i) || !refinedBoundarySet.has(i + len)) {
+            continue;
+          }
           const sub = refinedSentence.slice(i, i + len);
           if (
             sub !== correctTerm &&
@@ -2464,7 +2514,7 @@ export function applySentenceLevelLocalCorrection(
                 hitReasons.push({
                   wrong: sub,
                   right: correctTerm,
-                  reason: `Pass 1 依實體主權分數 (${anchor.sovereigntyScore}) 自動收斂為「${correctTerm}」`,
+                  reason: `Pass 1 依會議出現實體主權分數 (${anchor.sovereigntyScore}) 自動收斂為「${correctTerm}」`,
                 });
                 refinedSentence =
                   refinedSentence.slice(0, i) +
@@ -2483,10 +2533,14 @@ export function applySentenceLevelLocalCorrection(
         fKey.includes('-') &&
         correctTerm.length >= 2 &&
         correctTerm.length <= 4 &&
-        anchor.sovereigntyScore >= 8.0
+        anchor.sovereigntyScore >= 8.0 &&
+        fullCorpusText.includes(correctTerm)
       ) {
         const len = correctTerm.length;
         for (let i = 0; i <= refinedSentence.length - len; i++) {
+          if (!refinedBoundarySet.has(i) || !refinedBoundarySet.has(i + len)) {
+            continue;
+          }
           const sub = refinedSentence.slice(i, i + len);
           if (
             sub !== correctTerm &&
@@ -2494,12 +2548,7 @@ export function applySentenceLevelLocalCorrection(
             !COMMON_STOP_WORDS.has(sub) &&
             !BAD_GRAMMATICAL_EDGE_REGEX.test(sub)
           ) {
-            const isExactFuzzy = toAccentInsensitivePhoneticKey(sub) === fKey;
-            const isNearPhonetic =
-              !isExactFuzzy &&
-              (anchor.isPriorVerified || anchor.sovereigntyScore >= 10.0) &&
-              computeTaiwanPhoneticDistance(sub, correctTerm) <= 0.16;
-            if (isExactFuzzy || isNearPhonetic) {
+            if (toAccentInsensitivePhoneticKey(sub) === fKey) {
               const subItem = evidenceMap.get(sub);
               const subSov = subItem?.sovereigntyScore || 0.5;
               const subProd = subItem?.compoundProductivity || 0;
@@ -3124,6 +3173,29 @@ export async function executeBoundedQuotaRelisten(params: {
  * 1. 若已設定 Gemini API Key，直接呼叫 `gemini-2.5-flash` 結構化 JSON Schema 生成深度會議紀錄。
  * 2. 若處於 100% 本機離線模式（含整合式內顯共享記憶體保護環境），透過內建「多通道話語結構與承諾句分析引擎」自動萃取執行摘要、討論議題、關鍵結論與行動事項（含負責單位/時間點），零顯存佔用、毫秒級完成！
  */
+/**
+ * 將口語逐字稿句子去蕪存菁，濾除口頭禪與冗贅連接詞，收斂為精煉條列要點
+ */
+function condenseSpokenClauseToCleanPoint(rawText: string): string {
+  let s = rawText.trim();
+  s = s
+    .replace(/^(?:好[，、]?|那[，、]?|對[，、]?|喂[，、]?|報告主席[，、]?|好報告主席[，、]?|目前的話[，、]?|如果說是以?|我可以問一下那個|我們很快[，、]?)+/g, "")
+    .replace(/(?:那個|這個是|那目前就是協助他們去[，、]?|現在就是協助他們|他們現在走的路線會比較像是|因為他們之前的|他們現在要調的就是)/g, "")
+    .replace(/協助他們去/g, "協助")
+    .replace(/協助他們/g, "協助")
+    .replace(/沒有問到細節[，、]?所以還在持續聯繫當中/g, "尚未問到細節，持續聯繫對口中")
+    .replace(/計畫書已經寫得差不多了[，、]?所以他們/g, "計畫書已近完成")
+    .replace(/[，、]{2,}/g, "，")
+    .replace(/^[，、。！？!?\s]+|[，、…\s]+$/g, "");
+  if (s.length > 52) {
+    const parts = s.split(/[，；]/).filter((p) => p.trim().length >= 4);
+    if (parts.length >= 2) {
+      s = parts.slice(0, 3).join("，");
+    }
+  }
+  return s;
+}
+
 export async function generateStructuredMeetingMinutes(params: {
   config?: EngineConfig;
   segments: Segment[];
@@ -3143,21 +3215,20 @@ export async function generateStructuredMeetingMinutes(params: {
     geminiApiKey,
   } = params;
 
-  const effectiveGeminiKey = (geminiApiKey || config?.geminiApiKey || '').trim();
+  const effectiveGeminiKey = (geminiApiKey || config?.geminiApiKey || "").trim();
 
   const formatTime = (sec: number) => {
     const m = Math.floor(sec / 60);
     const s = Math.floor(sec % 60);
-    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   };
 
-  // 統計各與會語者之發言輪次與字數
   const speakerStatMap = new Map<string, MeetingMinutesSpeakerStat>();
   for (const seg of segments) {
     const spId = seg.speakerId;
     const spName = speakers[spId]?.name || spId;
     const charLen = seg.words.reduce(
-      (acc, w) => acc + (w.text || '').trim().length,
+      (acc, w) => acc + (w.text || "").trim().length,
       0
     );
     const existing = speakerStatMap.get(spId);
@@ -3178,7 +3249,6 @@ export async function generateStructuredMeetingMinutes(params: {
     speakerStatMap.values()
   ).sort((a, b) => b.charCount - a.charCount);
 
-  // 先對全文執行高頻專業詞彙探勘，確保摘要引用最精準的詞彙
   const coreTerms = mineAdaptiveHighFreqTerms(
     segments,
     dictionary,
@@ -3187,51 +3257,54 @@ export async function generateStructuredMeetingMinutes(params: {
 
   const formattedLines = segments.map((seg) => {
     const spName = speakers[seg.speakerId]?.name || seg.speakerId;
-    const text = seg.words.map((w) => w.text).join('');
+    const text = seg.words.map((w) => w.text).join("");
     return `[${formatTime(seg.start)}] ${spName}：${text}`;
   });
 
-  // 1. 優先嘗試 Gemini Cloud 結構化生成
+  // 1. 優先嘗試 Gemini Cloud 結構化極簡條列生成
   if (effectiveGeminiKey) {
     try {
       const transcriptSample =
         formattedLines.length <= 260
-          ? formattedLines.join('\n')
+          ? formattedLines.join("\n")
           : [
               ...formattedLines.slice(0, 120),
-              '...(中段略)...',
+              "...(中段略)...",
               ...formattedLines.slice(-120),
-            ].join('\n');
+            ].join("\n");
 
-      const prompt = `請擔任專業資深會議紀錄秘書，根據以下台灣會議逐字稿與背景知識，產出結構嚴謹、可直接呈報長官與分發同仁的【會議 AI 摘要、重要結論與行動事項報告】（請使用繁體中文，回傳純 JSON 格式）：
+      const prompt = `請擔任專業會議秘書，根據以下會議逐字稿，以「極簡條列式」收斂出核心討論要點、重要決議與行動事項（請使用繁體中文，回傳純 JSON 格式）。
+撰寫原則：
+- 嚴禁冗長段落與口語贅字，所有內容皆採「精煉條列要點」，每條控制在 20~42 字以內。
+- 完全忠於會議實際討論內容，不偏離事實、不自行編造未提及之資訊，讓讀者 10 秒內快速掌握核心事項。
 
-【會議背景與核心詞彙】：
-${docContextSummary || '一般專案檢討與協調會議'}
-高頻核心詞：${coreTerms.slice(0, 30).join('、')}
+【會議背景與核心詞】：
+${docContextSummary || "專案進度檢討會議"}
+核心詞：${coreTerms.slice(0, 20).join("、")}
 
 【會議逐字稿內容】：
 ${transcriptSample}
 
 請嚴格依以下 JSON 結構輸出（勿加 Markdown code block）：
 {
-  "meetingTitle": "會議名稱（依內容自動命名，12~26字）",
-  "executiveSummary": "會議執行摘要（120~250字，涵蓋會議目的、核心討論範疇與整體進度概況）",
-  "keyConclusions": ["重要結論或裁示1", "重要結論或裁示2", "重要結論或裁示3"],
+  "meetingTitle": "會議名稱（精簡 10~20 字）",
+  "executiveSummary": "• 核心範疇要點1\n• 核心範疇要點2",
+  "keyConclusions": ["精煉決議要點1（限35字內）", "精煉決議要點2（限35字內）"],
   "topicBreakdowns": [
     {
-      "topic": "議題或案件名稱",
+      "topic": "議題名稱",
       "timeRange": "00:00–02:00",
-      "keyPoints": "討論重點與現況說明",
-      "conclusion": "該案裁示或共識結論"
+      "keyPoints": "精煉現況要點（限35字內）",
+      "conclusion": "裁示或結論（限25字內）"
     }
   ],
   "actionItems": [
     {
       "id": "ACT-01",
-      "task": "具體待辦或後續追蹤行動事項",
-      "owner": "負責語者/單位/對口",
-      "deadlineOrTimeline": "目標時程或期限（如：9月24日、10月中旬、本週內）",
-      "statusNote": "目前狀態或備註"
+      "task": "具體精簡待辦事項（限32字內）",
+      "owner": "負責單位/人員",
+      "deadlineOrTimeline": "時程（如：9月24日、持續追蹤）",
+      "statusNote": "備註"
     }
   ]
 }`;
@@ -3241,14 +3314,14 @@ ${transcriptSample}
           effectiveGeminiKey
         )}`,
         {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             contents: [{ parts: [{ text: prompt }] }],
             generationConfig: {
-              temperature: 0.15,
-              maxOutputTokens: 2048,
-              responseMimeType: 'application/json',
+              temperature: 0.1,
+              maxOutputTokens: 1500,
+              responseMimeType: "application/json",
             },
           }),
         }
@@ -3257,16 +3330,16 @@ ${transcriptSample}
       if (res.ok) {
         const data = await res.json();
         const rawJson = (
-          data?.candidates?.[0]?.content?.parts?.[0]?.text || ''
+          data?.candidates?.[0]?.content?.parts?.[0]?.text || ""
         ).trim();
         const parsed = JSON.parse(rawJson);
         if (parsed && parsed.executiveSummary) {
           const resolvedTitle = converter(
-            String(parsed.meetingTitle || parsed.title || '會議摘要與決議報告')
+            String(parsed.meetingTitle || parsed.title || "會議核心摘要與行動事項")
           );
           return {
             generatedAt: new Date().toISOString(),
-            engineUsed: 'gemini_cloud',
+            engineUsed: "gemini_cloud",
             title: resolvedTitle,
             meetingTitle: resolvedTitle,
             executiveSummary: converter(String(parsed.executiveSummary)),
@@ -3277,16 +3350,16 @@ ${transcriptSample}
               ? parsed.topicBreakdowns.map(
                   (t: Record<string, unknown>): MeetingTopicDecisionItem => {
                     const pts = converter(
-                      String(t.discussionPoints || t.keyPoints || '')
+                      String(t.discussionPoints || t.keyPoints || "")
                     );
                     const dec = converter(
-                      String(t.decision || t.conclusion || '')
+                      String(t.decision || t.conclusion || "")
                     );
                     const tr = t.timeRange
                       ? converter(String(t.timeRange))
                       : undefined;
                     return {
-                      topic: converter(String(t.topic || '')),
+                      topic: converter(String(t.topic || "")),
                       discussionPoints: pts,
                       keyPoints: pts,
                       decision: dec,
@@ -3303,17 +3376,17 @@ ${transcriptSample}
                     idx: number
                   ): MeetingActionItem => {
                     const dl = converter(
-                      String(a.deadline || a.deadlineOrTimeline || '持續追蹤')
+                      String(a.deadline || a.deadlineOrTimeline || "持續追蹤")
                     );
                     const note = converter(
-                      String(a.contextNote || a.statusNote || '進行中')
+                      String(a.contextNote || a.statusNote || "進行中")
                     );
                     return {
                       id: String(
-                        a.id || `ACT-${String(idx + 1).padStart(2, '0')}`
+                        a.id || `ACT-${String(idx + 1).padStart(2, "0")}`
                       ),
-                      task: converter(String(a.task || '')),
-                      owner: converter(String(a.owner || '與會團隊')),
+                      task: converter(String(a.task || "")),
+                      owner: converter(String(a.owner || "與會團隊")),
                       deadline: dl,
                       deadlineOrTimeline: dl,
                       contextNote: note,
@@ -3328,50 +3401,40 @@ ${transcriptSample}
       }
     } catch (err) {
       console.warn(
-        '⚠️ [MeetingMinutes] 雲端摘要生成略過，切換至本機深度話語分析引擎:',
+        "⚠️ [MeetingMinutes] 雲端摘要生成略過，切換至本機精煉條列分析引擎:",
         err
       );
     }
   }
 
-  // 2. 本機零顯存「多通道話語結構與承諾句分析引擎 (Hybrid Discourse Analyzer)」
-  const totalDurMin =
-    segments.length > 0
-      ? Math.max(
-          1,
-          Math.round(
-            (segments[segments.length - 1].end - segments[0].start) / 60
-          )
-        )
-      : 1;
-  const speakerNames = Object.values(speakers).map((s) => s.name);
-  const topKeywords = coreTerms.slice(0, 10);
-
+  // 2. 本機零顯存「精煉條列話語收斂引擎 (Concise Bullet Discourse Analyzer)」
+  const topKeywords = coreTerms.slice(0, 6);
   const inferredTitle =
     topKeywords.length >= 2
-      ? `${topKeywords.slice(0, 3).join('、')}專案進度與決議檢討會議`
-      : '專案進度檢討與決議事項會議';
+      ? `${topKeywords.slice(0, 3).join("、")}進度檢討會議摘要`
+      : "專案進度與決議事項摘要";
 
   const decisionRegex =
-    /(?:決定|決議|確定|限定|只要|原則上|結論|共識|同意|通過|沒有問題|沒問題|就這樣|不要這樣寫|改成|變成|轉成|調整為|朝.+方向|納入.+會議)/;
+    /(?:決定|決議|確定|限定|只要|原則上|結論|共識|同意|通過|沒有問題|沒問題|改成|變成|轉成|調整為|朝.+方向|納入.+會議|規劃設計)/;
   const actionRegex =
-    /(?:協助|聯繫|聯絡|跟進|追蹤|詢問|確認|釐清|修改|修正|補齊|補充|提供|召開|開會|申請|編列|提報|完成|處理|麻煩|預計|預期)/;
+    /(?:協助|聯繫|聯絡|跟進|追蹤|詢問|確認|釐清|修改|修正|補齊|補充|提供|召開|開會|申請|編列|提報|完成|處理)/;
   const timelineRegex =
-    /((?:[0-9一二三四五六七八九十]+月(?:[0-9一二三四五六七八九十]+[號日]|中旬|上旬|下旬|底|初)?)|(?:[0-9一二三四五六七八九十]+[號日])|(?:禮拜[一二三四五六日天](?:早上|下午)?)|(?:這[個]?禮拜|下[個]?禮拜|本週|下週|月底|年底|下次會議|再一個月))/;
+    /((?:[0-9一二三四五六七八九十]+月(?:[0-9一二三四五六七八九十]+[號日]|中旬|上旬|下旬|底|初)?)|(?:[0-9一二三四五六七八九十]+[號日])|(?:禮拜[一二三四五六日天](?:早上|下午)?)|(?:這[個]?禮拜|下[個]?禮拜|本週|下週|月底|年底|下次會議|持續聯繫))/;
 
   const keyConclusions: string[] = [];
   const actionItems: MeetingActionItem[] = [];
   const topicBreakdowns: MeetingTopicDecisionItem[] = [];
 
-  // 依時間區塊或主題關鍵詞切分討論段落
-  const blockSize = Math.max(4, Math.ceil(segments.length / 5));
+  const numBlocks = Math.min(4, Math.max(1, Math.ceil(segments.length / 7)));
+  const blockSize = Math.max(3, Math.ceil(segments.length / numBlocks));
+
   for (let b = 0; b < segments.length; b += blockSize) {
     const blockSegs = segments.slice(b, b + blockSize);
     if (blockSegs.length === 0) continue;
 
     const blockText = blockSegs
-      .map((s) => s.words.map((w) => w.text).join(''))
-      .join(' ');
+      .map((s) => s.words.map((w) => w.text).join(""))
+      .join(" ");
     const timeRange = `${formatTime(blockSegs[0].start)}–${formatTime(
       blockSegs[blockSegs.length - 1].end
     )}`;
@@ -3381,34 +3444,25 @@ ${transcriptSample}
     );
     const topicLabel =
       matchedTopics.length > 0
-        ? `${matchedTopics.slice(0, 3).join('／')}`
-        : `會議討論區段`;
+        ? matchedTopics.slice(0, 2).join("・")
+        : `討論要點 ${topicBreakdowns.length + 1}`;
 
-    const informativeSentences = blockSegs.flatMap((s) => {
-      const sp = speakers[s.speakerId]?.name || s.speakerId;
-      return s.words
-        .map((w) => w.text)
-        .join('')
-        .split(/[。！？?!；;]/)
-        .map((cl) => ({ sp, cl: cl.trim() }))
-        .filter((item) => item.cl.length >= 8);
-    });
+    const cleanClauses = blockSegs
+      .flatMap((s) =>
+        s.words
+          .map((w) => w.text)
+          .join("")
+          .split(/[。！？?!；;]/)
+          .map((cl) => condenseSpokenClauseToCleanPoint(cl))
+      )
+      .filter((cl) => cl.length >= 6 && !/^(甚麼意思|什麼意思|這樣OK嗎|可以嗎)$/.test(cl));
 
     const keyPointSent =
-      informativeSentences
-        .sort((a, b) => b.cl.length - a.cl.length)
-        .slice(0, 2)
-        .map((x) => `${x.cl}`)
-        .join('；') || blockText.slice(0, 90);
+      cleanClauses.slice(0, 2).join("；") ||
+      condenseSpokenClauseToCleanPoint(blockText.slice(0, 50));
 
-    const decisionSent = informativeSentences.find((x) =>
-      decisionRegex.test(x.cl)
-    );
-    const conclusionText = decisionSent
-      ? `${decisionSent.sp}確認：${decisionSent.cl}。`
-      : informativeSentences.length > 0
-      ? `${informativeSentences[informativeSentences.length - 1].cl}。`
-      : '持續依計畫推進。';
+    const decisionSent = cleanClauses.find((cl) => decisionRegex.test(cl));
+    const conclusionText = decisionSent || "";
 
     topicBreakdowns.push({
       topic: topicLabel,
@@ -3422,42 +3476,45 @@ ${transcriptSample}
 
   for (const seg of segments) {
     const spName = speakers[seg.speakerId]?.name || seg.speakerId;
-    const fullSegText = seg.words.map((w) => w.text).join('').trim();
+    const fullSegText = seg.words.map((w) => w.text).join("").trim();
     const clauses = fullSegText
       .split(/[。！？?!]/)
       .map((c) => c.trim())
       .filter((c) => c.length >= 7);
 
     for (const cl of clauses) {
-      if (decisionRegex.test(cl) && keyConclusions.length < 7) {
-        const formatted = `[${formatTime(seg.start)}] ${spName}：${cl}。`;
+      const condensed = condenseSpokenClauseToCleanPoint(cl);
+      if (condensed.length < 6) continue;
+
+      if (decisionRegex.test(cl) && keyConclusions.length < 5) {
         if (
-          !keyConclusions.some((existing) => existing.includes(cl.slice(0, 10)))
+          !keyConclusions.some((existing) =>
+            existing.includes(condensed.slice(0, 8))
+          )
         ) {
-          keyConclusions.push(formatted);
+          keyConclusions.push(`${condensed}。`);
         }
       }
 
-      if (actionRegex.test(cl) && actionItems.length < 8) {
+      if (actionRegex.test(cl) && actionItems.length < 5) {
         const timeMatch = cl.match(timelineRegex);
-        const deadline = timeMatch ? timeMatch[1] : '近期持續跟進';
+        const deadline = timeMatch ? timeMatch[1] : "持續追蹤";
         const matchedEntities = coreTerms
-          .filter((t) => cl.includes(t))
+          .filter((t) => cl.includes(t) || fullSegText.includes(t))
           .slice(0, 2);
-        const statusNote =
-          matchedEntities.length > 0
-            ? `關聯項目：${matchedEntities.join('、')}`
-            : `時間軸 ${formatTime(seg.start)}`;
+        const prefixTag =
+          matchedEntities.length > 0 ? `【${matchedEntities.join("・")}】` : "";
+        const taskStr = `${prefixTag}${condensed}。`;
 
-        if (!actionItems.some((a) => a.task.includes(cl.slice(0, 10)))) {
+        if (!actionItems.some((a) => a.task.includes(condensed.slice(0, 8)))) {
           actionItems.push({
-            id: `ACT-${String(actionItems.length + 1).padStart(2, '0')}`,
-            task: `${cl}。`,
+            id: `ACT-${String(actionItems.length + 1).padStart(2, "0")}`,
+            task: taskStr,
             owner: spName,
             deadline,
             deadlineOrTimeline: deadline,
-            contextNote: statusNote,
-            statusNote,
+            contextNote: `時間軸 ${formatTime(seg.start)}`,
+            statusNote: `時間軸 ${formatTime(seg.start)}`,
           });
         }
       }
@@ -3465,48 +3522,44 @@ ${transcriptSample}
   }
 
   if (keyConclusions.length === 0 && topicBreakdowns.length > 0) {
-    for (const tb of topicBreakdowns.slice(0, 4)) {
-      keyConclusions.push(`${tb.topic}：${tb.conclusion}`);
+    for (const tb of topicBreakdowns.slice(0, 3)) {
+      keyConclusions.push(
+        `【${tb.topic}】${tb.decision || tb.discussionPoints}。`
+      );
     }
   }
 
   if (actionItems.length === 0 && segments.length > 0) {
     const lastSeg = segments[segments.length - 1];
     actionItems.push({
-      id: 'ACT-01',
-      task:
-        topicBreakdowns[0]?.conclusion ||
-        lastSeg.words.map((w) => w.text).join(''),
-      owner: speakers[lastSeg.speakerId]?.name || '與會團隊',
-      deadline: '下次工作會議前',
-      deadlineOrTimeline: '下次工作會議前',
-      contextNote: '依會議決議辦理',
-      statusNote: '依會議決議辦理',
+      id: "ACT-01",
+      task: `${
+        topicBreakdowns[0]?.discussionPoints ||
+        condenseSpokenClauseToCleanPoint(
+          lastSeg.words.map((w) => w.text).join("")
+        )
+      }。`,
+      owner: speakers[lastSeg.speakerId]?.name || "與會團隊",
+      deadline: "持續跟進",
+      deadlineOrTimeline: "持續跟進",
+      contextNote: "依會議討論辦理",
+      statusNote: "依會議討論辦理",
     });
   }
 
-  const executiveSummary = [
-    `本場會議共歷時約 ${totalDurMin} 分鐘（共 ${segments.length} 個對話段落，${
-      speakerNames.length || 2
-    } 位與會語者參與：${speakerNames.join('、') || '主席與報告人'}）。`,
+  const executiveSummary =
     topKeywords.length > 0
-      ? `會議核心聚焦於「${topKeywords.join('、')}」等關鍵議題之進度盤點、補助規範釐清與跨單位協調。`
-      : '',
-    keyConclusions.length > 0
-      ? `會中針對各項提案共達成 ${keyConclusions.length} 項關鍵裁示與共識，並確立 ${actionItems.length} 項後續具體追蹤與行動事項。`
-      : '',
-  ]
-    .filter(Boolean)
-    .join('');
+      ? `• 聚焦議題：${topKeywords.join("、")}之進度盤點、補助資格與跨單位聯繫。`
+      : `• 本次會議共檢視 ${topicBreakdowns.length} 項重點議題，收斂 ${keyConclusions.length} 項決議與 ${actionItems.length} 項行動事項。`;
 
   return {
     generatedAt: new Date().toISOString(),
-    engineUsed: 'hybrid_discourse_analyzer',
+    engineUsed: "hybrid_discourse_analyzer",
     title: inferredTitle,
     meetingTitle: inferredTitle,
     executiveSummary,
     keyConclusions,
-    topicBreakdowns: topicBreakdowns.slice(0, 6),
+    topicBreakdowns: topicBreakdowns.slice(0, 5),
     actionItems,
     speakerStats,
   };
