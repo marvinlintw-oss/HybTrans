@@ -10,9 +10,9 @@ export const TIER_PRESET_SPECS: Record<GranularityTier, TierPresetSpec> = {
   eco_safe: {
     tier: 'eco_safe',
     label: '輕量省電（一般文書機 / 快速初稿）',
-    badgeText: '極速 Beam=1 · VRAM < 2.0GB',
+    badgeText: '極速 q4f16 · 記憶體 ~ 1.0GB',
     hardwareHint:
-      '適用 16GB RAM 整合式內顯筆電：採用純 DSP 快速語者分群 + Whisper 貪婪極速解碼 (Beam=1) + 每5分鐘重聽1段，轉檔最快最省電',
+      '適用 8GB~16GB RAM 整合式內顯筆電 (如 Intel UHD / Iris Xe)：採用低耗能序列載入 + Whisper 貪婪極速解碼 (Beam=1) + 每5分鐘重聽1段，防記憶體溢位最穩定',
     chunkDurationSec: 300,
     keepModelsCoResident: false,
     recommendedLlm: 'gemma-2-2b-it-q4f16_1-MLC',
@@ -25,9 +25,9 @@ export const TIER_PRESET_SPECS: Record<GranularityTier, TierPresetSpec> = {
   balanced_pro: {
     tier: 'balanced_pro',
     label: '標準平衡（預設推薦 / 多數會議）',
-    badgeText: '平衡 Beam=2 · VRAM ~ 2.6GB',
+    badgeText: '平衡 q4f16 · 記憶體 ~ 1.3GB',
     hardwareHint:
-      '適用多數辦公電腦：採用兩階段黃金定錨 + WeSpeaker 256維聲紋 + Whisper 雙束搜尋 (Beam=2) + 每5分鐘重聽4段，兼顧速度與準確度',
+      '適用多數 16GB RAM 辦公電腦與筆電：採用兩階段黃金定錨 + WeSpeaker 256維聲紋 + Whisper q4f16 序列載入 + 每5分鐘重聽4段，兼顧低記憶體佔用與高準確度',
     chunkDurationSec: 300,
     keepModelsCoResident: false,
     recommendedLlm: 'Qwen2.5-3B-Instruct-q4f16_1-MLC',
@@ -40,9 +40,9 @@ export const TIER_PRESET_SPECS: Record<GranularityTier, TierPresetSpec> = {
   ultra_studio: {
     tier: 'ultra_studio',
     label: '深度精修（獨顯工作站 / 高難度音檔）',
-    badgeText: '精修 Beam=3 · 雙模型常駐 ~ 4.2GB',
+    badgeText: '精修 Beam=3 · 獨顯推薦',
     hardwareHint:
-      '適用獨立顯卡或連接雲端 API：採用雙尺度 256維深度聲紋 + Whisper 三束深層解碼 (Beam=3) + 180字高密度 AI 語境精修 + 每5分鐘重聽8段',
+      '適用獨立顯卡 (NVIDIA RTX / AMD RX) 或連接雲端 API：採用雙尺度 256維深度聲紋 + Whisper 三束深層解碼 (Beam=3) + 180字高密度 AI 語境精修 + 每5分鐘重聽8段',
     chunkDurationSec: 300,
     keepModelsCoResident: true,
     recommendedLlm: 'Qwen2.5-3B-Instruct-q4f16_1-MLC',
@@ -68,7 +68,6 @@ export async function probeHardwareAndCache(): Promise<HardwareProbeResult> {
     }
   }
 
-  // 修正 TS2304: 將型別明確指定為 unknown 避免找不到 GPU 型別定義
   const gpu = (navigator as unknown as { gpu?: unknown }).gpu as
     | {
         requestAdapter(options?: { powerPreference?: string }): Promise<{
@@ -90,7 +89,13 @@ export async function probeHardwareAndCache(): Promise<HardwareProbeResult> {
   }
 
   try {
-    const adapter = await gpu.requestAdapter({ powerPreference: 'high-performance' });
+    // 在 Windows 環境下不傳入 powerPreference，消除 Chrome crbug.com/369219127 警告
+    const isWindows =
+      typeof navigator !== 'undefined' &&
+      /Windows/i.test(navigator.userAgent || '');
+    const adapter = isWindows
+      ? await gpu.requestAdapter()
+      : await gpu.requestAdapter({ powerPreference: 'high-performance' });
     if (!adapter) {
       return {
         hasWebGPU: false,
@@ -102,19 +107,32 @@ export async function probeHardwareAndCache(): Promise<HardwareProbeResult> {
       };
     }
 
-    const info = (adapter as unknown as { info?: { vendor?: string; architecture?: string; description?: string } }).info || {};
+    const info =
+      (
+        adapter as unknown as {
+          info?: { vendor?: string; architecture?: string; description?: string };
+        }
+      ).info || {};
     const vendor = (info.vendor || '').toLowerCase();
-    const desc = (info.description || info.architecture || 'WebGPU Adapter').toLowerCase();
+    const desc = (
+      info.description ||
+      info.architecture ||
+      'WebGPU Adapter'
+    ).toLowerCase();
 
     const maxBufferBytes = adapter.limits?.maxBufferSize || 268435456;
-    const maxStorageBytes = adapter.limits?.maxStorageBufferBindingSize || 134217728;
-    const maxBufferSizeMB = Math.round(Math.max(maxBufferBytes, maxStorageBytes) / (1024 * 1024));
+    const maxStorageBytes =
+      adapter.limits?.maxStorageBufferBindingSize || 134217728;
+    const maxBufferSizeMB = Math.round(
+      Math.max(maxBufferBytes, maxStorageBytes) / (1024 * 1024)
+    );
 
     const isIntegratedKeyword =
       desc.includes('iris') ||
       desc.includes('uhd') ||
       desc.includes('hd graphics') ||
-      (vendor.includes('intel') && !desc.includes('arc'));
+      (vendor.includes('intel') && !desc.includes('arc')) ||
+      (vendor.includes('amd') && desc.includes('radeon(tm) graphics'));
 
     const isDiscreteKeyword =
       vendor.includes('nvidia') ||
@@ -123,7 +141,8 @@ export async function probeHardwareAndCache(): Promise<HardwareProbeResult> {
       desc.includes('radeon rx') ||
       desc.includes('arc');
 
-    const isDiscreteGpu = isDiscreteKeyword || (!isIntegratedKeyword && maxBufferSizeMB >= 2048);
+    const isDiscreteGpu =
+      isDiscreteKeyword || (!isIntegratedKeyword && maxBufferSizeMB >= 2048);
 
     let recommendedTier: GranularityTier = 'eco_safe';
     if (isDiscreteGpu && maxBufferSizeMB >= 2048) {
@@ -132,7 +151,9 @@ export async function probeHardwareAndCache(): Promise<HardwareProbeResult> {
       recommendedTier = 'balanced_pro';
     }
 
-    const displayAdapterName = info.description || `${info.vendor || 'Generic'} GPU (${maxBufferSizeMB}MB Buffer)`;
+    const displayAdapterName =
+      info.description ||
+      `${info.vendor || 'Generic'} GPU (${maxBufferSizeMB}MB Buffer)`;
 
     return {
       hasWebGPU: true,
@@ -161,7 +182,7 @@ export function validateTierAgainstHardware(
 ): string | null {
   if (!probe) return null;
   if (selectedTier === 'ultra_studio' && !probe.isDiscreteGpu && !hasCloudApiKey) {
-    return '偵測到您的電腦為整合式內顯，於純離線模式開啟「旗艦精修」極易記憶體不足，建議改用「輕量穩定」或填入 Gemini API Key。';
+    return '偵測到您的電腦為整合式內顯，系統已自動啟用低記憶體保護模式，建議使用「標準平衡」或「輕量省電」。';
   }
   return null;
 }
