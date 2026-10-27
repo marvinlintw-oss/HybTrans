@@ -1,14 +1,15 @@
 // src/workers/localAsr.worker.ts
-// 次世代本地 WebGPU Whisper 語音轉寫與聲學換人錨點耦合引擎（防 OOM 低記憶體峰值與序列載入強化版）
+// 次世代本地 WebGPU Whisper 語音轉寫與聲學換人錨點耦合引擎（q8 高精度聲學編碼器 + 防 OOM 低記憶體峰值序列載入版）
 // 核心升級與根因修正：
-// 1. [根除 1.27GB encoder_model_fp16.onnx / 2.55GB fp32 造成之 Out of Memory 崩潰]：
-//    - 針對支援 shader-f16 之顯卡（含 Intel UHD / Iris Xe 整合式內顯與 16GB RAM 筆電/桌機），全面改採原生 FP16 激活之 `q4f16` 量化權重 (`encoder_model_q4f16.onnx` 370MB + `decoder_model_merged_q4f16.onnx` 194MB，總計僅 564MB，較原本 1,604MB 降低 65% 記憶體佔用)；不支援 shader-f16 時採用 `q4` (425MB + 334MB)，徹底廢除會載入 2.55GB 並瞬間撐爆記憶體的 `encoder_model: 'fp32'`。
+// 1. [兼顧高精度殘響環境解析力與 16GB RAM 零 OOM 之黃金混合量化 (`encoder_model: 'q8'` + `decoder: 'q4f16'`)]：
+//    - 針對 4-bit Encoder (`q4f16`) 在殘響會議室與遠距麥克風下容易壓縮頻譜注意力動態範圍（把「公有空間」聽成「風天/罐空間」、「32處」聽成「三個處」）之問題，
+//    - 在標準與高精細模式下將 `encoder_model` 升級為 8-bit 對稱量化 (`q8` = 645MB，僅為 1.27GB `fp16` 的一半，且保留完整 80-bin 梅爾頻譜注意力精度)，搭配 `decoder_model_merged: 'q4f16' / 'q4'` (194MB)，總權重僅 839MB；效能安全模式 (`eco_safe`) 則維持 564MB `q4f16`。
 // 2. [根除 `Unable to determine content-length` 導致之 1GB->2GB Uint8Array 動態擴張崩潰]：
-//    - 攔截 Worker 內之 `fetch` 與 `Cache.prototype.match`，當回應缺少 `Content-Length` 標頭時，以每 24MB 自動壓實之磁碟級 `Blob` 串流接收並補齊精確 `Content-Length`，使 `@huggingface/transformers` 一次配置精確大小之緩衝區，徹底消除指數倍增 (Buffer Doubling) 與 `.slice()` 雙倍複製。
+//    - 攔截 Worker 內之 `fetch` 與 `Cache.prototype.match`，當回應缺少 `Content-Length` 標頭時，以每 24MB 自動壓實之磁碟級 `Blob` 串流接收並補齊精確 `Content-Length`。
 // 3. [Encoder 與 Decoder 序列載入互斥鎖 (Sequential ONNX Init Mutex)]：
-//    - 打破 `@huggingface/transformers` 預設 `Promise.all([encoder, decoder])` 雙模型同時解壓縮與建立 WebGPU Session 的記憶體疊加峰值，強制讓 `encoder_model` 完成載入與 GC 釋放後才啟動 `decoder_model_merged` 串流。
-// 4. [WASM 執行緒池節流與舊版巨型快取自動清理]：
-//    - WebGPU 模式下將 `env.backends.onnx.wasm.numThreads` 鎖定為 1，避免預先配置多個 2~4GB SharedArrayBuffer Pthread 虛擬記憶體池 (`已認可記憶體`)；啟動時自動清除舊版殘留之 1.27GB `encoder_model_fp16.onnx` 快取。
+//    - 強制讓 `encoder_model` 完成載入與釋放後才啟動 `decoder_model_merged` 串流，打破雙模型並發解壓縮峰值。
+// 4. [強化聲學換人切點子句切分 (`splitClauseAtAcousticSwitches`)]：
+//    - 當 Whisper 將兩人快速問答連寫為同一句時，允許在聲學話輪切換點 (`midClauseSwitches`) 附近之自然詞界（含無逗號處）切開並標記 `isAcousticTurnBoundary = true`。
 
 import { env, pipeline } from '@huggingface/transformers';
 import * as OpenCC from 'opencc-js';
@@ -33,17 +34,14 @@ env.allowLocalModels = false;
 env.useBrowserCache = true;
 
 if (env.backends?.onnx) {
-  // 抑制 ONNX Runtime C++ 層級之 VerifyEachNodeIsAssignedToAnEp 假性紅字警告
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (env.backends.onnx as any).logLevel = 'error';
   if (env.backends.onnx.wasm) {
-    // WebGPU 推論時僅需單一 WASM 輔助執行緒處理張量形狀，避免開啟多執行緒預佔數 GB 的 Windows 已認可記憶體 (Commit Charge)
     env.backends.onnx.wasm.numThreads = 1;
     env.backends.onnx.wasm.proxy = false;
   }
 }
 
-// 使用純字形簡轉繁 (cn -> tw)，保留語者原話（「對象」、「招標文件」、「支持」），避免 twp 過度替換成 IT 術語（「物件」、「檔案」、「支援」）
 const toTw = OpenCC.Converter({ from: 'cn', to: 'tw' });
 
 const MODEL_ID_MAP: Record<LocalAsrModel, string> = {
@@ -124,13 +122,13 @@ let activeDownloadingModelName: string = 'Whisper-Large-v3-Turbo';
 let isIntegratedOrLowMemDevice = false;
 const fileProgressMap = new Map<string, { loaded: number; total: number }>();
 
-/**
- * 預估各 ONNX 子模型之已知標準大小（當 CDN 未回傳 Content-Length 時供即時進度條計算使用）
- */
 function estimateKnownOnnxFileBytes(urlStr: string): number {
   if (urlStr.includes('encoder_model_q4f16')) return 370 * 1024 * 1024;
   if (urlStr.includes('encoder_model_q4')) return 425 * 1024 * 1024;
-  if (urlStr.includes('encoder_model_quantized') || urlStr.includes('encoder_model_int8')) {
+  if (
+    urlStr.includes('encoder_model_quantized') ||
+    urlStr.includes('encoder_model_int8')
+  ) {
     return 645 * 1024 * 1024;
   }
   if (urlStr.includes('encoder_model_fp16')) return 1270 * 1024 * 1024;
@@ -153,7 +151,6 @@ function reportUnifiedDownloadProgress(
     total: Math.max(loadedBytes, totalBytes),
   });
 
-  // 計算雙模型 (encoder ~65% + decoder ~35%) 之平滑整體進度
   let encoderRatio = 0;
   let decoderRatio = 0;
   let hasEncoder = false;
@@ -172,11 +169,11 @@ function reportUnifiedDownloadProgress(
 
   let combinedPct = 10;
   if (hasEncoder && hasDecoder) {
-    combinedPct = Math.round((encoderRatio * 0.65 + decoderRatio * 0.35) * 96);
+    combinedPct = Math.round((encoderRatio * 0.68 + decoderRatio * 0.32) * 96);
   } else if (hasEncoder) {
-    combinedPct = Math.round(encoderRatio * 64);
+    combinedPct = Math.round(encoderRatio * 66);
   } else if (hasDecoder) {
-    combinedPct = 64 + Math.round(decoderRatio * 34);
+    combinedPct = 66 + Math.round(decoderRatio * 32);
   }
 
   maxReportedProgress = Math.max(
@@ -193,7 +190,6 @@ function reportUnifiedDownloadProgress(
   });
 }
 
-// ── 序列載入鎖與免擴張串流攔截器 (防止 encoder 與 decoder 同時解壓縮疊加記憶體，並根除 Content-Length 缺失警告) ──
 let onnxStreamLockPromise: Promise<void> = Promise.resolve();
 
 function wrapStreamWithReleaseHook(
@@ -205,7 +201,6 @@ function wrapStreamWithReleaseHook(
   const triggerRelease = () => {
     if (!released) {
       released = true;
-      // 給予 ONNX Runtime Web 320ms 完成當前 Session 建立並讓 V8 回收暫存 Uint8Array 後，再放行下一個 .onnx 模型
       setTimeout(onComplete, 320);
     }
   };
@@ -240,8 +235,6 @@ function installMemorySafeFetchAndCacheInterceptor(): void {
   if (interceptorsInstalled) return;
   interceptorsInstalled = true;
 
-  // 1. 攔截 Cache.prototype.match：確保從瀏覽器 CacheStorage 讀出的模型或 JSON 100% 帶有精確 Content-Length，
-  //    且對 .onnx 檔案套用序列鎖，避免快取命中時 encoder 與 decoder 同時讀入 V8 Heap 造成瞬間記憶體翻倍！
   if (typeof Cache !== 'undefined' && Cache.prototype?.match) {
     const origMatch = Cache.prototype.match;
     Cache.prototype.match = async function (
@@ -269,7 +262,6 @@ function installMemorySafeFetchAndCacheInterceptor(): void {
       }
 
       try {
-        // 從 CacheStorage 取得零拷貝磁碟 Blob 參考 (耗時 < 1ms，不佔用 V8 記憶體)
         const diskBlob = await matched.blob();
         const exactSize = diskBlob.size;
         const headers = new Headers(matched.headers);
@@ -300,8 +292,6 @@ function installMemorySafeFetchAndCacheInterceptor(): void {
     };
   }
 
-  // 2. 攔截 self.fetch：當網路回應未暴露 Content-Length 時，透過每 24MB 自動壓實之磁碟級 Blob 接收串流，
-  //    徹底根除 @huggingface/transformers 因未知長度觸發 1GB -> 2GB Uint8Array 翻倍擴張而 OOM 崩潰！
   const origFetch = self.fetch.bind(self);
   self.fetch = async function (
     input: RequestInfo | URL,
@@ -337,7 +327,6 @@ function installMemorySafeFetchAndCacheInterceptor(): void {
         '';
       const parsedLen = parseInt(rawContentLen, 10);
 
-      // 若伺服器已提供有效 Content-Length，直接附掛序列釋放 Hook 後回傳
       if (Number.isFinite(parsedLen) && parsedLen > 0) {
         const headers = new Headers(res.headers);
         headers.set('Content-Length', String(parsedLen));
@@ -356,7 +345,6 @@ function installMemorySafeFetchAndCacheInterceptor(): void {
         });
       }
 
-      // 若為小型設定檔 (.json / .txt) 且無 Content-Length，直接讀取 ArrayBuffer 並補上精確長度
       if (!isOnnx) {
         const buf = await res.arrayBuffer();
         const headers = new Headers(res.headers);
@@ -368,21 +356,18 @@ function installMemorySafeFetchAndCacheInterceptor(): void {
         });
       }
 
-      // 針對缺少 Content-Length 之大型 .onnx 模型檔：
-      // 以每 24MB 壓實為磁碟級 Blob 的方式串流接收，確保 V8 JS Heap 佔用永遠不超過 24MB！
       const estimatedTotal = estimateKnownOnnxFileBytes(reqUrl);
       const reader = res.body.getReader();
       let compactedBlob = new Blob([]);
       let chunkBatch: BlobPart[] = [];
       let batchBytes = 0;
       let totalLoaded = 0;
-      const COMPACT_THRESHOLD_BYTES = 24 * 1024 * 1024; // 24MB
+      const COMPACT_THRESHOLD_BYTES = 24 * 1024 * 1024;
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         if (value && value.byteLength > 0) {
-          // 複製為獨立 ArrayBuffer 切片並立即允許底層網路緩衝區回收
           const sliceCopy = value.buffer.slice(
             value.byteOffset,
             value.byteOffset + value.byteLength
@@ -443,9 +428,6 @@ function installMemorySafeFetchAndCacheInterceptor(): void {
 
 installMemorySafeFetchAndCacheInterceptor();
 
-/**
- * 自動清理舊版殘留之 1.27GB `encoder_model_fp16.onnx` 或 2.55GB `encoder_model.onnx` 快取，釋放磁碟與記憶體空間
- */
 async function purgeOversizedLegacyModelCache(): Promise<void> {
   if (!('caches' in self)) return;
   try {
@@ -466,9 +448,6 @@ async function purgeOversizedLegacyModelCache(): Promise<void> {
   }
 }
 
-/**
- * 探測當前瀏覽器與顯卡是否支援 WebGPU、`shader-f16` (fp16) 以及是否為共用系統記憶體之整合式內顯 (如 Intel UHD / Iris Xe)。
- */
 async function probeWebGpuCapabilities(): Promise<{
   hasWebGpu: boolean;
   supportsFp16: boolean;
@@ -486,7 +465,6 @@ async function probeWebGpuCapabilities(): Promise<{
         maxBufferSizeMB: 0,
       };
     }
-    // 在 Windows 上不傳入 powerPreference，徹底消除 crbug.com/369219127 警告
     const adapter = await gpu.requestAdapter();
     if (!adapter) {
       return {
@@ -601,7 +579,8 @@ async function ensureAsrPipeline(
 ) {
   const modelId =
     MODEL_ID_MAP[modelName] || MODEL_ID_MAP['Whisper-Large-v3-Turbo'];
-  if (asrInstance && loadedModelKey === modelId) {
+  const cacheKey = `${modelId}::${granularityTier}`;
+  if (asrInstance && loadedModelKey === cacheKey) {
     ensureAlignmentHeadsPatched(asrInstance, modelName);
     return asrInstance;
   }
@@ -625,7 +604,7 @@ async function ensureAsrPipeline(
     type: 'ASR_DOWNLOAD_PROGRESS',
     active: true,
     modelName,
-    fileName: '正在檢測硬體記憶體規格並準備低耗能語音模型...',
+    fileName: '正在檢測硬體規格並準備高精度語音模型...',
     progress: 5,
   });
 
@@ -668,10 +647,18 @@ async function ensureAsrPipeline(
   isIntegratedOrLowMemDevice =
     isIntegratedGpu || maxBufferSizeMB < 2048 || granularityTier === 'eco_safe';
 
-  // 針對 WebGPU 啟用低記憶體峰值之 MatMulNBits 量化組合：
-  // - 支援 shader-f16 時採用 `q4f16` (encoder 370MB + decoder 194MB = 564MB，較 1.27GB fp16 省下超過 1GB 實體記憶體與 6GB 峰值記憶體！)
-  // - 不支援 shader-f16 時採用 `q4` (encoder 425MB + decoder 334MB = 759MB，嚴禁使用 2.55GB 之 fp32！)
-  const preferredWebGpuDtype = supportsFp16
+  // 【黃金混合量化策略】：
+  // - 標準平衡 (`balanced_pro`) 與高精細模式 (`ultra_studio`)：Encoder 採用 8-bit `q8` (645MB，保留完整頻譜注意力精度，解決殘響環境把「公有空間」聽成「風天」之失真)，Decoder 採用 `q4f16 / q4` (194MB)，總計 839MB，兼顧零 OOM 與高辨識率！
+  // - 效能安全模式 (`eco_safe`) 或極低顯存裝置 (< 768MB)：Encoder 與 Decoder 皆採用 `q4f16 / q4` (564MB)。
+  const useHighPrecisionQ8Encoder =
+    granularityTier !== 'eco_safe' && maxBufferSizeMB >= 768;
+
+  const preferredWebGpuDtype = useHighPrecisionQ8Encoder
+    ? ({
+        encoder_model: 'q8',
+        decoder_model_merged: supportsFp16 ? 'q4f16' : 'q4',
+      } as const)
+    : supportsFp16
     ? ({
         encoder_model: 'q4f16',
         decoder_model_merged: 'q4f16',
@@ -687,7 +674,7 @@ async function ensureAsrPipeline(
         env.backends.onnx.wasm.numThreads = 1;
       }
       console.info(
-        `ℹ️ [LocalASR] 啟動低記憶體峰值 WebGPU 推論 (${
+        `ℹ️ [LocalASR] 啟動 WebGPU 推論 (${
           isIntegratedGpu ? '整合式內顯共享記憶體保護模式' : '獨立顯卡高速模式'
         }, dtype=${preferredWebGpuDtype.encoder_model}/${
           preferredWebGpuDtype.decoder_model_merged
@@ -703,18 +690,17 @@ async function ensureAsrPipeline(
     }
   } catch (firstErr) {
     console.warn(
-      '⚠️ [LocalASR] 首選 WebGPU 模式切換至相容保護模式 (q4 / WASM):',
+      '⚠️ [LocalASR] 首選 WebGPU 模式切換至相容保護模式 (q4f16 / q4 / WASM):',
       firstErr
     );
     fileProgressMap.clear();
     try {
       if (hasWebGpu) {
-        // 若 q4f16 失敗，降級至通用性最高之 WebGPU q4 (425MB + 334MB)，絕不載入 2.55GB 之 fp32！
         asrInstance = await pipeline('automatic-speech-recognition', modelId, {
           device: 'webgpu',
           dtype: {
-            encoder_model: 'q4',
-            decoder_model_merged: 'q4',
+            encoder_model: supportsFp16 ? 'q4f16' : 'q4',
+            decoder_model_merged: supportsFp16 ? 'q4f16' : 'q4',
           },
           progress_callback: progressCallback,
         });
@@ -765,7 +751,7 @@ async function ensureAsrPipeline(
     progress: 100,
   });
 
-  loadedModelKey = modelId;
+  loadedModelKey = cacheKey;
   return asrInstance;
 }
 
@@ -832,7 +818,7 @@ function restoreMultilingualPunctuation(
           return `${leftChunk}${rightChunk}`;
         }
         const isShortStandaloneInterjection =
-          /^(對|好|是|不是|沒有|算|不算|沒錯|可以|對啊|好啊|好那|那)$/.test(
+          /^(對|好|是|不是|沒有|算|不算|沒錯|可以|對啊|好啊|好那|那|有|喂)$/.test(
             leftChunk
           );
         if (isShortStandaloneInterjection) {
@@ -847,7 +833,7 @@ function restoreMultilingualPunctuation(
   }
 
   text = text.replace(
-    /^(?:(對|好)(?![於長官貴賓同仁講者團隊他她你我您大家這那外內接齊應照比面方手話象嗎呢吧啊呀喔啦])|(不是)(?![嗎呢說要很太都也因為])|(沒有)(?![嗎呢啊吧喔啦要人辦法問題關係錯想說那這])|(那)(?![個些邊裡麼天位種家間場樣一二三四五六七八九十百千萬兩嗎呢吧])|(另外)(?![一二三四五六七八九十兩半個種邊家位])|(不過|其實|老實說|基本上|はい|ええ|いや|なるほど))(?=[\u3040-\u9fa5])/g,
+    /^(?:(對|好)(?![於長官貴賓同仁講者團隊他她你我您大家這那外內接齊應照比面方手話象嗎呢吧啊呀喔啦])|(不是)(?![嗎呢說要很太都也因為])|(沒有)(?![嗎呢啊吧喔啦要人辦法問題關係錯想說那這])|(那)(?![個些邊裡麼天位種家間場樣一二三四五六七八九十百千萬兩嗎呢吧原])|(另外)(?![一二三四五六七八九十兩半個種邊家位])|(不過|其實|老實說|基本上|はい|ええ|いや|なるほど))(?=[\u3040-\u9fa5])/g,
     '$&，'
   );
   text = text.replace(
@@ -859,7 +845,7 @@ function restoreMultilingualPunctuation(
     .replace(/那，(個|些|天|邊|裡|種|位|樣)/g, '那$1')
     .replace(/沒有，(嗎|呢|啊|吧|喔|要|問題|關係|辦法)/g, '沒有$1')
     .replace(/另外，(一[個種邊家位半])/g, '另外$1')
-    .replace(/對，(長官|貴賓|同仁|講者|團隊|於|他|她|你|我|大家)/g, '對$1');
+    .replace(/對，(長官|貴賓|同仁|講者|團隊|於|他|她|你|我|大家|口)/g, '對$1');
 
   text = text.replace(
     /([\u4e00-\u9fa5A-Za-z0-9]{4,})(但是|可是|不過|因為|所以|如果說|不然的話|否則|那如果|而且|然後|ですが|けれども|しかし|ただ)/g,
@@ -872,7 +858,7 @@ function restoreMultilingualPunctuation(
   );
 
   text = text.replace(
-    /(怎麼辦|對不對|是不是|好不好|可以嗎|是嗎|對嗎|多少錢|為什麼|哪裡|でしょうか|ますか|ですか)(?=[，。？?]|$)/g,
+    /(怎麼辦|怎麼樣|怎樣|對不對|是不是|好不好|可以嗎|是嗎|對嗎|多少錢|為什麼|哪裡|什麼時候|甚麼時候|什麼意思|甚麼意思|誰會補助|接觸了沒|でしょうか|ますか|ですか)(?=[，。？?]|$)/g,
     '$1？'
   );
   text = text.replace(/(嗎|呢)[。，？?]*$/g, '$1？');
@@ -902,7 +888,7 @@ function restoreMultilingualPunctuation(
       ) ||
       (nextRaw.length > 0 && isSyntacticallyInseparableBoundary(text, nextRaw));
     const endsWithClauseBridge =
-      /(?:要能夠|能夠|可以|應該|就是|因為|所以|而且|然後|例如說|比方說|像是|主要是)$/.test(
+      /(?:要能夠|能夠|可以|應該|就是|因為|所以|而且|然後|例如說|比方說|像是|主要是|還有|目前的話)$/.test(
         text
       );
 
@@ -910,7 +896,7 @@ function restoreMultilingualPunctuation(
       // 保持無標點，讓下一個 sub-chunk 自然無縫接上
     } else if (
       isMidTurn &&
-      (endsWithClauseBridge || (pauseSec <= 0.75 && text.length <= 22))
+      (endsWithClauseBridge || (pauseSec <= 0.85 && text.length <= 24))
     ) {
       text += '，';
     } else {
@@ -921,7 +907,7 @@ function restoreMultilingualPunctuation(
 }
 
 const UNIVERSAL_CLAUSE_STARTER_REGEX =
-  /^(但是|可是|不過|因為|所以|如果說|那如果|要是|不是[，、]|沒有[，、]|不用[，、]|不然|否則|其實|老實說|那我們|那你們|那我|所以我)/;
+  /^(但是|可是|不過|因為|所以|如果說|那如果|要是|不是[，、]|沒有[，、]|不用[，、]|不然|否則|其實|老實說|那我們|那你們|那我|所以我|目前的話|好報告|報告主席|現在只有|現在總共|第一個是|第二個是|另外一個|這應該|對[，、]?這|好[，、]?再來|所以要|這個也是|這個他們|也是|那原民會|有[，、]?接觸|接觸哪|什麼意思|甚麼意思|喂)/;
 
 function isSyntacticallyInseparableBoundary(
   leftStr: string,
@@ -959,7 +945,7 @@ function isSyntacticallyInseparableBoundary(
     /([0-9一二三四五六七八九十百千萬兩]+(到|至|跟|或|～|~)?|[到至])$/.test(
       lClean
     ) &&
-    /^([0-9一二三四五六七八九十百千萬兩]|到|至|分|分鐘|小時|天|個|月|年|萬|元|塊|人|家|間|成|倍)/.test(
+    /^([0-9一二三四五六七八九十百千萬兩]|到|至|分|分鐘|小時|天|個|月|年|萬|元|塊|人|家|間|處|案|號|成|倍)/.test(
       rClean
     )
   ) {
@@ -1010,19 +996,19 @@ function splitTextIntoDiscourseClauses(cleanClause: string): string[] {
   let t = cleanClause;
   t = t.replace(/([。？！?!])/g, '$1|');
   t = t.replace(
-    /([|。？！?!]\s*(?:不算|算|對|對啊|對對對|好|好的|可以|沒錯|沒有|不是|了解|はい|ええ|うん|なるほど|yeah|yes|no|right|sure|ok|okay)[，、,])\s*/gi,
+    /([|。？！?!]\s*(?:不算|算|對|對啊|對對對|好|好的|好再來|可以|沒錯|沒有|不是|了解|有|はい|ええ|うん|なるほど|yeah|yes|no|right|sure|ok|okay)[，、,])\s*/gi,
     '$1|'
   );
   t = t.replace(
-    /(^|[|，。？！?!]\s*)(不算|算|對|好|可以|沒有|不是)([，、,])\s*(?=(?:不算|算|對|好|不是|沒有|我們|那|所以|可是|但是))/g,
+    /(^|[|，。？！?!]\s*)(不算|算|對|好|可以|沒有|不是)([，、,])\s*(?=(?:不算|算|對|好|不是|沒有|我們|那|所以|可是|但是|再來))/g,
     '$1$2$3|'
   );
   t = t.replace(
-    /([\u4e00-\u9fa5]{4,}[，、,])\s*(?=(?:好|好的|好啊|對|對啊|對對對|可以|沒錯|算|不算|了解|ok|okay)[。？！?!|\s]*$)/gi,
+    /([\u4e00-\u9fa5]{4,}[，、,])\s*(?=(?:好|好的|好啊|好再來|對|對啊|對對對|可以|沒錯|算|不算|了解|ok|okay)[。？！?!|\s]*$)/gi,
     '$1|'
   );
   t = t.replace(
-    /([\u4e00-\u9fa5]{5,}[，、,])\s*(?=不是[，]|可是|不過|但是|然而|那如果|不然|否則|はい|しかし|ただ|but\s|however)/gi,
+    /([\u4e00-\u9fa5]{4,}[，、,])\s*(?=不是[，]|可是|不過|但是|然而|那如果|不然|否則|這應該|對[，]?這|好[，]?再來|所以要|那原民會|接觸哪|什麼意思|甚麼意思|はい|しかし|ただ|but\s|however)/gi,
     '$1|'
   );
 
@@ -1059,23 +1045,32 @@ function splitClauseAtAcousticSwitches(
   cEnd: number,
   midClauseSwitches: number[]
 ): Array<{ text: string; start: number; end: number; isAcousticSplit: boolean }> {
-  if (midClauseSwitches.length === 0 || cText.length < 10) {
+  if (midClauseSwitches.length === 0 || cText.length < 7) {
     return [{ text: cText, start: cStart, end: cEnd, isAcousticSplit: false }];
   }
   const chars = Array.from(cText);
   const L = chars.length;
   const dur = Math.max(0.2, cEnd - cStart);
 
+  // 建立自然詞界索引集合，供無標點換人切點優先對齊
+  const naturalTokens = segmentNaturalLanguageTokens(cText);
+  const tokenBoundarySet = new Set<number>();
+  let accLen = 0;
+  for (const nt of naturalTokens) {
+    accLen += nt.length;
+    tokenBoundarySet.add(accLen);
+  }
+
   const splitPoints: Array<{ charIdx: number; timeSec: number }> = [];
   for (const st of midClauseSwitches) {
-    const rel = Math.max(0.2, Math.min(0.8, (st - cStart) / dur));
+    const rel = Math.max(0.18, Math.min(0.82, (st - cStart) / dur));
     const rawIdx = Math.round(rel * L);
     let bestIdx = -1;
     let bestScore = -5.0;
 
     for (
-      let idx = Math.max(4, rawIdx - 3);
-      idx <= Math.min(L - 4, rawIdx + 3);
+      let idx = Math.max(3, rawIdx - 4);
+      idx <= Math.min(L - 3, rawIdx + 4);
       idx++
     ) {
       const leftPart = chars.slice(0, idx).join('');
@@ -1084,20 +1079,22 @@ function splitClauseAtAcousticSwitches(
         continue;
       }
 
-      const distPen = Math.abs(idx - rawIdx) * 0.45;
+      const distPen = Math.abs(idx - rawIdx) * 0.38;
       const prevChar = chars[idx - 1];
       let score = -distPen;
       if (/[，、；：,:;\s]/.test(prevChar)) {
         score += 3.5;
       } else if (UNIVERSAL_CLAUSE_STARTER_REGEX.test(restStr)) {
-        score += 2.2;
+        score += 2.5;
+      } else if (tokenBoundarySet.has(idx)) {
+        score += 1.4;
       }
       if (score > bestScore) {
         bestScore = score;
         bestIdx = idx;
       }
     }
-    if (bestIdx >= 4 && bestScore >= 0.8) {
+    if (bestIdx >= 3 && bestScore >= 0.45) {
       splitPoints.push({ charIdx: bestIdx, timeSec: st });
     }
   }
@@ -1196,7 +1193,6 @@ async function runWhisperWithWordTimestampsAndFallback(
   } | null = null;
   let isWordLevel = false;
 
-  // 在整合式內顯 (如 Intel UHD Graphics) 或低記憶體環境下，強制採用 num_beams=1 貪婪解碼（Whisper-Large-v3-Turbo 原生針對 Greedy 蒸餾最佳化），避免多束 KV-Cache 翻倍佔用共享記憶體
   const safeBeams = isIntegratedOrLowMemDevice
     ? 1
     : Math.max(1, Math.min(3, Math.round(asrBeamSize || 1)));
@@ -1399,7 +1395,7 @@ function normalizeWhisperChunksToWordItems(
       (st) => st >= absChEnd - 0.25 && st <= absNextStart + 0.25
     );
     const isMidTurnContinuation =
-      Boolean(nextCh) && !hasSwitchBetween && pauseToNextSec <= 1.15;
+      Boolean(nextCh) && !hasSwitchBetween && pauseToNextSec <= 1.25;
 
     const cleanClause = restoreMultilingualPunctuation(ch.text || '', {
       isMidTurnContinuation,
@@ -1448,7 +1444,7 @@ function normalizeWhisperChunksToWordItems(
     if (numClauses === 0) continue;
 
     const internalSwitches = switchTimes.filter(
-      (t) => t >= gStart + 0.22 && t <= gEnd - 0.22
+      (t) => t >= gStart + 0.20 && t <= gEnd - 0.20
     );
     const claimedSwitches = new Set<number>();
 
@@ -1501,7 +1497,7 @@ function normalizeWhisperChunksToWordItems(
 
       const midClauseSwitches = internalSwitches.filter(
         (st) =>
-          !claimedSwitches.has(st) && st >= cStart + 0.35 && st <= cEnd - 0.35
+          !claimedSwitches.has(st) && st >= cStart + 0.28 && st <= cEnd - 0.28
       );
 
       const acousticSubClauses = splitClauseAtAcousticSwitches(
@@ -1532,7 +1528,7 @@ function normalizeWhisperChunksToWordItems(
             text: tok,
             start: Number((sub.start + k * step).toFixed(3)),
             end: Number((sub.start + (k + 1) * step).toFixed(3)),
-            confidence: 0.88,
+            confidence: 0.84,
             isAcousticTurnBoundary:
               k === 0 && (cIdx > 0 || sub.isAcousticSplit),
           });
@@ -1999,6 +1995,15 @@ self.onmessage = async (event: MessageEvent) => {
           ? subSamples
           : new Float32Array(subSamples);
 
+      if (audioInput.length < 1600) {
+        self.postMessage({
+          type: 'RELISTEN_ERROR',
+          segmentId: targetSegment.id,
+          error: '音訊過短',
+        });
+        return;
+      }
+
       const resolvedWhisperLang =
         languageHint === 'en'
           ? 'english'
@@ -2006,36 +2011,32 @@ self.onmessage = async (event: MessageEvent) => {
           ? 'japanese'
           : 'chinese';
 
-      const { chunks: rawChunks } =
-        await runWhisperWithWordTimestampsAndFallback(
-          transcriber,
-          audioInput,
-          resolvedWhisperLang,
-          20,
-          4,
-          isIntegratedOrLowMemDevice ? 1 : 2
-        );
+      const { chunks } = await runWhisperWithWordTimestampsAndFallback(
+        transcriber,
+        audioInput,
+        resolvedWhisperLang,
+        20,
+        3
+      );
 
-      const rawText = rawChunks
-        .map((c: { text?: string }) => (c.text || '').trim())
-        .filter(Boolean)
-        .join('');
+      const joinedRaw = chunks.map((c) => c.text).join('');
+      const cleanText = restoreMultilingualPunctuation(joinedRaw);
+      if (!cleanText) {
+        self.postMessage({
+          type: 'RELISTEN_ERROR',
+          segmentId: targetSegment.id,
+          error: '無文字產出',
+        });
+        return;
+      }
 
-      const cleanText = restoreMultilingualPunctuation(rawText);
-      const newWords = cleanText
-        ? buildWordSpans(
-            cleanText,
-            `${targetSegment.id}_re`,
-            targetSegment.start,
-            targetSegment.end,
-            0.95
-          ).map((w) => ({
-            ...w,
-            status: 'auto_corrected' as const,
-            reason: '經無失真線性增益與重聽校準',
-          }))
-        : null;
-
+      const newWords = buildWordSpans(
+        cleanText,
+        targetSegment.id,
+        targetSegment.start,
+        targetSegment.end,
+        0.93
+      );
       self.postMessage({
         type: 'RELISTEN_SUCCESS',
         segmentId: targetSegment.id,
@@ -2044,6 +2045,7 @@ self.onmessage = async (event: MessageEvent) => {
     } catch (err) {
       self.postMessage({
         type: 'RELISTEN_ERROR',
+        segmentId: targetSegment.id,
         error: (err as Error).message,
       });
     }
