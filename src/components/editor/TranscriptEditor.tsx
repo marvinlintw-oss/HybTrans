@@ -994,131 +994,96 @@ export const TranscriptEditor: React.FC<TranscriptEditorProps> = ({
             </div>
 
             {showMinutesCard && (
-              <div className="space-y-4 text-xs sm:text-sm text-slate-800">
-                {/* 1. 執行摘要 */}
-                <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-1">
+              <div className="space-y-3 text-xs sm:text-sm text-slate-800">
+                {/* 1. 會議討論要點（條列） */}
+                <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-1.5">
                   <div className="font-bold text-xs text-indigo-900 flex items-center gap-1.5">
                     <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
-                    <span>一、會議執行摘要 (Executive Summary)</span>
+                    <span>一、會議討論要點摘要</span>
                   </div>
-                  <p className="text-xs sm:text-sm text-slate-700 leading-relaxed">
-                    {meetingMinutes.executiveSummary}
-                  </p>
-                </div>
-
-                {/* 2. 重要結論與裁示事項 */}
-                <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-1.5">
-                  <div className="font-bold text-xs text-emerald-900 flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                    <span>二、重要結論與裁示事項</span>
-                  </div>
-                  <ul className="space-y-1.5 pl-1">
-                    {meetingMinutes.keyConclusions.map((item, idx) => (
+                  <ul className="space-y-1 pl-1">
+                    {(meetingMinutes.executiveSummary || "")
+                      .split(/\n+/)
+                      .map((s) => s.replace(/^[•\-*]\s*/, "").trim())
+                      .filter(Boolean)
+                      .map((line, idx) => (
+                        <li
+                          key={`sum_${idx}`}
+                          className="text-xs sm:text-sm text-slate-700 leading-relaxed flex items-start gap-2"
+                        >
+                          <span className="text-indigo-600 font-bold shrink-0">•</span>
+                          <span>{line}</span>
+                        </li>
+                      ))}
+                    {meetingMinutes.topicBreakdowns.map((t, idx) => (
                       <li
-                        key={idx}
+                        key={`topic_${idx}`}
                         className="text-xs sm:text-sm text-slate-700 leading-relaxed flex items-start gap-2"
                       >
-                        <span className="inline-flex items-center justify-center w-4 h-4 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px] shrink-0 mt-0.5">
-                          {idx + 1}
+                        <span className="text-indigo-600 font-bold shrink-0">•</span>
+                        <span>
+                          <strong className="text-slate-900">【{t.topic}】</strong>
+                          {t.timeRange ? (
+                            <span className="text-[11px] font-mono text-slate-400 mr-1">
+                              ({t.timeRange})
+                            </span>
+                          ) : null}
+                          ：{t.discussionPoints}
+                          {t.decision && t.decision !== t.discussionPoints ? (
+                            <span className="text-emerald-800 font-medium">
+                              {" "}➔ {t.decision}
+                            </span>
+                          ) : null}
                         </span>
-                        <span>{item}</span>
                       </li>
                     ))}
                   </ul>
                 </div>
 
-                {/* 3. 各議題討論重點與決議 */}
-                {meetingMinutes.topicBreakdowns.length > 0 && (
-                  <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-2">
-                    <div className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
-                      <FileText className="w-3.5 h-3.5 text-blue-600" />
-                      <span>三、各議題討論重點與決議</span>
+                {/* 2. 重要結論與裁示（條列） */}
+                {meetingMinutes.keyConclusions.length > 0 && (
+                  <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-1.5">
+                    <div className="font-bold text-xs text-emerald-900 flex items-center gap-1.5">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                      <span>二、重要結論與裁示</span>
                     </div>
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left border-collapse text-xs">
-                        <thead>
-                          <tr className="border-b border-slate-200 bg-slate-50 text-slate-600">
-                            <th className="py-1.5 px-2.5 font-semibold w-1/4">
-                              議題 / 專案名稱
-                            </th>
-                            <th className="py-1.5 px-2.5 font-semibold w-5/12">
-                              討論現況與重點
-                            </th>
-                            <th className="py-1.5 px-2.5 font-semibold w-1/3">
-                              決議與裁示
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100">
-                          {meetingMinutes.topicBreakdowns.map((t, idx) => (
-                            <tr key={idx} className="hover:bg-slate-50/80">
-                              <td className="py-2 px-2.5 align-top font-semibold text-slate-800">
-                                <div>{t.topic}</div>
-                                {t.timeRange && (
-                                  <span className="inline-block mt-0.5 text-[10px] font-mono text-slate-400">
-                                    [{t.timeRange}]
-                                  </span>
-                                )}
-                              </td>
-                              <td className="py-2 px-2.5 align-top text-slate-600 leading-relaxed">
-                                {t.discussionPoints}
-                              </td>
-                              <td className="py-2 px-2.5 align-top font-medium text-emerald-800 leading-relaxed">
-                                {t.decision}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
+                    <ul className="space-y-1 pl-1">
+                      {meetingMinutes.keyConclusions.map((item, idx) => (
+                        <li
+                          key={idx}
+                          className="text-xs sm:text-sm text-slate-700 leading-relaxed flex items-start gap-2"
+                        >
+                          <span className="text-emerald-600 font-bold shrink-0">•</span>
+                          <span>{item.replace(/^[•\-*]\s*/, "")}</span>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
                 )}
 
-                {/* 4. 後續行動事項追蹤表 */}
+                {/* 3. 後續行動事項（條列） */}
                 {meetingMinutes.actionItems.length > 0 && (
-                  <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-2">
+                  <div className="bg-white/90 rounded-xl p-3 border border-slate-200/80 space-y-1.5">
                     <div className="font-bold text-xs text-amber-900 flex items-center gap-1.5">
                       <ListChecks className="w-3.5 h-3.5 text-amber-600" />
-                      <span>四、後續行動事項追蹤表 (Action Items)</span>
+                      <span>三、後續行動事項 (Action Items)</span>
                     </div>
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left border-collapse text-xs">
-                        <thead>
-                          <tr className="border-b border-slate-200 bg-amber-50/60 text-slate-700">
-                            <th className="py-1.5 px-2 font-semibold w-10">
-                              #
-                            </th>
-                            <th className="py-1.5 px-2.5 font-semibold">
-                              具體待辦與行動事項
-                            </th>
-                            <th className="py-1.5 px-2.5 font-semibold w-36">
-                              負責語者 / 單位
-                            </th>
-                            <th className="py-1.5 px-2.5 font-semibold w-28">
-                              目標時程
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100">
-                          {meetingMinutes.actionItems.map((act, idx) => (
-                            <tr key={act.id} className="hover:bg-amber-50/20">
-                              <td className="py-2 px-2 align-top font-mono text-slate-400">
-                                {idx + 1}
-                              </td>
-                              <td className="py-2 px-2.5 align-top font-medium text-slate-800 leading-relaxed">
-                                {act.task}
-                              </td>
-                              <td className="py-2 px-2.5 align-top text-blue-700 font-semibold">
-                                {act.owner}
-                              </td>
-                              <td className="py-2 px-2.5 align-top text-amber-800 font-medium">
-                                {act.deadline}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
+                    <ul className="space-y-1 pl-1">
+                      {meetingMinutes.actionItems.map((act) => (
+                        <li
+                          key={act.id}
+                          className="text-xs sm:text-sm text-slate-700 leading-relaxed flex items-start gap-2"
+                        >
+                          <span className="text-amber-600 font-bold shrink-0">•</span>
+                          <span>
+                            <span className="inline-block font-semibold text-blue-700 mr-1.5">
+                              [{act.owner}｜{act.deadline}]
+                            </span>
+                            <span className="text-slate-800">{act.task}</span>
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
                 )}
               </div>
