@@ -1,11 +1,11 @@
 // src/workers/diarization.worker.ts
-// 次世代雙尺度語者分離與聲紋純化引擎 (Two-Stage Macro-Anchor Discovery + Pitch/Dip Micro-Turn Attribution + Calibrated AHC/NME-SC/VBx)
-// 針對台灣真實多人會議 (如 250623_1432 DEMO 音檔 4 人高頻搶話/附和) 之核心根因修正與低記憶體峰值保護：
-// 1. [VAD 底噪分位數修正]：將 noiseFloor 由 18% 分位數乘 2.0 修正為 5% 分位數乘 1.65，100% 保留小聲插話與附和。
-// 2. [基頻倍頻減半誤差修正]：自相關基頻估算改採「首波峰門檻法 (First-Peak >= 0.86 * maxCorr)」，徹底根除女聲 (240Hz) 在次諧波處被誤判為男聲 (120Hz/80Hz) 的倍頻錯誤。
-// 3. [WeSpeaker ONNX 全模式啟用與短句 CMN 保護]：Mode 0 / Mode B / Mode C 皆自動載入 /public/models/wespeaker_voxceleb_resnet34_int8.onnx (若無則無縫降級 64-dim DSP)，並採用「時長自適應全局/局部混合 CMN + 短句張量延展 (>=100 幀)」。
-// 4. [兩階段雙解析度架構]：Stage 1 長視窗定錨聚類 + Stage 2 微觀話輪歸屬。
-// 5. [ONNX Session 顯式釋放與 WASM 執行緒節流]：結束前主動呼叫 session.release() 並清空 Fbank 矩陣，限制 WASM Pthread 數 <= 2，防止與後續 Whisper 模型產生記憶體疊加峰值。
+// 次世代雙尺度語者分離與聲紋純化引擎 (YIN CMNDF 無倍頻誤差基頻 + P02 真實靜音底噪錨定 + 通道錨定 CMN + 雙尺度定錨聚類 + 話輪級 Viterbi 平滑)
+// 核心架構升級與根因修正：
+// 1. [P02 真實靜音底噪與過零率摩擦保護]：以 2% 分位數 (P02) 乘 1.32 作為自適應 VAD 門檻（不隨大聲主講人 p75 膨脹），並僅在過零率偏高 (zcr > 0.26) 且無諧波時才抑制翻紙雜音，100% 保留遠距與會者之低頻發聲（如「24號」、「禮拜三早上」）。
+// 2. [YIN CMNDF 基頻估計器]：採用累積均值正規化差分函數 d'(tau)，徹底根除殘響會議室中男聲二次諧波倍頻 (120Hz -> 240Hz 女聲) 與女聲次諧波減半誤差。
+// 3. [通道錨定混合 CMN 與單塊動態最少群數 (effectiveMinK <= 2)]：保留 55%~80% 全局通道均值扣除比例以保護語者靜態聲道共振峰；單一 5 分鐘區塊最少群數上限設為 2，並加入同性別音色衛星群聚整併，防止將一問一答的主席與報告人碎切成 6 個語者。
+// 4. [廢除無條件 1.65s 硬切 + 導入話輪級 Viterbi 平滑與翻頁停頓縫合]：僅於真實聲學邊界波峰處切分微觀話輪，並對話輪序列執行 Viterbi 轉移平滑與 <= 2.4s 同語者無插話縫合。
+// 5. [ONNX Session 顯式釋放與 WASM 執行緒節流]：結束前主動呼叫 session.release() 並清空 Fbank 矩陣，限制 WASM Pthread 數 <= 2，防止記憶體疊加峰值。
 
 import {
   AcousticFormulaCalibration,
@@ -22,7 +22,6 @@ const SPEAKER_PALETTE = [
   '#0891b2', '#dc2626', '#4f46e5', '#65a30d', '#ea580c',
 ];
 
-// 獨立模型快取命名空間，與 /HybTransPlus/ 互不干擾
 const LOCAL_MODEL_CACHE_NAME = 'hybtrans-rwd-local-models-v2';
 
 function resolvePublicRootUrl(relPath: string): string {
@@ -108,6 +107,84 @@ function cosineSimilarity(
   return denom > 1e-10 ? Math.max(-1.0, Math.min(1.0, dot / denom)) : 0.0;
 }
 
+/**
+ * 單幀 YIN 累積均值正規化差分 (CMNDF) 基頻與諧波週期度計算
+ */
+function computeYinPitchForFrame(
+  samples: Float32Array,
+  pos: number,
+  sampleRate = 16000
+): { f0Hz: number; periodicity: number; zcr: number } {
+  const frameLen = 512;
+  const W = 256;
+  const minLag = 50; // 320 Hz
+  const maxLag = 212; // 75.5 Hz
+
+  if (pos + frameLen > samples.length) {
+    return { f0Hz: 0, periodicity: 0, zcr: 0 };
+  }
+
+  let zc = 0;
+  for (let i = 1; i < frameLen; i++) {
+    if ((samples[pos + i] >= 0) !== (samples[pos + i - 1] >= 0)) {
+      zc++;
+    }
+  }
+  const zcr = zc / frameLen;
+
+  const d = new Float32Array(maxLag + 1);
+  for (let tau = 2; tau <= maxLag; tau += 2) {
+    let sumSq = 0.0;
+    for (let i = 0; i < W; i += 2) {
+      const diff = samples[pos + i] - samples[pos + i + tau];
+      sumSq += diff * diff;
+    }
+    d[tau] = sumSq;
+    d[tau - 1] = sumSq;
+  }
+
+  const cmndf = new Float32Array(maxLag + 1);
+  cmndf[0] = 1.0;
+  let runningSum = 0.0;
+  for (let tau = 1; tau <= maxLag; tau++) {
+    runningSum += d[tau];
+    cmndf[tau] = runningSum > 1e-12 ? (d[tau] * tau) / runningSum : 1.0;
+  }
+
+  let bestTau = minLag;
+  let minVal = cmndf[minLag];
+  for (let tau = minLag + 2; tau <= maxLag; tau += 2) {
+    if (cmndf[tau] < minVal) {
+      minVal = cmndf[tau];
+      bestTau = tau;
+    }
+  }
+
+  const periodicity = Math.max(0.0, Math.min(1.0, 1.0 - minVal));
+  if (minVal > 0.54 || zcr > 0.28) {
+    return { f0Hz: 0, periodicity, zcr };
+  }
+
+  const thresh = Math.max(0.24, minVal * 1.18);
+  let chosenTau = bestTau;
+  for (let tau = minLag + 2; tau <= maxLag - 2; tau += 2) {
+    if (
+      cmndf[tau] <= thresh &&
+      cmndf[tau] <= cmndf[tau - 2] &&
+      cmndf[tau] <= cmndf[tau + 2]
+    ) {
+      chosenTau = tau;
+      break;
+    }
+  }
+
+  return {
+    f0Hz: sampleRate / Math.max(minLag, chosenTau),
+    periodicity: Math.max(0.0, Math.min(1.0, 1.0 - cmndf[chosenTau])),
+    zcr,
+  };
+}
+
 export function estimateMedianPitchHz(
   samples: Float32Array,
   startSample: number,
@@ -118,10 +195,6 @@ export function estimateMedianPitchHz(
   const total = Math.max(1, endSample - startSample);
   const hop = Math.max(256, Math.floor(total / 25));
   const pitches: number[] = [];
-  const minLag = Math.floor(sampleRate / 320);
-  const maxLag = Math.floor(sampleRate / 75);
-  const numLags = Math.floor((maxLag - minLag) / 2) + 1;
-  const corrs = new Float32Array(numLags);
 
   for (let pos = startSample; pos + frameLen <= endSample; pos += hop) {
     let energy = 0.0;
@@ -129,50 +202,19 @@ export function estimateMedianPitchHz(
       const v = samples[pos + i];
       energy += v * v;
     }
-    if (Math.sqrt((energy * 2) / frameLen) < 0.012) continue;
+    if (Math.sqrt((energy * 2) / frameLen) < 0.008) continue;
 
-    let maxCorr = 0.0;
-    let argMaxIdx = 0;
-    for (let idx = 0; idx < numLags; idx++) {
-      const lag = minLag + idx * 2;
-      let sum = 0.0;
-      let nA = 0.0;
-      let nB = 0.0;
-      const limit = frameLen - lag;
-      for (let i = 0; i < limit; i += 2) {
-        const a = samples[pos + i];
-        const b = samples[pos + i + lag];
-        sum += a * b;
-        nA += a * a;
-        nB += b * b;
-      }
-      const c = nA > 1e-8 && nB > 1e-8 ? sum / Math.sqrt(nA * nB) : 0.0;
-      corrs[idx] = c;
-      if (c > maxCorr) {
-        maxCorr = c;
-        argMaxIdx = idx;
-      }
-    }
-
-    if (maxCorr >= 0.48) {
-      let chosenIdx = argMaxIdx;
-      const firstPeakThresh = 0.86 * maxCorr;
-      for (let idx = 1; idx < numLags - 1; idx++) {
-        if (
-          corrs[idx] >= firstPeakThresh &&
-          corrs[idx] >= corrs[idx - 1] &&
-          corrs[idx] >= corrs[idx + 1]
-        ) {
-          chosenIdx = idx;
-          break;
-        }
-      }
-      const bestLag = minLag + chosenIdx * 2;
-      pitches.push(sampleRate / bestLag);
+    const { f0Hz, periodicity, zcr } = computeYinPitchForFrame(
+      samples,
+      pos,
+      sampleRate
+    );
+    if (f0Hz > 0 && periodicity >= 0.44 && zcr <= 0.26) {
+      pitches.push(f0Hz);
     }
   }
 
-  if (pitches.length === 0) return 155;
+  if (pitches.length === 0) return 145;
   pitches.sort((a, b) => a - b);
   return pitches[Math.floor(pitches.length / 2)];
 }
@@ -187,6 +229,7 @@ function computePitchTrackAndBoundaryCurve(
 ): {
   stepF0Hz: Float32Array;
   stepHarmonicity: Float32Array;
+  stepZcr: Float32Array;
   calibratedHarmGate: number;
   boundaryScoreCurve: Float32Array;
   queryMedianPitchHz: (startF: number, endF: number) => number;
@@ -200,89 +243,81 @@ function computePitchTrackAndBoundaryCurve(
   const numSteps = Math.max(1, Math.floor(numFrames / stepFrames));
   const stepF0Hz = new Float32Array(numSteps);
   const stepHarmonicity = new Float32Array(numSteps);
-  const stepBestLag = new Int32Array(numSteps);
+  const stepZcr = new Float32Array(numSteps);
+  const rawStepF0 = new Float32Array(numSteps);
 
   const frameLen = 512;
-  const minLag = Math.floor(sampleRate / 320);
-  const maxLag = Math.floor(sampleRate / 75);
-  const numLags = Math.floor((maxLag - minLag) / 2) + 1;
-  const corrs = new Float32Array(numLags);
   const activeHarms: number[] = [];
 
   for (let s = 0; s < numSteps; s++) {
     const f = s * stepFrames;
-    if (smoothRms[f] < vadThreshold * 0.85) continue;
+    if (smoothRms[f] < vadThreshold * 0.80) continue;
     const pos = f * 160;
     if (pos + frameLen > samples.length) break;
 
-    let maxCorr = 0.0;
-    let argMaxIdx = 0;
-    for (let idx = 0; idx < numLags; idx++) {
-      const lag = minLag + idx * 2;
-      let sum = 0.0;
-      let nA = 0.0;
-      let nB = 0.0;
-      const limit = frameLen - lag;
-      for (let i = 0; i < limit; i += 2) {
-        const a = samples[pos + i];
-        const b = samples[pos + i + lag];
-        sum += a * b;
-        nA += a * a;
-        nB += b * b;
-      }
-      const c = nA > 1e-8 && nB > 1e-8 ? sum / Math.sqrt(nA * nB) : 0.0;
-      corrs[idx] = c;
-      if (c > maxCorr) {
-        maxCorr = c;
-        argMaxIdx = idx;
-      }
-    }
+    const { f0Hz, periodicity, zcr } = computeYinPitchForFrame(
+      samples,
+      pos,
+      sampleRate
+    );
+    stepHarmonicity[s] = periodicity;
+    stepZcr[s] = zcr;
+    rawStepF0[s] = f0Hz;
 
-    stepHarmonicity[s] = maxCorr;
-    if (maxCorr >= 0.22) {
-      activeHarms.push(maxCorr);
+    if (periodicity >= 0.22 && zcr <= 0.28) {
+      activeHarms.push(periodicity);
     }
-
-    let chosenIdx = argMaxIdx;
-    const thresh = 0.86 * maxCorr;
-    for (let idx = 1; idx < numLags - 1; idx++) {
-      if (
-        corrs[idx] >= thresh &&
-        corrs[idx] >= corrs[idx - 1] &&
-        corrs[idx] >= corrs[idx + 1]
-      ) {
-        chosenIdx = idx;
-        break;
-      }
-    }
-    stepBestLag[s] = minLag + chosenIdx * 2;
   }
 
   let calibratedHarmGate = formulaCalibration?.harmonicityGateThreshold ?? 0;
   if (calibratedHarmGate <= 0.1) {
     if (activeHarms.length > 10) {
       activeHarms.sort((a, b) => a - b);
-      const p15 = activeHarms[Math.floor(activeHarms.length * 0.15)] || 0.36;
-      calibratedHarmGate = Math.max(0.34, Math.min(0.42, p15 * 0.95));
+      const p15 = activeHarms[Math.floor(activeHarms.length * 0.15)] || 0.32;
+      calibratedHarmGate = Math.max(0.28, Math.min(0.38, p15 * 0.90));
     } else {
-      calibratedHarmGate = 0.36;
+      calibratedHarmGate = 0.32;
     }
   }
 
   for (let s = 0; s < numSteps; s++) {
-    if (stepHarmonicity[s] >= calibratedHarmGate && stepBestLag[s] > 0) {
-      stepF0Hz[s] = sampleRate / stepBestLag[s];
+    if (
+      stepHarmonicity[s] >= calibratedHarmGate &&
+      rawStepF0[s] > 0 &&
+      stepZcr[s] <= 0.26
+    ) {
+      stepF0Hz[s] = rawStepF0[s];
     }
   }
 
+  // 3 點中位數濾波消除單一 40ms 幀之瞬間雜訊毛刺
+  const filteredStepF0 = new Float32Array(numSteps);
+  for (let s = 0; s < numSteps; s++) {
+    const c = stepF0Hz[s];
+    if (c <= 0) continue;
+    const l = s > 0 ? stepF0Hz[s - 1] : 0;
+    const r = s + 1 < numSteps ? stepF0Hz[s + 1] : 0;
+    if (l > 0 && r > 0) {
+      const a = Math.min(l, c, r);
+      const b = Math.max(l, c, r);
+      filteredStepF0[s] = l + c + r - a - b;
+    } else {
+      filteredStepF0[s] = c;
+    }
+  }
+  stepF0Hz.set(filteredStepF0);
+
   const queryMedianPitchHz = (startF: number, endF: number): number => {
     const sStart = Math.max(0, Math.floor(startF / stepFrames));
-    const sEnd = Math.min(numSteps, Math.max(sStart + 1, Math.ceil(endF / stepFrames)));
+    const sEnd = Math.min(
+      numSteps,
+      Math.max(sStart + 1, Math.ceil(endF / stepFrames))
+    );
     const valid: number[] = [];
     for (let s = sStart; s < sEnd; s++) {
       if (stepF0Hz[s] > 0) valid.push(stepF0Hz[s]);
     }
-    if (valid.length === 0) return 155;
+    if (valid.length === 0) return 142;
     valid.sort((a, b) => a - b);
     return valid[Math.floor(valid.length / 2)];
   };
@@ -301,7 +336,7 @@ function computePitchTrackAndBoundaryCurve(
     for (let s = sStart; s < sEnd; s++) {
       const h = stepHarmonicity[s];
       harms.push(h);
-      if (h >= calibratedHarmGate) voicedCount++;
+      if (h >= calibratedHarmGate && stepZcr[s] <= 0.28) voicedCount++;
     }
     if (harms.length === 0) return { voicedRatio: 0.0, medianHarm: 0.0 };
     harms.sort((a, b) => a - b);
@@ -315,7 +350,7 @@ function computePitchTrackAndBoundaryCurve(
   for (let f = 0; f < numFrames; f++) {
     let sumEnv = 0.0;
     let cntEnv = 0;
-    for (let k = Math.max(0, f - 7); k <= Math.min(numFrames - 1, f + 7); k++) {
+    for (let k = Math.max(0, f - 6); k <= Math.min(numFrames - 1, f + 6); k++) {
       sumEnv += smoothRms[k];
       cntEnv++;
     }
@@ -324,7 +359,8 @@ function computePitchTrackAndBoundaryCurve(
 
   const formantBins = 38;
   const binOffset = 10;
-  const hasFbank = Array.isArray(allFbankFrames) && allFbankFrames.length >= numFrames;
+  const hasFbank =
+    Array.isArray(allFbankFrames) && allFbankFrames.length >= numFrames;
   const melPrefix = hasFbank
     ? new Float32Array((numFrames + 1) * formantBins)
     : null;
@@ -332,7 +368,8 @@ function computePitchTrackAndBoundaryCurve(
   if (melPrefix && allFbankFrames) {
     for (let t = 0; t < numFrames; t++) {
       const sIdx = Math.min(numSteps - 1, Math.floor(t / stepFrames));
-      const isVoiced = stepHarmonicity[sIdx] >= calibratedHarmGate;
+      const isVoiced =
+        stepHarmonicity[sIdx] >= calibratedHarmGate && stepZcr[sIdx] <= 0.28;
       const prevOff = t * formantBins;
       const nextOff = (t + 1) * formantBins;
 
@@ -360,47 +397,57 @@ function computePitchTrackAndBoundaryCurve(
   const leftPitches: number[] = [];
   const rightPitches: number[] = [];
 
-  const wDip = formulaCalibration?.boundaryDipWeight ?? 0.45;
-  const wVoice = formulaCalibration?.boundaryVoiceWeight ?? 0.55;
-  const stepDbFloor = formulaCalibration?.stepDbDiffFloor ?? 3.5;
-  const cosDistFloor = formulaCalibration?.formantCosDistFloor ?? 0.22;
+  const wDip = formulaCalibration?.boundaryDipWeight ?? 0.42;
+  const wVoice = formulaCalibration?.boundaryVoiceWeight ?? 0.58;
+  const stepDbFloor = formulaCalibration?.stepDbDiffFloor ?? 3.2;
+  const cosDistFloor = formulaCalibration?.formantCosDistFloor ?? 0.21;
 
-  const winF = 55;
-  for (let f = 58; f < numFrames - 58; f += 2) {
+  // 使用 380ms 靈敏視窗捕捉 0.6s~1.2s 之快速問答換人（如「這應該沒問題吧？/對，這沒問題」、「好，再來」）
+  const winF = 38;
+  for (let f = 42; f < numFrames - 42; f += 2) {
     let sumL = 0.0;
     let sumR = 0.0;
-    const countSide = winF - 5;
-    for (let k = 5; k < winF; k++) {
+    const countSide = winF - 4;
+    for (let k = 4; k < winF; k++) {
       sumL += smoothRms[f - k];
       sumR += smoothRms[f + k];
     }
     const rmsL = sumL / Math.max(1, countSide);
     const rmsR = sumR / Math.max(1, countSide);
     const locAvg = 0.5 * (rmsL + rmsR);
-    if (locAvg < vadThreshold * 0.7) continue;
+    if (locAvg < vadThreshold * 0.72) continue;
 
     const dip = Math.max(0.0, 1.0 - envRms[f] / (locAvg + 1e-5));
 
     const dbDiff = Math.abs(20.0 * Math.log10((rmsR + 1e-5) / (rmsL + 1e-5)));
-    const stepJump = Math.max(0.0, Math.min(1.0, (dbDiff - stepDbFloor) / 8.0));
+    const stepJump = Math.max(0.0, Math.min(1.0, (dbDiff - stepDbFloor) / 7.2));
 
     const sCenter = Math.floor(f / stepFrames);
     leftPitches.length = 0;
     rightPitches.length = 0;
-    for (let s = Math.max(0, sCenter - 14); s < sCenter; s++) {
+    for (let s = Math.max(0, sCenter - 10); s < sCenter; s++) {
       if (stepF0Hz[s] > 0) leftPitches.push(stepF0Hz[s]);
     }
-    for (let s = sCenter; s < Math.min(numSteps, sCenter + 14); s++) {
+    for (let s = sCenter; s < Math.min(numSteps, sCenter + 10); s++) {
       if (stepF0Hz[s] > 0) rightPitches.push(stepF0Hz[s]);
     }
 
     let semiJump = 0.0;
+    let isGenderCrossing = false;
     if (leftPitches.length >= 2 && rightPitches.length >= 2) {
       leftPitches.sort((a, b) => a - b);
       rightPitches.sort((a, b) => a - b);
       const medL = leftPitches[Math.floor(leftPitches.length / 2)];
       const medR = rightPitches[Math.floor(rightPitches.length / 2)];
-      semiJump = Math.min(1.0, Math.abs(12.0 * Math.log2(medL / medR)) / 5.5);
+      const semiDiff = Math.abs(12.0 * Math.log2(medL / medR));
+      semiJump = Math.min(1.0, semiDiff / 5.0);
+      if (
+        semiDiff >= 3.8 &&
+        ((medL < 160 && medR >= 170) || (medL >= 170 && medR < 160))
+      ) {
+        isGenderCrossing = true;
+        semiJump = Math.max(semiJump, 0.88);
+      }
     }
 
     let specJump = 0.0;
@@ -423,12 +470,19 @@ function computePitchTrackAndBoundaryCurve(
       const cosDist = Math.max(0.0, 1.0 - cosSim);
       specJump =
         cosDist > cosDistFloor
-          ? Math.min(1.0, (cosDist - cosDistFloor) / 0.38)
+          ? Math.min(1.0, (cosDist - cosDistFloor) / 0.36)
           : 0.0;
     }
 
-    const acousticChange = Math.max(semiJump, specJump * 0.75, stepJump * 0.75);
-    const score = wDip * dip + wVoice * acousticChange;
+    const acousticChange = Math.max(semiJump, specJump * 0.78, stepJump * 0.80);
+    let score = wDip * dip + wVoice * acousticChange;
+    // 當發生明確男女音域跨越或遠近距大音量階躍且伴隨能量微谷底時，確保邊界分數跨過切分門檻
+    if (
+      (isGenderCrossing && (dip >= 0.18 || stepJump >= 0.30)) ||
+      (stepJump >= 0.65 && dip >= 0.25)
+    ) {
+      score = Math.max(score, 0.55);
+    }
     boundaryScoreCurve[f] = score;
     if (f + 1 < numFrames) boundaryScoreCurve[f + 1] = score;
   }
@@ -436,6 +490,7 @@ function computePitchTrackAndBoundaryCurve(
   return {
     stepF0Hz,
     stepHarmonicity,
+    stepZcr,
     calibratedHarmGate,
     boundaryScoreCurve,
     queryMedianPitchHz,
@@ -446,13 +501,19 @@ function computePitchTrackAndBoundaryCurve(
 function computeSoftPitchCompatibilityPenalty(
   f0A: number,
   f0B: number,
-  maxPen = 0.13,
+  maxPen = 0.14,
   toleranceSemitones = 3.8
 ): number {
   if (f0A <= 70 || f0B <= 70) return 0.0;
   const semitoneDiff = 12.0 * Math.abs(Math.log2(f0A / f0B));
-  if (semitoneDiff <= toleranceSemitones) return 0.0;
-  return Math.min(maxPen, (semitoneDiff - toleranceSemitones) * 0.026);
+  const isCrossGender =
+    (f0A < 158 && f0B >= 172) || (f0A >= 172 && f0B < 158);
+  if (semitoneDiff <= toleranceSemitones && !isCrossGender) return 0.0;
+  const basePen = Math.min(
+    maxPen,
+    Math.max(0, semitoneDiff - toleranceSemitones) * 0.028
+  );
+  return isCrossGender ? Math.min(maxPen + 0.08, basePen + 0.06) : basePen;
 }
 
 export function runFourStateHysteresisBinarization(
@@ -460,8 +521,8 @@ export function runFourStateHysteresisBinarization(
   frameStepSec: number,
   thetaOn = 0.5,
   thetaOff = 0.35,
-  minDurationOnSec = 0.22,
-  minDurationOffSec = 0.1
+  minDurationOnSec = 0.20,
+  minDurationOffSec = 0.10
 ): Array<{ startFrame: number; endFrame: number }> {
   const T = probTrace.length;
   if (T === 0) return [];
@@ -536,10 +597,10 @@ export function buildOptimalVadGuidedAsrWindows(
   const speechRegions = runFourStateHysteresisBinarization(
     frameVadProbs,
     frameStepSec,
-    0.45,
-    0.3,
+    0.42,
+    0.28,
     0.12,
-    0.22
+    0.20
   );
 
   if (speechRegions.length === 0) {
@@ -619,7 +680,7 @@ export function buildOptimalVadGuidedAsrWindows(
       let switchBonus = 0.0;
       for (let d = -6; d <= 6; d++) {
         if (turnSwitchFrames.has(f + d)) {
-          switchBonus = -0.24;
+          switchBonus = -0.28;
           break;
         }
       }
@@ -628,7 +689,7 @@ export function buildOptimalVadGuidedAsrWindows(
       const curSec = chunkStartSec + f * frameStepSec;
       const distPenalty = Math.abs(curSec - targetCenterSec) * 0.015;
 
-      const cost = avgVad * 1.2 + avgRms * 2.5 + distPenalty + switchBonus;
+      const cost = avgVad * 1.4 + avgRms * 2.5 + distPenalty + switchBonus;
       if (cost < minValleyCost) {
         minValleyCost = cost;
         bestValleyFrame = f;
@@ -827,6 +888,11 @@ export class KaldiFbankExtractor {
     return { globalChannelMean, globalChannelStd };
   }
 
+  /**
+   * 【通道錨定混合 CMN (`sliceAndApplyCMN`)】：
+   * 保留 55% ~ 80% 之全局會議通道均值 (`globalChannelMean`) 作為參考基準，
+   * 防止 100% 減去局部語句均值時把語者固有的靜態聲道共振峰（男低音/女高音特質）一併抹除！
+   */
   public sliceAndApplyCMN(
     allFrames: Float32Array[],
     startFrame: number,
@@ -853,7 +919,7 @@ export class KaldiFbankExtractor {
     }
 
     const alphaGlobal = globalChannelMean
-      ? Math.max(0.0, Math.min(0.5, ((150.0 - T) / 150.0) * 0.5))
+      ? Math.max(0.55, Math.min(0.80, (250.0 - Math.min(200, T)) / 250.0))
       : 0.0;
 
     for (let t = 0; t < T; t++) {
@@ -902,7 +968,7 @@ export class KaldiFbankExtractor {
     }
 
     const alphaGlobal = globalChannelMean
-      ? Math.max(0.0, Math.min(0.5, ((150.0 - T) / 150.0) * 0.5))
+      ? Math.max(0.55, Math.min(0.80, (250.0 - Math.min(200, T)) / 250.0))
       : 0.0;
 
     for (let idx = 0; idx < T; idx++) {
@@ -930,7 +996,7 @@ export class KaldiFbankExtractor {
     numFrames: number,
     globalChannelMean?: Float32Array,
     globalChannelStd?: Float32Array,
-    f0Hz = 155,
+    f0Hz = 145,
     enableDivergenceEnhance = true,
     isHeritageClassicMode = false
   ): Float32Array {
@@ -1008,14 +1074,14 @@ export class KaldiFbankExtractor {
     }
 
     const logF0Norm =
-      (Math.log(Math.max(75, Math.min(340, f0Hz))) - 5.05) * 1.25;
+      (Math.log(Math.max(75, Math.min(340, f0Hz))) - 5.05) * 1.35;
     let lowBandE = 0.0;
     let highBandE = 0.0;
     for (let b = 4; b < 28; b++) lowBandE += normSpectralEnvelope[b];
     for (let b = 28; b < 68; b++) highBandE += normSpectralEnvelope[b];
     const spectralTilt = (highBandE / 40.0 - lowBandE / 24.0) * 0.65;
 
-    out[60] = logF0Norm * 0.65;
+    out[60] = logF0Norm * 0.75;
     out[61] = spectralTilt;
     out[62] = (normSpectralEnvelope[18] - normSpectralEnvelope[42]) * 0.6;
     out[63] = (normSpectralEnvelope[26] - normSpectralEnvelope[54]) * 0.6;
@@ -1193,7 +1259,10 @@ class SileroVadRunner {
             numSteps - 1,
             Math.max(0, Math.floor(sec / 0.032))
           );
-          outVad[f] = stepProbs[sIdx];
+          const ratio = smoothRms[f] / Math.max(1e-5, vadThreshold);
+          const energyProb = 1.0 / (1.0 + Math.exp(-3.4 * (ratio - 0.92)));
+          // 融合 Silero VAD 與 P02 能量機率，避免遠距小聲語者被單一模型漏抓
+          outVad[f] = Math.max(stepProbs[sIdx], energyProb * 0.88);
         }
         return outVad;
       } catch {
@@ -1203,7 +1272,7 @@ class SileroVadRunner {
 
     for (let f = 0; f < numFbankFrames; f++) {
       const ratio = smoothRms[f] / Math.max(1e-5, vadThreshold);
-      outVad[f] = 1.0 / (1.0 + Math.exp(-3.4 * (ratio - 0.95)));
+      outVad[f] = 1.0 / (1.0 + Math.exp(-3.4 * (ratio - 0.92)));
     }
     return outVad;
   }
@@ -1438,10 +1507,10 @@ export class AutoTuningSpectralClusterer {
       return { labels: new Int32Array(N).fill(0), optimalK: 1 };
     }
 
-    const effectiveMinK = Math.max(1, minK);
+    const effectiveMinK = Math.max(1, Math.min(2, minK));
     const effectiveMaxK = Math.max(
       effectiveMinK,
-      Math.min(maxK + 2, Math.floor(N / 2))
+      Math.min(maxK + 1, Math.floor(N / 2))
     );
 
     const clusters: number[][] = Array.from({ length: N }, (_, idx) => [idx]);
@@ -1522,10 +1591,11 @@ export class AutoTuningSpectralClusterer {
       return { labels: new Int32Array(N).fill(0), optimalK: 1, optimalP: 1 };
     }
 
+    const effectiveMinK = Math.max(1, Math.min(2, minK));
     const ahcProbe = this.clusterManifoldAhcCosine(
       affinityMatrix,
       N,
-      minK,
+      effectiveMinK,
       maxK,
       stopSimThreshold
     );
@@ -1538,7 +1608,6 @@ export class AutoTuningSpectralClusterer {
       true
     );
 
-    const effectiveMinK = Math.max(2, minK);
     const effectiveMaxK = Math.max(
       effectiveMinK,
       Math.min(maxK, Math.floor(N / 2))
@@ -1627,7 +1696,7 @@ export class AutoTuningSpectralClusterer {
       { length: S },
       () => new Float32Array(D)
     );
-    const invTemp = D >= 128 ? 22.0 : 12.5;
+    const invTemp = D >= 128 ? 20.0 : 12.0;
     const coreGate = 0.45;
 
     for (let iter = 0; iter < 8; iter++) {
@@ -1656,7 +1725,7 @@ export class AutoTuningSpectralClusterer {
           }
         }
         centroids[s] = l2Normalize(centroids[s]);
-        pi[s] = Math.pow(Math.max(1e-4, sumG / N), 0.15);
+        pi[s] = Math.pow(Math.max(1e-4, sumG / N), 0.18);
       }
 
       let piSum = 0.0;
@@ -1697,8 +1766,9 @@ export class AutoTuningSpectralClusterer {
       mass: clusterMass[s],
     })).sort((a, b) => b.mass - a.mass);
 
-    let keptCount = clusterRanked.filter((c) => c.mass >= 1.35).length;
-    keptCount = Math.max(minK, Math.min(maxK, Math.min(S, keptCount)));
+    const effectiveMinK = Math.max(1, Math.min(2, minK));
+    let keptCount = clusterRanked.filter((c) => c.mass >= 1.5).length;
+    keptCount = Math.max(effectiveMinK, Math.min(maxK, Math.min(S, keptCount)));
     const keptClusterIndices = clusterRanked
       .slice(0, keptCount)
       .map((c) => c.s);
@@ -1914,7 +1984,6 @@ class WeSpeakerOnnxRunner {
       if (this.ortModule.env?.wasm) {
         this.ortModule.env.wasm.wasmPaths = wasmRootUrl;
         this.ortModule.env.wasm.simd = true;
-        // 限制 WASM 執行緒數 <= 2，避免開啟過多 SharedArrayBuffer Pthread 佔用系統已認可記憶體
         this.ortModule.env.wasm.numThreads = Math.max(
           1,
           Math.min(2, Math.floor((navigator.hardwareConcurrency || 4) / 2))
@@ -1978,7 +2047,7 @@ class WeSpeakerOnnxRunner {
     fbankHelper: KaldiFbankExtractor,
     globalChannelMean?: Float32Array,
     globalChannelStd?: Float32Array,
-    f0Hz = 155
+    f0Hz = 145
   ): Promise<Float32Array> {
     const enableEnhance =
       this.config.enableAcousticDivergencePreproc ?? true;
@@ -2098,8 +2167,8 @@ function buildVirtualSpeakerTrackBatches(
     if (
       prev &&
       prev.speakerId === t.speakerId &&
-      t.start - prev.end <= 0.28 &&
-      t.end - prev.start <= 12.0
+      t.start - prev.end <= 0.45 &&
+      t.end - prev.start <= 14.0
     ) {
       prev.end = t.end;
       prev.speakerConfidence = Math.max(
@@ -2219,6 +2288,10 @@ self.onmessage = async (event: MessageEvent) => {
     minSpeakers,
     Math.min(10, Number(data.maxSpeakers) || 6)
   );
+  // 單一 5 分鐘微批次內實際開口人數可能僅 2 人（如主席與單一分區報告人），
+  // 故單塊聚類下限設為 Math.min(2, minSpeakers)，防止強制把 2 個人切成 4~6 群！
+  const chunkEffectiveMinSpeakers = Math.max(1, Math.min(2, minSpeakers));
+
   const existingSpeakers: Speaker[] = Array.isArray(data.existingSpeakers)
     ? data.existingSpeakers
     : [];
@@ -2292,7 +2365,7 @@ self.onmessage = async (event: MessageEvent) => {
       type: 'DIARIZE_PROGRESS',
       progress: 12,
       detailText:
-        '計算 Bit-Exact Kaldi 80-dim Fbank、5% 分位數自適應底噪與無倍頻誤差基頻軌跡...',
+        '計算 Kaldi 80-dim Fbank、P02 真實靜音底噪與 YIN 無倍頻誤差基頻軌跡...',
     });
 
     const {
@@ -2315,21 +2388,14 @@ self.onmessage = async (event: MessageEvent) => {
     }
 
     const sortedRms = Array.from(frameRms).sort((a, b) => a - b);
-    const noiseQuantile = formulaCal?.vadNoiseQuantile ?? 0.05;
-    const speechMult = formulaCal?.vadSpeechMultiplier ?? 1.65;
-    const dynWeight = formulaCal?.vadDynamicRangeWeight ?? 0.06;
+    const noiseQuantile = Math.min(0.03, formulaCal?.vadNoiseQuantile ?? 0.02);
+    const speechMult = Math.min(1.42, formulaCal?.vadSpeechMultiplier ?? 1.32);
     const noiseFloor =
-      sortedRms[Math.floor(sortedRms.length * noiseQuantile)] || 0.004;
-    const p75Rms = sortedRms[Math.floor(sortedRms.length * 0.75)] || 0.04;
+      sortedRms[Math.floor(sortedRms.length * noiseQuantile)] || 0.003;
+    // 嚴格以 P02 靜音底噪錨定 vadThreshold，絕不讓近距大聲講者 (p75) 墊高門檻而吞沒遠距與會者！
     const vadThreshold = Math.max(
-      0.006,
-      Math.min(
-        noiseFloor * 2.1,
-        Math.max(
-          noiseFloor * speechMult,
-          noiseFloor + dynWeight * Math.max(0, p75Rms - noiseFloor)
-        )
-      )
+      0.0048,
+      Math.min(noiseFloor * 1.48, noiseFloor * speechMult)
     );
 
     const { globalChannelMean, globalChannelStd } =
@@ -2345,11 +2411,11 @@ self.onmessage = async (event: MessageEvent) => {
       vadThreshold
     );
 
-    // Silero VAD 完成後立即釋放其 ONNX Session 降低峰值記憶體
     await sileroRunner.release();
 
     const {
       stepHarmonicity,
+      stepZcr,
       calibratedHarmGate,
       boundaryScoreCurve,
       queryMedianPitchHz,
@@ -2363,12 +2429,12 @@ self.onmessage = async (event: MessageEvent) => {
       formulaCal
     );
 
-    // 原始 PCM 樣本於基頻軌跡提取後即可釋放參考
     samples = null;
 
+    // 僅針對「低諧波度且高過零率 (zcr > 0.26)」之真實翻紙/摩擦雜音壓低 VAD，100% 保護遠距低頻男聲 (zcr ~ 0.09)
     const frictionCeiling =
       formulaCal?.frictionHarmonicCeiling ??
-      Math.max(0.26, Math.min(0.35, calibratedHarmGate * 0.82));
+      Math.max(0.20, Math.min(0.28, calibratedHarmGate * 0.76));
     for (let s = 0; s < stepHarmonicity.length; s++) {
       const prevH = s > 0 ? stepHarmonicity[s - 1] : stepHarmonicity[s];
       const nextH =
@@ -2376,7 +2442,7 @@ self.onmessage = async (event: MessageEvent) => {
           ? stepHarmonicity[s + 1]
           : stepHarmonicity[s];
       const localMaxH = Math.max(stepHarmonicity[s], prevH, nextH);
-      if (localMaxH < frictionCeiling) {
+      if (localMaxH < frictionCeiling && stepZcr[s] > 0.26) {
         const f0 = s * 4;
         for (let k = f0; k < Math.min(numFrames, f0 + 4); k++) {
           frameVadProbs[k] = Math.min(frameVadProbs[k], 0.12);
@@ -2398,9 +2464,9 @@ self.onmessage = async (event: MessageEvent) => {
         }
         silFrames = 0;
 
-        if (fCursor - sf >= 175) {
-          const wStart = sf + 115;
-          const wEnd = Math.min(numFrames, sf + 205);
+        if (fCursor - sf >= 185) {
+          const wStart = sf + 120;
+          const wEnd = Math.min(numFrames, sf + 220);
           let bestCut = wStart;
           let minVal = Infinity;
           for (let k = wStart; k < wEnd; k++) {
@@ -2409,7 +2475,7 @@ self.onmessage = async (event: MessageEvent) => {
               bestCut = k;
             }
           }
-          if (bestCut - sf >= 118) {
+          if (bestCut - sf >= 120) {
             macroAnchorBounds.push({ startF: sf, endF: bestCut });
           }
           sf = bestCut;
@@ -2420,7 +2486,7 @@ self.onmessage = async (event: MessageEvent) => {
         silFrames++;
         if (silFrames >= 8) {
           const ef = fCursor - silFrames + 1;
-          if (ef - sf >= 118) {
+          if (ef - sf >= 115) {
             macroAnchorBounds.push({ startF: sf, endF: ef });
           }
           inSp = false;
@@ -2429,7 +2495,7 @@ self.onmessage = async (event: MessageEvent) => {
       }
       fCursor++;
     }
-    if (inSp && numFrames - sf >= 118) {
+    if (inSp && numFrames - sf >= 115) {
       macroAnchorBounds.push({ startF: sf, endF: numFrames });
     }
 
@@ -2438,17 +2504,20 @@ self.onmessage = async (event: MessageEvent) => {
         b.startF,
         b.endF
       );
-      return voicedRatio >= 0.40 && medianHarm >= calibratedHarmGate;
+      return voicedRatio >= 0.35 && medianHarm >= calibratedHarmGate;
     });
-    if (harmonicMacroBounds.length >= Math.max(2, minSpeakers)) {
+    if (harmonicMacroBounds.length >= Math.max(2, chunkEffectiveMinSpeakers)) {
       macroAnchorBounds.length = 0;
       macroAnchorBounds.push(...harmonicMacroBounds);
     }
 
-    if (macroAnchorBounds.length < Math.max(3, minSpeakers)) {
+    if (macroAnchorBounds.length < Math.max(3, chunkEffectiveMinSpeakers)) {
       macroAnchorBounds.length = 0;
       for (let f = 0; f + 90 <= numFrames; f += 75) {
-        macroAnchorBounds.push({ startF: f, endF: Math.min(numFrames, f + 110) });
+        macroAnchorBounds.push({
+          startF: f,
+          endF: Math.min(numFrames, f + 110),
+        });
       }
     }
 
@@ -2514,7 +2583,7 @@ self.onmessage = async (event: MessageEvent) => {
         const pitchPen = computeSoftPitchCompatibilityPenalty(
           macroAnchors[i].f0Hz,
           macroAnchors[j].f0Hz,
-          isOnnx256 ? 0.12 : 0.18
+          isOnnx256 ? 0.14 : 0.20
         );
         const s = rawSim - pitchPen;
         anchorAffinity[i * M + j] = s;
@@ -2522,7 +2591,7 @@ self.onmessage = async (event: MessageEvent) => {
       }
     }
 
-    const stopSimThreshold = isOnnx256 ? 0.28 : 0.46;
+    const stopSimThreshold = isOnnx256 ? 0.27 : 0.44;
 
     const seedRes =
       diarConfig.clusterMethod === 'spectral_cosine' ||
@@ -2530,14 +2599,14 @@ self.onmessage = async (event: MessageEvent) => {
         ? AutoTuningSpectralClusterer.clusterManifoldNmeSc(
             anchorAffinity,
             M,
-            minSpeakers,
+            chunkEffectiveMinSpeakers,
             maxSpeakers,
             stopSimThreshold
           )
         : AutoTuningSpectralClusterer.clusterManifoldAhcCosine(
             anchorAffinity,
             M,
-            minSpeakers,
+            chunkEffectiveMinSpeakers,
             maxSpeakers,
             stopSimThreshold
           );
@@ -2547,7 +2616,7 @@ self.onmessage = async (event: MessageEvent) => {
         macroAnchors.map((a) => a.embedding),
         seedRes.labels,
         seedRes.optimalK,
-        minSpeakers,
+        chunkEffectiveMinSpeakers,
         maxSpeakers
       );
 
@@ -2586,7 +2655,7 @@ self.onmessage = async (event: MessageEvent) => {
       }
 
       pitches.sort((a, b) => a - b);
-      const medF0 = pitches[Math.floor(pitches.length / 2)] || 155;
+      const medF0 = pitches[Math.floor(pitches.length / 2)] || 145;
       const normCentroid = l2Normalize(meanVec);
 
       const topExemplars = memberIndices
@@ -2609,7 +2678,8 @@ self.onmessage = async (event: MessageEvent) => {
       });
     }
 
-    while (localClusters.length > minSpeakers) {
+    // 【同性別音色衛星群聚整併】：防止同一位男主席或女報告人因遠近音量或語速變化被拆為多個同性別衛星群！
+    while (localClusters.length > chunkEffectiveMinSpeakers) {
       let bestI = -1;
       let bestJ = -1;
       let maxCSim = -Infinity;
@@ -2622,20 +2692,33 @@ self.onmessage = async (event: MessageEvent) => {
           const pitchPen = computeSoftPitchCompatibilityPenalty(
             cA.f0Hz,
             cB.f0Hz,
-            isOnnx256 ? 0.12 : 0.18
+            isOnnx256 ? 0.14 : 0.20
           );
           const cSim = rawSim - pitchPen;
+          const semiDiff = Math.abs(
+            12.0 * Math.log2(Math.max(75, cA.f0Hz) / Math.max(75, cB.f0Hz))
+          );
+          const isSameGenderRegister =
+            ((cA.f0Hz < 162 && cB.f0Hz < 162) ||
+              (cA.f0Hz >= 168 && cB.f0Hz >= 168)) &&
+            semiDiff <= 3.6;
           const minCount = Math.min(
             cA.anchorIndices.length,
             cB.anchorIndices.length
           );
-          const mergeThresh = isOnnx256
-            ? minCount <= 4
-              ? 0.415
-              : 0.46
-            : minCount <= 4
-            ? 0.58
-            : 0.64;
+          const minDur = Math.min(cA.totalDurSec, cB.totalDurSec);
+
+          let mergeThresh = isOnnx256
+            ? minCount <= 4 || minDur < 12.0
+              ? 0.36
+              : 0.42
+            : minCount <= 4 || minDur < 12.0
+            ? 0.50
+            : 0.58;
+
+          if (isSameGenderRegister) {
+            mergeThresh -= isOnnx256 ? 0.05 : 0.06;
+          }
 
           if (cSim >= mergeThresh && cSim > maxCSim) {
             maxCSim = cSim;
@@ -2720,7 +2803,7 @@ self.onmessage = async (event: MessageEvent) => {
 
       for (const sp of updatedSpeakers) {
         if (usedGlobalSpeakerIds.has(sp.id)) continue;
-        const spF0 = sp.f0Hz ?? sp.centroid?.[0] ?? 155;
+        const spF0 = sp.f0Hz ?? sp.centroid?.[0] ?? 145;
         const spEmb =
           sp.embedding && sp.embedding.length === embDim ? sp.embedding : null;
         if (!spEmb) continue;
@@ -2745,9 +2828,9 @@ self.onmessage = async (event: MessageEvent) => {
         }
       }
 
-      if (bestSp && bestOmega >= 0.42) {
+      if (bestSp && bestOmega >= 0.38) {
         usedGlobalSpeakerIds.add(bestSp.id);
-        if (bestOmega >= 0.5) {
+        if (bestOmega >= 0.46) {
           const oldMass = bestSp.accumulatedMass || 10.0;
           const alpha = Math.min(
             0.22,
@@ -2782,7 +2865,7 @@ self.onmessage = async (event: MessageEvent) => {
       } else if (updatedSpeakers.length < maxSpeakers) {
         const nextNum = updatedSpeakers.length + 1;
         const newId = `Speaker_${String(nextNum).padStart(2, '0')}`;
-        const pitchLabel = loc.f0Hz >= 175 ? '女聲/高音' : '男聲/中低音';
+        const pitchLabel = loc.f0Hz >= 168 ? '女聲/高音' : '男聲/中低音';
         const newSp: Speaker = {
           id: newId,
           name: `語者 ${String(nextNum).padStart(2, '0')} (${pitchLabel})`,
@@ -2812,7 +2895,7 @@ self.onmessage = async (event: MessageEvent) => {
         sp.embedding.length === embDim
       ) {
         activeProfiles.set(sp.id, {
-          f0Hz: sp.f0Hz ?? 155,
+          f0Hz: sp.f0Hz ?? 145,
           masterCentroid: l2Normalize(sp.embedding),
           anchorBank: (sp.anchorBank || [])
             .filter((a) => a.length === embDim)
@@ -2825,7 +2908,7 @@ self.onmessage = async (event: MessageEvent) => {
     if (activeProfiles.size === 0 && updatedSpeakers.length > 0) {
       const sp0 = updatedSpeakers[0];
       activeProfiles.set(sp0.id, {
-        f0Hz: sp0.f0Hz ?? 155,
+        f0Hz: sp0.f0Hz ?? 145,
         masterCentroid: sp0.embedding
           ? l2Normalize(sp0.embedding)
           : new Float32Array(embDim),
@@ -2836,11 +2919,11 @@ self.onmessage = async (event: MessageEvent) => {
     const scdSensitivity = diarConfig.scdPeakThreshold ?? 0.22;
     const finePeakCutoff =
       formulaCal?.scdPeakCutoff ??
-      Math.max(0.48, Math.min(0.58, 0.42 + scdSensitivity * 0.5));
-    const maxMicroTurnFrames = Math.round(
-      (formulaCal?.maxMicroTurnSec ?? 1.65) * 100
-    );
+      Math.max(0.47, Math.min(0.56, 0.40 + scdSensitivity * 0.5));
 
+    // 【Stage 2 微觀話輪邊界切分】：
+    // 僅在真實靜音停頓 (silFrames >= 8) 或真實聲學邊界波峰 (boundaryScoreCurve >= finePeakCutoff) 處切分，
+    // 廢除舊版「每 1.65 秒無條件強制砍斷連續長句」之缺陷！
     const fineBounds: Array<{ startF: number; endF: number }> = [];
     inSp = false;
     sf = 0;
@@ -2856,9 +2939,9 @@ self.onmessage = async (event: MessageEvent) => {
         silFrames = 0;
         const curLen = fCursor - sf;
 
-        if (curLen >= 55 && boundaryScoreCurve[fCursor] >= finePeakCutoff) {
-          const checkStart = Math.max(sf + 45, fCursor - 15);
-          const checkEnd = Math.min(numFrames, fCursor + 15);
+        if (curLen >= 42 && boundaryScoreCurve[fCursor] >= finePeakCutoff) {
+          const checkStart = Math.max(sf + 35, fCursor - 14);
+          const checkEnd = Math.min(numFrames, fCursor + 14);
           let isLocalMax = true;
           for (let k = checkStart; k < checkEnd; k++) {
             if (boundaryScoreCurve[k] > boundaryScoreCurve[fCursor]) {
@@ -2874,27 +2957,30 @@ self.onmessage = async (event: MessageEvent) => {
           }
         }
 
-        if (curLen >= maxMicroTurnFrames) {
-          const wStart = sf + 85;
-          const wEnd = Math.min(numFrames, sf + maxMicroTurnFrames + 10);
-          let bestCut = wStart;
-          let maxB = -1.0;
+        // 若單人連續無停頓發聲超過 4.5 秒 (450 幀)，僅在內部確實存在次波峰 (>= finePeakCutoff * 0.78) 時才進行保護性分段
+        if (curLen >= 450) {
+          const wStart = sf + 150;
+          const wEnd = Math.min(numFrames, sf + 450);
+          let bestCut = -1;
+          let maxB = finePeakCutoff * 0.78;
           for (let k = wStart; k < wEnd; k++) {
-            if (boundaryScoreCurve[k] > maxB) {
+            if (boundaryScoreCurve[k] >= maxB) {
               maxB = boundaryScoreCurve[k];
               bestCut = k;
             }
           }
-          fineBounds.push({ startF: sf, endF: bestCut });
-          sf = bestCut;
-          fCursor = bestCut;
-          continue;
+          if (bestCut > sf + 120) {
+            fineBounds.push({ startF: sf, endF: bestCut });
+            sf = bestCut;
+            fCursor = bestCut;
+            continue;
+          }
         }
       } else if (inSp) {
         silFrames++;
         if (silFrames >= 8) {
           const ef = fCursor - silFrames + 1;
-          if (ef - sf >= 24) {
+          if (ef - sf >= 20) {
             fineBounds.push({ startF: sf, endF: ef });
           }
           inSp = false;
@@ -2903,7 +2989,7 @@ self.onmessage = async (event: MessageEvent) => {
       }
       fCursor++;
     }
-    if (inSp && numFrames - sf >= 24) {
+    if (inSp && numFrames - sf >= 20) {
       fineBounds.push({ startF: sf, endF: numFrames });
     }
 
@@ -2923,13 +3009,25 @@ self.onmessage = async (event: MessageEvent) => {
 
     for (let f = 0; f < numPostFrames; f++) {
       const f10ms = Math.min(numFrames - 1, f * 2);
-      postOsdProbs[f] = boundaryScoreCurve[f10ms] >= 0.55 ? 0.28 : 0.04;
+      postOsdProbs[f] = boundaryScoreCurve[f10ms] >= 0.54 ? 0.28 : 0.04;
       for (let k = 0; k < K_active; k++) {
         flatPosteriors[f * K_active + k] = 1.0 / Math.max(1, K_active);
       }
     }
 
-    const rawFineTurns: FineDiarizationTurn[] = [];
+    interface TurnCandidateEvaluation {
+      startF: number;
+      endF: number;
+      startSec: number;
+      endSec: number;
+      f0Hz: number;
+      bLeft: number;
+      bRight: number;
+      rawScores: Float64Array;
+      probs: Float32Array;
+    }
+
+    const turnEvals: TurnCandidateEvaluation[] = [];
 
     for (let idx = 0; idx < fineBounds.length; idx++) {
       const b = fineBounds[idx];
@@ -2938,7 +3036,8 @@ self.onmessage = async (event: MessageEvent) => {
         b.startF,
         b.endF
       );
-      if (voicedRatio < 0.22 && medianHarm < 0.42) {
+      // 保留遠距與會者之低能量諧波話輪（如「24號」、「禮拜三早上」），僅過濾純無聲摩擦雜訊
+      if (voicedRatio < 0.12 && medianHarm < 0.24) {
         continue;
       }
       const f0Hz = queryMedianPitchHz(b.startF, b.endF);
@@ -2959,14 +3058,11 @@ self.onmessage = async (event: MessageEvent) => {
         f0Hz
       );
 
-      let top1Sp = activeSpeakerIds[0] || 'Speaker_01';
-      let top2Sp = top1Sp;
       let s1 = -2.0;
-      let s2 = -2.0;
       const rawScores = new Float64Array(K_active);
 
       for (let pIdx = 0; pIdx < K_active; pIdx++) {
-        const [spId, prof] = activeEntries[pIdx];
+        const [, prof] = activeEntries[pIdx];
         const cSim = cosineSimilarity(emb, prof.masterCentroid);
         let sumASim = 0.0;
         for (const anc of prof.anchorBank) {
@@ -2977,20 +3073,11 @@ self.onmessage = async (event: MessageEvent) => {
         const pitchPen = computeSoftPitchCompatibilityPenalty(
           f0Hz,
           prof.f0Hz,
-          0.14
+          0.18
         );
-        const compScore = 0.6 * cSim + 0.4 * avgASim - pitchPen;
+        const compScore = 0.62 * cSim + 0.38 * avgASim - pitchPen;
         rawScores[pIdx] = compScore;
-
-        if (compScore > s1) {
-          s2 = s1;
-          top2Sp = top1Sp;
-          s1 = compScore;
-          top1Sp = spId;
-        } else if (compScore > s2) {
-          s2 = compScore;
-          top2Sp = spId;
-        }
+        if (compScore > s1) s1 = compScore;
       }
 
       const probs = new Float32Array(K_active);
@@ -3006,14 +3093,149 @@ self.onmessage = async (event: MessageEvent) => {
 
       const startSec = Number((chunkStartSec + b.startF * 0.01).toFixed(2));
       const endSec = Number((chunkStartSec + b.endF * 0.01).toFixed(2));
+      const bLeft = Number((boundaryScoreCurve[b.startF] || 0).toFixed(3));
+      const bRight = Number(
+        (boundaryScoreCurve[Math.min(numFrames - 1, b.endF)] || 0).toFixed(3)
+      );
+
+      turnEvals.push({
+        startF: b.startF,
+        endF: b.endF,
+        startSec,
+        endSec,
+        f0Hz,
+        bLeft,
+        bRight,
+        rawScores,
+        probs,
+      });
+
+      if ((idx + 1) % (yieldStep * 2) === 0 || idx === fineBounds.length - 1) {
+        const pct = 52 + Math.round(((idx + 1) / fineBounds.length) * 42);
+        self.postMessage({
+          type: 'DIARIZE_PROGRESS',
+          progress: pct,
+          detailText: `第二階段：微觀話輪聲紋歸屬與話輪級 Viterbi 平滑 (${idx + 1}/${fineBounds.length})...`,
+        });
+        await new Promise((r) => setTimeout(r, 1));
+      }
+    }
+
+    await onnxRunner.release();
+    allFbankFrames.length = 0;
+
+    // 【話輪級 Viterbi HMM 平滑解碼】：
+    // 消除單一短話輪因翻頁雜音或語速變化在同性別語者間隨機跳動之現象，同時對真實音域跨越 (男<->女) 與高邊界波峰即時開放換人！
+    const T_turns = turnEvals.length;
+    const viterbiSpeakerIdx = new Int32Array(T_turns);
+    if (T_turns > 0 && K_active > 1) {
+      const dp = Array.from(
+        { length: T_turns },
+        () => new Float64Array(K_active).fill(-Infinity)
+      );
+      const backPtr = Array.from(
+        { length: T_turns },
+        () => new Int32Array(K_active)
+      );
+
+      for (let k = 0; k < K_active; k++) {
+        dp[0][k] = turnEvals[0].rawScores[k];
+      }
+
+      for (let t = 1; t < T_turns; t++) {
+        const prevTurn = turnEvals[t - 1];
+        const currTurn = turnEvals[t];
+        const gapSec = Math.max(0.0, currTurn.startSec - prevTurn.endSec);
+        const semiDiff = Math.abs(
+          12.0 *
+            Math.log2(
+              Math.max(75, currTurn.f0Hz) / Math.max(75, prevTurn.f0Hz)
+            )
+        );
+        const isGenderSwitch =
+          (prevTurn.f0Hz < 160 && currTurn.f0Hz >= 170) ||
+          (prevTurn.f0Hz >= 170 && currTurn.f0Hz < 160);
+
+        let switchCost = 0.095;
+        if (isGenderSwitch || currTurn.bLeft >= finePeakCutoff) {
+          switchCost = 0.01;
+        } else if (gapSec <= 1.6 && semiDiff <= 3.0 && currTurn.bLeft < 0.42) {
+          switchCost = 0.14;
+        }
+
+        const durWeight = Math.min(
+          1.6,
+          Math.max(0.75, (currTurn.endSec - currTurn.startSec) / 1.2)
+        );
+
+        for (let kCurr = 0; kCurr < K_active; kCurr++) {
+          let bestPrevVal = -Infinity;
+          let bestPrevK = 0;
+          for (let kPrev = 0; kPrev < K_active; kPrev++) {
+            const penalty = kCurr === kPrev ? 0.0 : switchCost;
+            const val = dp[t - 1][kPrev] - penalty;
+            if (val > bestPrevVal) {
+              bestPrevVal = val;
+              bestPrevK = kPrev;
+            }
+          }
+          dp[t][kCurr] =
+            bestPrevVal + durWeight * currTurn.rawScores[kCurr];
+          backPtr[t][kCurr] = bestPrevK;
+        }
+      }
+
+      let bestLastK = 0;
+      let maxFinal = -Infinity;
+      for (let k = 0; k < K_active; k++) {
+        if (dp[T_turns - 1][k] > maxFinal) {
+          maxFinal = dp[T_turns - 1][k];
+          bestLastK = k;
+        }
+      }
+      viterbiSpeakerIdx[T_turns - 1] = bestLastK;
+      for (let t = T_turns - 1; t >= 1; t--) {
+        viterbiSpeakerIdx[t - 1] = backPtr[t][viterbiSpeakerIdx[t]];
+      }
+    }
+
+    const rawFineTurns: FineDiarizationTurn[] = [];
+    for (let t = 0; t < T_turns; t++) {
+      const ev = turnEvals[t];
+      const chosenIdx = viterbiSpeakerIdx[t];
+      const top1Sp = activeSpeakerIds[chosenIdx] || 'Speaker_01';
+
+      let runnerUpIdx = chosenIdx;
+      let bestAltScore = -Infinity;
+      for (let k = 0; k < K_active; k++) {
+        if (k !== chosenIdx && ev.rawScores[k] > bestAltScore) {
+          bestAltScore = ev.rawScores[k];
+          runnerUpIdx = k;
+        }
+      }
+      const top2Sp = activeSpeakerIds[runnerUpIdx] || top1Sp;
+      const s1 = ev.rawScores[chosenIdx];
+      const s2 = runnerUpIdx !== chosenIdx ? ev.rawScores[runnerUpIdx] : s1 - 0.25;
+
+      // 將 Viterbi 平滑後的主語者強化注入幀級後驗矩陣
+      const smoothedProbs = new Float32Array(K_active);
+      let pSum = 0.0;
+      for (let k = 0; k < K_active; k++) {
+        const boost = k === chosenIdx ? 1.35 : 1.0;
+        smoothedProbs[k] = ev.probs[k] * boost;
+        pSum += smoothedProbs[k];
+      }
+      for (let k = 0; k < K_active; k++) {
+        smoothedProbs[k] /= Math.max(1e-12, pSum);
+      }
 
       const fStart = Math.max(
         0,
-        Math.floor((startSec - chunkStartSec) / postFrameStepSec)
+        Math.floor((ev.startSec - chunkStartSec) / postFrameStepSec)
       );
       const fEnd = Math.min(
         numPostFrames - 1,
-        Math.ceil((endSec - chunkStartSec) / postFrameStepSec)
+        Math.ceil((ev.endSec - chunkStartSec) / postFrameStepSec)
       );
       for (let f = fStart; f <= fEnd; f++) {
         const prevW = postWeightAcc[f];
@@ -3022,63 +3244,47 @@ self.onmessage = async (event: MessageEvent) => {
         for (let k = 0; k < K_active; k++) {
           flatPosteriors[rowOff + k] =
             prevW === 0
-              ? probs[k]
-              : (flatPosteriors[rowOff + k] * prevW + probs[k]) / newW;
+              ? smoothedProbs[k]
+              : (flatPosteriors[rowOff + k] * prevW + smoothedProbs[k]) / newW;
         }
         postWeightAcc[f] = newW;
       }
 
       const margin = Math.max(0.0, s1 - (s2 > -1.5 ? s2 : 0.0));
-      const p1 = Math.max(0.5, Math.min(0.99, (s1 + 1.0) / 2.0));
+      const p1 = Math.max(0.52, Math.min(0.99, (s1 + 1.0) / 2.0));
       const p2 = Math.max(0.01, p1 - margin);
       const logOdds = Number(
         (Math.log(p1 + 1e-6) - Math.log(p2 + 1e-6)).toFixed(3)
       );
-      const bLeft = Number((boundaryScoreCurve[b.startF] || 0).toFixed(3));
-      const bRight = Number(
-        (boundaryScoreCurve[Math.min(numFrames - 1, b.endF)] || 0).toFixed(3)
-      );
 
       rawFineTurns.push({
-        start: startSec,
-        end: endSec,
+        start: ev.startSec,
+        end: ev.endSec,
         speakerId: top1Sp,
         runnerUpSpeakerId: top2Sp,
-        f0Hz: Math.round(f0Hz),
+        f0Hz: Math.round(ev.f0Hz),
         speakerConfidence: Number(p1.toFixed(3)),
         speakerMargin: Number(margin.toFixed(3)),
         logOddsMargin: logOdds,
-        overlapRatio: bLeft >= 0.55 || bRight >= 0.55 ? 0.22 : 0.04,
-        boundaryScdLeft: bLeft,
-        boundaryScdRight: bRight,
+        overlapRatio: ev.bLeft >= 0.55 || ev.bRight >= 0.55 ? 0.22 : 0.04,
+        boundaryScdLeft: ev.bLeft,
+        boundaryScdRight: ev.bRight,
         isProtectedBackchannel:
-          margin >= backchannelMarginReq || bLeft + bRight >= 0.85,
-        isAnchorTurn: durF >= 115,
+          margin >= backchannelMarginReq || ev.bLeft + ev.bRight >= 0.85,
+        isAnchorTurn: ev.endF - ev.startF >= 115,
       });
-
-      if ((idx + 1) % (yieldStep * 2) === 0 || idx === fineBounds.length - 1) {
-        const pct = 52 + Math.round(((idx + 1) / fineBounds.length) * 42);
-        self.postMessage({
-          type: 'DIARIZE_PROGRESS',
-          progress: pct,
-          detailText: `第二階段：微觀話輪聲紋歸屬與邊界校準 (${idx + 1}/${fineBounds.length})...`,
-        });
-        await new Promise((r) => setTimeout(r, 1));
-      }
     }
 
-    // 顯式釋放 WeSpeaker ONNX Session 與 Fbank 矩陣，讓瀏覽器立即回收 WASM 堆積記憶體
-    await onnxRunner.release();
-    allFbankFrames.length = 0;
-
+    // 【同語者翻頁與換氣停頓無縫縫合】：
+    // 只要相鄰兩個話輪屬於同一位語者（中間沒有其他語者開口），即使中間有 <= 2.4 秒的翻閱資料或思考停頓，亦直接縫合為單一連續話輪！
     const fineTimelineTurns: FineDiarizationTurn[] = [];
     for (const item of rawFineTurns) {
       const prev = fineTimelineTurns[fineTimelineTurns.length - 1];
       if (
         prev &&
         prev.speakerId === item.speakerId &&
-        item.start - prev.end <= 0.55 &&
-        item.end - prev.start <= 12.0
+        item.start - prev.end <= 2.4 &&
+        item.end - prev.start <= 22.0
       ) {
         prev.end = item.end;
         prev.speakerConfidence = Math.max(
@@ -3092,43 +3298,6 @@ self.onmessage = async (event: MessageEvent) => {
         prev.boundaryScdRight = item.boundaryScdRight;
       } else {
         fineTimelineTurns.push({ ...item });
-      }
-    }
-
-    for (let i = 1; i < fineTimelineTurns.length; i++) {
-      const prev = fineTimelineTurns[i - 1];
-      const curr = fineTimelineTurns[i];
-      const semiDiff = Math.abs(
-        12.0 * Math.log2(Math.max(80, curr.f0Hz) / Math.max(80, prev.f0Hz))
-      );
-      if (
-        curr.speakerId !== prev.speakerId &&
-        curr.runnerUpSpeakerId === prev.speakerId &&
-        curr.start - prev.end <= 0.42 &&
-        (curr.speakerMargin || 0) < 0.075 &&
-        (curr.boundaryScdLeft || 0) < 0.48 &&
-        semiDiff < 2.8
-      ) {
-        curr.speakerId = prev.speakerId;
-      }
-    }
-
-    for (let i = 1; i < fineTimelineTurns.length - 1; i++) {
-      const prev = fineTimelineTurns[i - 1];
-      const curr = fineTimelineTurns[i];
-      const next = fineTimelineTurns[i + 1];
-      const dur = curr.end - curr.start;
-      const dualPeak =
-        (curr.boundaryScdLeft || 0) + (curr.boundaryScdRight || 0);
-
-      if (
-        prev.speakerId === next.speakerId &&
-        curr.speakerId !== prev.speakerId &&
-        dur < 0.35 &&
-        (curr.speakerMargin || 0) < 0.08 &&
-        dualPeak < 0.75
-      ) {
-        curr.speakerId = prev.speakerId;
       }
     }
 
