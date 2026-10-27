@@ -3,29 +3,34 @@ import React, { useState } from 'react';
 import {
   Users,
   Merge,
+  Sparkles,
   CheckCircle2,
   Sliders,
-  Sparkles,
-  Info,
-  Globe2,
-  Activity,
+  Settings2,
   ChevronDown,
   ChevronUp,
-  HelpCircle,
-  Settings2,
+  Globe2,
+  Activity,
 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
 import {
+  AudioRecommendationOption,
   CompliantOnnxSpeakerModel,
   DiarizationClusterMethod,
   DiarizationEngineMode,
   MeetingLanguageHint,
 } from '../../types';
-import * as phoneticModule from '../../utils/phoneticMatcher';
+import {
+  computeTaiwanPhoneticDistance,
+  toPhoneticSignature,
+} from '../../utils/phoneticMatcher';
+import { HoverInfoPopover } from '../common/HoverInfoPopover';
 
-interface ModeScenarioGuide {
-  shortBadge: string;
+interface StrategyGuideCard {
+  mode: DiarizationEngineMode;
   optionLabel: string;
+  badge: string;
+  title: string;
   whyChoose: string;
   bestFor: string;
   notFor: string;
@@ -33,132 +38,101 @@ interface ModeScenarioGuide {
   techPrincipleDetail: string;
 }
 
-const ENGINE_STRATEGY_GUIDES: Record<DiarizationEngineMode, ModeScenarioGuide> =
+const ENGINE_STRATEGY_GUIDES: Record<DiarizationEngineMode, StrategyGuideCard> =
   {
     mode_0_heritage_classic: {
-      shortBadge: '標準會議 (推薦)',
-      optionLabel: '★ 標準會議模式（預設推薦・多數會議首選）',
-      whyChoose: '兼顧「多人聲音區分」與「對話先後順序」，開箱即用最穩定。',
-      bestFor: '2～6 人一般部門會議、專案討論、男女與同性別混合且有來回接話。',
-      notFor: '超過 2 小時以上長錄音且使用無獨顯舊筆電（建議改選快速省電模式）。',
-      techPrincipleTitle: '兩階段黃金長句定錨 + WeSpeaker 256維聲紋',
+      mode: 'mode_0_heritage_classic',
+      optionLabel: '★ 標準會議模式（2～6 人推薦）',
+      badge: '預設推薦',
+      title: '標準會議模式（兼顧長句與快速問答）',
+      whyChoose:
+        '先抓取清楚的長句建立每個人的聲音檔案，再透過 YIN 基頻與話輪 Viterbi 平滑切分短句與快速應答（「24號」、「不算」、「對」），最不易把同一人切碎。',
+      bestFor:
+        '2～6 人一般部門會議、專案進度檢討、男女與同性別混合且有來回接話的討論',
+      notFor: '10 人以上且全程同時重疊喧嘩的大型活動',
+      techPrincipleTitle: '兩階段雙尺度定錨 + YIN 基頻與話輪 Viterbi 平滑',
       techPrincipleDetail:
-        '第一階段先抓取 1.2～2.2 秒高信噪比長句提取 256 維神經聲紋定錨語者；第二階段結合「基頻跳變 + 能量谷底 + 共振峰通量」切出微觀話輪，並以 12～20 秒靜音谷底視窗搭配字級 Viterbi 對齊，確保同性別可分開且句子順序不顛倒。',
+        '第一階段僅取 >=1.2 秒高諧波有聲長句提取 WeSpeaker 256 維聲紋建立語者中心；第二階段以 YIN 累積均值差分基頻、分貝階躍與話輪級 Viterbi 平滑歸屬微觀話輪。',
     },
     mode_c_onnx_neural: {
-      shortBadge: '同性別精細區分',
-      optionLabel: '精細音色模式（多位同性別與會者）',
-      whyChoose: '針對聲音相近的同性別與會者，強化細微腔調與音色共鳴的區分度。',
-      bestFor: '多位同性別與會者（如 3 女 1 男、全男或全女）且需要細分每個人時。',
-      notFor: '現場環境雜音極大、麥克風離太遠，或想最快拿到初稿時。',
-      techPrincipleTitle: 'WeSpeaker 256維雙尺度深度聲紋 + 短句延展',
+      mode: 'mode_c_onnx_neural',
+      optionLabel: '同性別與密集搶話強化（深度聲紋模式）',
+      badge: '高敏感度',
+      title: '同性別與密集搶話強化模式',
+      whyChoose:
+        '當與會者全部是同性別（例如全男或全女）、聲音聽起來很像，或是大家頻繁插話搶話時，加強區分細微的聲音腔體差異。',
+      bestFor: '全同性別與會者且音色相近、高頻率交叉問答、腦力激盪會議',
+      notFor: '講者習慣在句中長時間停頓思考（高敏感度較容易將停頓切開）',
+      techPrincipleTitle: 'WeSpeaker ResNet34 256D 神經聲紋 + AHC 凝聚分群',
       techPrincipleDetail:
-        '融合宏觀與微觀雙尺度 256 維超球面神經聲紋，並針對短於 1 秒的附和詞執行時長自適應混合 CMN 與張量週期延展，最大化同性別不同語者的超球面餘弦邊際。',
+        '直接透過 80-dim Kaldi Fbank 擷取 256 維深度神經聲紋向量，針對 F2~F4 個人聲道共振峰差異加權，專攻基頻接近但腔體不同的同性別語者。',
     },
     mode_b_advanced_dsp: {
-      shortBadge: '主講與簡報',
-      optionLabel: '主講與簡報模式（一人主講、少數人提問）',
-      whyChoose: '保護偶爾才開口提問的人，不會因為主講人講太久而被系統吞併。',
-      bestFor: '教育訓練、專題發表、1 人主講佔 70% 以上時間、其他人僅偶爾插話。',
-      notFor: '每個人都在頻繁搶話、每句話都只有兩三個字的激烈討論。',
-      techPrincipleTitle: '密度感知譜聚類 (NME-SC) + 溫和先驗 VBx',
+      mode: 'mode_b_advanced_dsp',
+      optionLabel: '長篇簡報與訪談模式（防句中斷裂）',
+      badge: '長句保護',
+      title: '長篇簡報與專題報告模式',
+      whyChoose:
+        '拉高換人判定門檻，就算主講人在句中停頓喘氣、翻閱資料或思考，系統也會盡量保持為同一個人，避免把一段話切成好幾段。',
+      bestFor: '專題簡報、教育訓練、法說會、單人主講搭配少數提問',
+      notFor: '多人每秒快速一問一答的激烈討論',
+      techPrincipleTitle: 'NME-SC 自調諧譜聚類 + 高門檻防碎切保護',
       techPrincipleDetail:
-        '結合正規化拉普拉斯算子特徵間隙與阻尼先驗變分貝氏聚類（Tempered-Prior VBx），防止高發言量主講人的先驗機率過度膨脹而吸走少數發言者的短句。',
+        '建構全局餘弦親和力拉普拉斯圖譜，透過特徵間隙自動估計語者數，並提高邊界波峰門檻以維持長篇論述的語者連貫性。',
     },
     mode_a_classic: {
-      shortBadge: '快速省電初稿',
-      optionLabel: '快速省電模式（長錄音 / 一般文書筆電）',
-      whyChoose: '轉檔速度最快、最省電，適合先快速產出文字初稿再手動微調。',
-      bestFor: '1～2 小時以上長錄音、輕薄文書筆電，或不在意同性別細分的情境。',
-      notFor: '有多位同性別與會者，且需要系統自動精細區分每個人時。',
-      techPrincipleTitle: '純 DSP 64維共振峰統計池化 (無須 ONNX 模型)',
+      mode: 'mode_a_classic',
+      optionLabel: '輕量省電模式（低階筆電 / 行動裝置適用）',
+      badge: '極速低耗',
+      title: '輕量省電模式（純聲學特徵快速分群）',
+      whyChoose:
+        '不載入額外的神經聲紋模型，把系統記憶體與顯卡資源全部留給語音轉文字引擎，在無獨立顯卡的筆電或平板上最流暢。',
+      bestFor: '1～3 人單純對談、長時數錄音快速初稿、記憶體較小的文書筆電',
+      notFor: '4 人以上且聲音極度相近的複雜多人會議',
+      techPrincipleTitle: '64 維共振峰時頻統計池化 (Formant-Preserving TSTP)',
       techPrincipleDetail:
-        '全程使用輕量級 64 維 Kaldi Fbank 共振峰包絡與時序統計池化（TSTP），CPU 與記憶體負擔最低，老舊筆電也能流暢執行。',
+        '完全在 CPU 上高速計算 MFCC 倒頻譜、頻譜斜率與 YIN 基頻特徵，零額外記憶體佔用，推論速度最快。',
     },
   };
 
-/**
- * 浮出式說明視窗組件 (內建於組件內，零外部路徑依賴，避免 ts(2307) 報錯)
- */
-const HoverInfoPopover: React.FC<{
-  label?: string;
-  title: string;
-  children: React.ReactNode;
-  align?: 'left' | 'right';
-}> = ({ label, title, children, align = 'right' }) => {
-  const [pinned, setPinned] = useState(false);
-
-  return (
-    <div
-      className="relative inline-flex items-center group"
-      onMouseLeave={() => setPinned(false)}
-    >
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          setPinned((prev) => !prev);
-        }}
-        aria-label={title}
-        className="inline-flex items-center gap-1 text-[11px] text-slate-400 hover:text-indigo-600 focus:text-indigo-600 transition-colors cursor-pointer focus:outline-none"
-      >
-        <HelpCircle className="w-3.5 h-3.5 shrink-0" />
-        {label && (
-          <span className="underline decoration-dotted underline-offset-2">
-            {label}
-          </span>
-        )}
-      </button>
-
-      <div
-        className={`max-sm:fixed max-sm:left-3 max-sm:right-3 max-sm:top-16 max-sm:w-auto sm:absolute ${
-          align === 'right' ? 'sm:right-0' : 'sm:left-0'
-        } sm:top-full sm:mt-1.5 z-50 sm:w-72 p-3 rounded-xl bg-slate-900/95 text-slate-100 text-[11px] leading-relaxed shadow-xl border border-slate-700 transition-all duration-150 ${
-          pinned
-            ? 'opacity-100 visible pointer-events-auto'
-            : 'opacity-0 invisible pointer-events-none group-hover:opacity-100 group-hover:visible group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:visible'
-        }`}
-      >
-        <div className="font-semibold text-white mb-1 flex items-center gap-1.5 border-b border-slate-700/80 pb-1">
-          <Info className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-          <span>{title}</span>
-        </div>
-        <div className="text-slate-300 space-y-1 font-normal">{children}</div>
-      </div>
-    </div>
-  );
-};
-
 export const SpeakerSyncPanel: React.FC = () => {
-  const {
-    config,
-    updateConfig,
-    updateDiarizationConfig,
-    speakers,
-    segments,
-    renameSpeaker,
-    mergeSpeakers,
-    phoneticCandidates,
-    setPhoneticCandidates,
-    applyPhoneticReplacements,
-    audioPreAnalysis,
-    selectedPresetId,
-    applyRecommendedPreset,
-  } = useAppStore();
+  const speakers = useAppStore((s) => s.speakers);
+  const segments = useAppStore((s) => s.segments);
+  const config = useAppStore((s) => s.config);
+  const updateConfig = useAppStore((s) => s.updateConfig);
+  const updateDiarizationConfig = useAppStore((s) => s.updateDiarizationConfig);
+  const renameSpeaker = useAppStore((s) => s.renameSpeaker);
+  const mergeSpeakers = useAppStore((s) => s.mergeSpeakers);
+  const phoneticCandidates = useAppStore((s) => s.phoneticCandidates);
+  const setPhoneticCandidates = useAppStore((s) => s.setPhoneticCandidates);
+  const applyPhoneticReplacements = useAppStore(
+    (s) => s.applyPhoneticReplacements
+  );
+  const audioPreAnalysis = useAppStore((s) => s.audioPreAnalysis);
+  const selectedPresetId = useAppStore((s) => s.selectedPresetId);
+  const applyRecommendedPreset = useAppStore((s) => s.applyRecommendedPreset);
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [nameInput, setNameInput] = useState('');
   const [mergeSourceId, setMergeSourceId] = useState<string>('');
   const [mergeTargetId, setMergeTargetId] = useState<string>('');
-  const [showScenarioGuide, setShowScenarioGuide] = useState<boolean>(false);
-  const [showAdvancedTech, setShowAdvancedTech] = useState<boolean>(false);
+  const [showScenarioGuide, setShowScenarioGuide] = useState(false);
+  const [showAdvancedTech, setShowAdvancedTech] = useState(false);
 
+  const speakerList = Object.values(speakers);
   const diarCfg = config.diarizationConfig || {
     engineMode: 'mode_0_heritage_classic',
     clusterMethod: 'ahc_cosine',
     executionBackend: 'wasm',
     onnxModelFilename: 'wespeaker_voxceleb_resnet34_int8.onnx',
+    localWasmBasePath: './wasm/',
+    localModelBasePath: './models/',
+    yieldEveryNUnits: 14,
+    enableGlobalMeanCentering: false,
     languageHint: 'zh',
+    shortTurnConfidenceKeepThreshold: 0.66,
+    pingPongMaxDurSec: 1.6,
+    enablePauseAndSemanticWeighting: true,
     scdPeakThreshold: 0.22,
     backchannelMarginThreshold: 0.12,
     enableAcousticDivergencePreproc: true,
@@ -169,9 +143,6 @@ export const SpeakerSyncPanel: React.FC = () => {
     ENGINE_STRATEGY_GUIDES[diarCfg.engineMode] ||
     ENGINE_STRATEGY_GUIDES.mode_0_heritage_classic;
 
-  const speakerList = Object.values(speakers);
-  const hasMultipleSpeakers = speakerList.length >= 2;
-  const hasPhoneticCandidates = phoneticCandidates.length > 0;
   const scdThreshold = diarCfg.scdPeakThreshold ?? 0.22;
   const preprocEnabled = diarCfg.enableAcousticDivergencePreproc ?? true;
   const virtualTrackEnabled =
@@ -182,64 +153,94 @@ export const SpeakerSyncPanel: React.FC = () => {
     setNameInput(currentName);
   };
 
+  const scanPhoneticMatchesForSpeaker = (newName: string) => {
+    const cleanName = newName
+      .replace(/[\(（].*?[\)）]/g, '')
+      .replace(/語者\s*\d+/g, '')
+      .trim();
+    if (cleanName.length < 2) return;
+
+    const targetSig = toPhoneticSignature(cleanName);
+    const len = cleanName.length;
+    const matches: typeof phoneticCandidates = [];
+
+    for (const seg of segments) {
+      for (let wIdx = 0; wIdx < seg.words.length; wIdx++) {
+        const w = seg.words[wIdx];
+        const txt = w.text.trim();
+        if (txt.length === len && txt !== cleanName && /^[\u4e00-\u9fa5]+$/.test(txt)) {
+          const dist = computeTaiwanPhoneticDistance(txt, cleanName);
+          if (toPhoneticSignature(txt) === targetSig || dist <= 0.24) {
+            const left = seg.words
+              .slice(Math.max(0, wIdx - 2), wIdx)
+              .map((x) => x.text)
+              .join('');
+            const right = seg.words
+              .slice(wIdx + 1, Math.min(seg.words.length, wIdx + 3))
+              .map((x) => x.text)
+              .join('');
+            matches.push({
+              segmentId: seg.id,
+              wordIndex: wIdx,
+              matchedText: txt,
+              targetSpeakerName: cleanName,
+              contextPreview: `...${left}【${txt}】${right}...`,
+              selected: true,
+            });
+          }
+        }
+      }
+    }
+
+    if (matches.length > 0) {
+      setPhoneticCandidates(matches);
+    }
+  };
+
   const handleConfirmRename = (id: string) => {
     const trimmed = nameInput.trim();
     if (trimmed) {
       renameSpeaker(id, trimmed);
-
-      try {
-        const matcherFn = (phoneticModule as Record<string, unknown>)
-          .scanHomophoneSpeakerMentions as (...args: unknown[]) => unknown;
-
-        if (typeof matcherFn === 'function') {
-          let result: unknown;
-          try {
-            result = matcherFn(trimmed, segments);
-          } catch {
-            const fullText = segments
-              .map((seg) => seg.words.map((w) => w.text).join(''))
-              .join('\n');
-            result = matcherFn(fullText, trimmed, segments);
-          }
-
-          if (Array.isArray(result)) {
-            setPhoneticCandidates(result);
-          }
-        }
-      } catch (err) {
-        console.warn('掃描同音稱謂略過:', err);
-      }
+      scanPhoneticMatchesForSpeaker(trimmed);
     }
     setEditingId(null);
   };
 
+  const handleMergeConfirm = () => {
+    if (!mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId) {
+      return;
+    }
+    mergeSpeakers(mergeSourceId, mergeTargetId);
+    setMergeSourceId('');
+    setMergeTargetId('');
+  };
+
   const handleMinChange = (val: number) => {
     const safeMin = Math.max(1, Math.min(10, val));
-    const safeMax = Math.max(safeMin, config.maxSpeakers);
-    updateConfig({ minSpeakers: safeMin, maxSpeakers: safeMax });
+    updateConfig({
+      minSpeakers: safeMin,
+      maxSpeakers: Math.max(safeMin, config.maxSpeakers),
+    });
   };
 
   const handleMaxChange = (val: number) => {
     const safeMax = Math.max(1, Math.min(10, val));
-    const safeMin = Math.min(config.minSpeakers, safeMax);
-    updateConfig({ minSpeakers: safeMin, maxSpeakers: safeMax });
+    updateConfig({
+      minSpeakers: Math.min(config.minSpeakers, safeMax),
+      maxSpeakers: safeMax,
+    });
   };
 
-  const handleMergeConfirm = () => {
-    if (mergeSourceId && mergeTargetId && mergeSourceId !== mergeTargetId) {
-      mergeSpeakers(mergeSourceId, mergeTargetId);
-      setMergeSourceId('');
-      setMergeTargetId('');
-    }
-  };
+  const hasMultipleSpeakers = speakerList.length >= 2;
+  const hasPhoneticCandidates = phoneticCandidates.length > 0;
 
   const handleSelectEngineMode = (mode: DiarizationEngineMode) => {
     if (mode === 'mode_0_heritage_classic') {
       updateDiarizationConfig({
         engineMode: mode,
         clusterMethod: 'ahc_cosine',
-        scdPeakThreshold: 0.21,
-        backchannelMarginThreshold: 0.11,
+        scdPeakThreshold: 0.22,
+        backchannelMarginThreshold: 0.12,
         enableAcousticDivergencePreproc: true,
         enableVirtualSpeakerTrackStitching: false,
       });
@@ -247,7 +248,7 @@ export const SpeakerSyncPanel: React.FC = () => {
       updateDiarizationConfig({
         engineMode: mode,
         clusterMethod: 'ahc_cosine',
-        scdPeakThreshold: 0.27,
+        scdPeakThreshold: 0.25,
         backchannelMarginThreshold: 0.15,
         enableAcousticDivergencePreproc: true,
         enableVirtualSpeakerTrackStitching: false,
@@ -270,6 +271,23 @@ export const SpeakerSyncPanel: React.FC = () => {
         enableAcousticDivergencePreproc: true,
         enableVirtualSpeakerTrackStitching: false,
       });
+    }
+  };
+
+  const handleQuickAutoMergeSameGender = () => {
+    if (speakerList.length < 2) return;
+    // 自動尋找同性別標籤（如多個「男聲/中低音」或多個「女聲/高音」）並設定至下拉選單供使用者一鍵確認
+    const males = speakerList.filter((s) => s.name.includes('男聲'));
+    const females = speakerList.filter((s) => s.name.includes('女聲'));
+    if (males.length >= 2) {
+      setMergeTargetId(males[0].id);
+      setMergeSourceId(males[males.length - 1].id);
+    } else if (females.length >= 2) {
+      setMergeTargetId(females[0].id);
+      setMergeSourceId(females[females.length - 1].id);
+    } else {
+      setMergeTargetId(speakerList[0].id);
+      setMergeSourceId(speakerList[speakerList.length - 1].id);
     }
   };
 
@@ -301,7 +319,7 @@ export const SpeakerSyncPanel: React.FC = () => {
             </span>
           </div>
           <div className="grid grid-cols-3 gap-1">
-            {audioPreAnalysis.recommendations.map((opt) => {
+            {audioPreAnalysis.recommendations.map((opt: AudioRecommendationOption) => {
               const isSelected = selectedPresetId === opt.id;
               return (
                 <button
@@ -340,7 +358,7 @@ export const SpeakerSyncPanel: React.FC = () => {
                 • <strong>點選上方快捷鍵</strong>即可套用常見人數範圍。
               </p>
               <p>
-                • 若不確定實際有幾人開口，建議維持 <strong>2～6 人</strong>，系統會根據聲音特徵自動判斷實際人數。
+                • 建議將「最少人數」設為 <strong>2 人</strong>、「最多人數」設為 <strong>4～6 人</strong>，讓系統在雙人問答與多人補充之間自動調節，避免把同一人切碎。
               </p>
             </HoverInfoPopover>
           </div>
@@ -350,7 +368,7 @@ export const SpeakerSyncPanel: React.FC = () => {
               { label: '2人', min: 2, max: 2 },
               { label: '2~4人', min: 2, max: 4 },
               { label: '2~6人', min: 2, max: 6 },
-              { label: '4~8人', min: 4, max: 8 },
+              { label: '4~8人', min: 2, max: 8 },
             ].map((preset) => {
               const active =
                 config.minSpeakers === preset.min &&
@@ -404,7 +422,7 @@ export const SpeakerSyncPanel: React.FC = () => {
         </div>
       </div>
 
-      {/* 2. 會議情境模式選擇 (預設收起適用情境說明，保持版面精簡，點擊或挑選時再展開) */}
+      {/* 2. 會議情境模式選擇 */}
       <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-2.5 space-y-2">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1.5">
@@ -459,7 +477,6 @@ export const SpeakerSyncPanel: React.FC = () => {
           </option>
         </select>
 
-        {/* 三行情境提示（預設收合，僅在點擊「適用情境說明」或挑選下拉選單時展開） */}
         {showScenarioGuide && (
           <div className="rounded-md bg-white border border-slate-200/90 p-2 text-[11px] leading-relaxed space-y-1 relative">
             <button
@@ -485,7 +502,6 @@ export const SpeakerSyncPanel: React.FC = () => {
           </div>
         )}
 
-        {/* 會議語言與插話敏感度 (精簡直覺版) */}
         <div className="grid grid-cols-2 gap-1.5 pt-0.5">
           <div className="flex items-center bg-white px-2 py-1 rounded border border-slate-200">
             <Globe2 className="w-3.5 h-3.5 text-slate-400 shrink-0 mr-1.5" />
@@ -541,13 +557,12 @@ export const SpeakerSyncPanel: React.FC = () => {
                 • <strong>積極切分</strong>：當大家頻繁插話（「對」、「沒錯」），覺得兩個人常被黏在同一句時選這個。
               </p>
               <p>
-                • <strong>減少碎切</strong>：當同一個人講話常停頓喘氣，卻被誤切成兩個人時選這個。
+                • <strong>減少碎切</strong>：當同一個人講話常停頓翻頁，卻被誤切成兩個人時選這個。
               </p>
             </HoverInfoPopover>
           </div>
         </div>
 
-        {/* 進階工程微調 (預設收起，不干擾一般同事) */}
         <div className="pt-1 border-t border-slate-200/70">
           <button
             type="button"
@@ -567,7 +582,6 @@ export const SpeakerSyncPanel: React.FC = () => {
 
           {showAdvancedTech && (
             <div className="mt-2 pt-2 border-t border-slate-200/60 space-y-2 text-[11px]">
-              {/* 細部滑桿與演算法選項，皆附帶浮出視窗說明 */}
               <div className="flex items-center justify-between">
                 <span className="text-slate-600 flex items-center gap-1">
                   分群演算法
@@ -656,7 +670,7 @@ export const SpeakerSyncPanel: React.FC = () => {
                     align="left"
                   >
                     <p>
-                      僅在「語者分離軌道」強化個人聲道共振峰（F2～F4）與時長自適應去均值；送給 Whisper 轉寫的音訊保持 100% 原始自然音質。建議保持開啟。
+                      僅在「語者分離軌道」強化個人聲道共振峰（F2～F4）與通道錨定去均值；送給 Whisper 轉寫的音訊保持 100% 原始自然音質。建議保持開啟。
                     </p>
                   </HoverInfoPopover>
                 </span>
@@ -749,7 +763,7 @@ export const SpeakerSyncPanel: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => handleStartEdit(sp.id, sp.name)}
-                  className="text-[11px] text-slate-500 hover:text-blue-600 ml-2 shrink-0"
+                  className="text-[11px] text-slate-500 hover:text-blue-600 ml-2 shrink-0 cursor-pointer"
                 >
                   更名
                 </button>
@@ -770,7 +784,7 @@ export const SpeakerSyncPanel: React.FC = () => {
             <button
               type="button"
               onClick={applyPhoneticReplacements}
-              className="text-[11px] px-2 py-0.5 bg-amber-600 text-white rounded font-medium hover:bg-amber-700 flex items-center gap-1"
+              className="text-[11px] px-2 py-0.5 bg-amber-600 text-white rounded font-medium hover:bg-amber-700 flex items-center gap-1 cursor-pointer"
             >
               <CheckCircle2 className="w-3 h-3" />
               套用修正
@@ -794,41 +808,54 @@ export const SpeakerSyncPanel: React.FC = () => {
         </div>
       )}
 
-      {/* 5. 合併同一人之語者標籤 */}
+      {/* 5. 合併同一人之語者標籤 (修正版：雙欄自適應下拉選單 + 獨立滿版高對比「合併語者標籤」按鈕，永不裁切超出邊界) */}
       {hasMultipleSpeakers && (
-        <div className="pt-2 border-t border-slate-100 space-y-1.5">
-          <div className="text-xs font-medium text-slate-600 flex items-center gap-1">
-            <Merge className="w-3.5 h-3.5 text-slate-400" />
-            <span>合併同一人之語者標籤</span>
-            <HoverInfoPopover
-              title="什麼時候需要合併語者？"
-              align="left"
-            >
-              <p>
-                若同一位與會者因笑聲、咳嗽或音量變化被分成兩個標籤（例如「語者 01」與「語者 04」其實是同一人），可在此將「語者 04」併入「語者 01」，全文會自動同步合併。
-              </p>
-            </HoverInfoPopover>
+        <div className="pt-2.5 border-t border-slate-200/80 space-y-2 bg-slate-50/70 -mx-1 px-2.5 py-2 rounded-lg">
+          <div className="flex items-center justify-between gap-1">
+            <div className="text-xs font-semibold text-slate-700 flex items-center gap-1">
+              <Merge className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+              <span>合併同一人之語者標籤</span>
+              <HoverInfoPopover
+                title="什麼時候需要合併語者？"
+                align="left"
+              >
+                <p>
+                  若同一位與會者因遠近音量變化或翻閱文件被分成兩個標籤（例如「語者 04」與「語者 02」其實是同一人），可在此選擇來源與目標後點擊下方<strong>「合併語者標籤」</strong>，全文會自動同步合併並重新順暢接句。
+                </p>
+              </HoverInfoPopover>
+            </div>
+            {speakerList.length > 2 && (
+              <button
+                type="button"
+                onClick={handleQuickAutoMergeSameGender}
+                className="text-[10px] text-indigo-600 hover:text-indigo-800 font-medium underline cursor-pointer shrink-0"
+                title="自動預選同性別之重複語者標籤"
+              >
+                預選同性別
+              </button>
+            )}
           </div>
-          <div className="flex items-center gap-1.5">
+
+          <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-1.5">
             <select
               value={mergeSourceId}
               onChange={(e) => setMergeSourceId(e.target.value)}
-              className="flex-1 text-xs border border-slate-200 rounded px-1.5 py-1 bg-slate-50 text-slate-700 focus:outline-none"
+              className="w-full min-w-0 text-xs border border-slate-300 rounded-md px-2 py-1.5 bg-white text-slate-800 font-medium focus:outline-none focus:border-blue-500 truncate"
             >
-              <option value="">選擇來源...</option>
+              <option value="">選擇被合併語者...</option>
               {speakerList.map((sp) => (
                 <option key={sp.id} value={sp.id}>
                   {sp.name}
                 </option>
               ))}
             </select>
-            <span className="text-xs text-slate-400">→</span>
+            <span className="text-xs font-bold text-slate-400 px-0.5">→</span>
             <select
               value={mergeTargetId}
               onChange={(e) => setMergeTargetId(e.target.value)}
-              className="flex-1 text-xs border border-slate-200 rounded px-1.5 py-1 bg-slate-50 text-slate-700 focus:outline-none"
+              className="w-full min-w-0 text-xs border border-slate-300 rounded-md px-2 py-1.5 bg-white text-slate-800 font-medium focus:outline-none focus:border-blue-500 truncate"
             >
-              <option value="">併入目標...</option>
+              <option value="">併入目標語者...</option>
               {speakerList
                 .filter((sp) => sp.id !== mergeSourceId)
                 .map((sp) => (
@@ -837,15 +864,21 @@ export const SpeakerSyncPanel: React.FC = () => {
                   </option>
                 ))}
             </select>
-            <button
-              type="button"
-              disabled={!mergeSourceId || !mergeTargetId}
-              onClick={handleMergeConfirm}
-              className="px-2 py-1 text-xs bg-slate-800 text-white rounded hover:bg-slate-700 disabled:opacity-40 shrink-0"
-            >
-              合併
-            </button>
           </div>
+
+          <button
+            type="button"
+            disabled={!mergeSourceId || !mergeTargetId || mergeSourceId === mergeTargetId}
+            onClick={handleMergeConfirm}
+            className="w-full py-1.5 px-3 text-xs font-semibold bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-md shadow-2xs disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
+          >
+            <Merge className="w-3.5 h-3.5 shrink-0" />
+            <span>
+              {mergeSourceId && mergeTargetId
+                ? `確認將「${speakers[mergeSourceId]?.name.split(' ')[0] || mergeSourceId}」併入「${speakers[mergeTargetId]?.name.split(' ')[0] || mergeTargetId}」`
+                : '請選擇上方兩個語者後點擊合併'}
+            </span>
+          </button>
         </div>
       )}
     </div>
