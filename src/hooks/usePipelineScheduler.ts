@@ -43,6 +43,7 @@ import {
   generateStructuredMeetingMinutes,
   mineAdaptiveHighFreqTerms,
   runGlobalRetroactiveContextPass,
+  runIncrementalRetroactiveEntityPass,
   runStage1SentenceIntegrityCheckAndRepair,
   runTriLevelWindowCorrection,
 } from '../services/engineRouter';
@@ -1312,20 +1313,24 @@ export function usePipelineScheduler() {
                   );
 
                 let windowStage1Segments = stage1Fixed;
-                if (
-                  lastPriorSeg &&
-                  stage1Fixed.length > 0 &&
-                  stage1Fixed[0].id === lastPriorSeg.id
-                ) {
-                  useAppStore
-                    .getState()
-                    .replaceBatchSegments([stage1Fixed[0]]);
-                  windowStage1Segments = stage1Fixed.slice(1);
+                if (lastPriorSeg && stage1Fixed.length > 0) {
+                  const priorDerivedCount = stage1Fixed.filter(
+                    (s) =>
+                      s.id === lastPriorSeg.id ||
+                      s.id.startsWith(`${lastPriorSeg.id}_`)
+                  ).length;
+                  if (priorDerivedCount > 0) {
+                    const priorDerived = stage1Fixed.slice(0, priorDerivedCount);
+                    useAppStore
+                      .getState()
+                      .replaceBatchSegments(priorDerived, [lastPriorSeg.id]);
+                    windowStage1Segments = stage1Fixed.slice(priorDerivedCount);
+                  }
                 }
 
                 // 同時結合字典先驗與目前已驗證之高頻詞彙進行即時單句校準
                 const verifiedSoFar = mineAdaptiveHighFreqTerms(
-                  useAppStore.getState().segments,
+                  [...useAppStore.getState().segments, ...windowStage1Segments],
                   latestDict,
                   stateBeforeWin.docContextSummary
                 );
@@ -1340,6 +1345,8 @@ export function usePipelineScheduler() {
                     latestDict
                   );
                 useAppStore.getState().appendSegments(instantCorrected);
+                // 即時跨視窗回溯：當後文聽出正確專有名詞（如 02:44「尖石」）時，立即將前文同音誤植（如 00:39/00:43「監持」）同步修正！
+                runIncrementalRetroactiveEntityPass();
                 pendingWindowSegments.push(...instantCorrected);
 
                 const addedChars = instantCorrected.reduce(
