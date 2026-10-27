@@ -1,6 +1,6 @@
 // src/data/taiwanMeetingDictionary.ts
 // ============================================================================
-// 台灣商業、政府公務、地方創生、採購標案、學術研發與科技專案內建大詞典 (獨立維護檔)
+// 台灣商業、政府公務、地方創生、採購標案、鄉鎮市區與科技專案內建大詞典 (獨立維護檔)
 // ----------------------------------------------------------------------------
 // 設計目的：
 // 1. 獨立於核心邏輯之外，方便日後直接新增、修改或匯出台灣在地會議常用詞彙。
@@ -8,7 +8,7 @@
 //    杜絕將不同語意詞彙混入 aliases 造成誤替換。
 // 3. 針對特定領域之千詞級完整名單（如 1,394 筆之《HybTransPlus 地方創生字典》），
 //    系統支援透過網址參數 `?dict=1ra9-ylqZrpBA5d6g0VLW_pENIYJnR1jICVjAi2oLu6E` 動態載入，
-//    本內建詞庫則精選高頻、零碰撞風險之核心機構、計畫、專詞與常駐與會者。
+//    本內建詞庫則精選高頻、零碰撞風險之核心部會、計畫、鄉鎮地名、專詞與常駐與會者。
 // ============================================================================
 
 import { DictCategory, DictEntry } from '../types';
@@ -32,6 +32,25 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
     term: '國發會',
     category: 'person',
     aliases: ['國法會', '過發會', '果發會', '國發匯', '廣發會'],
+  },
+  {
+    term: '原民會',
+    category: 'person',
+    aliases: [
+      '園民會',
+      '援民會',
+      '圓民會',
+      '願意會',
+      '原明會',
+      '原名會',
+      '人民會',
+      '員民會',
+    ],
+  },
+  {
+    term: '原住民族委員會',
+    category: 'project',
+    aliases: ['原住民委員會', '園住民族委員會'],
   },
   {
     term: '國土區域離島發展處',
@@ -99,7 +118,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '經濟部',
     category: 'person',
-    aliases: ['金濟部', '經紀部'],
+    aliases: ['金濟部', '經紀部', '精濟部'],
   },
   {
     term: '勞動部',
@@ -109,17 +128,52 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '農業部',
     category: 'person',
-    aliases: ['農委會', '農業處'],
+    aliases: ['農委會', '農業處', '濃業部'],
+  },
+  {
+    term: '林業保育署',
+    category: 'person',
+    aliases: ['林務局', '林保署', '林業署', '林業保育處'],
   },
   {
     term: '文化部',
     category: 'person',
-    aliases: ['文化處'],
+    aliases: ['文化處', '文話部'],
+  },
+  {
+    term: '文資司',
+    category: 'person',
+    aliases: ['文資師', '文資絲', '文字司', '文資局'],
   },
   {
     term: '環境部',
     category: 'person',
     aliases: ['環保署'],
+  },
+  {
+    term: '交通部',
+    category: 'person',
+    aliases: ['交痛部', '交統部'],
+  },
+  {
+    term: '衛福部',
+    category: 'person',
+    aliases: ['衛服部', '未福部', '衛生福利部'],
+  },
+  {
+    term: '教育部',
+    category: 'person',
+    aliases: ['較育部', '教育處'],
+  },
+  {
+    term: '內政部',
+    category: 'person',
+    aliases: ['內正部'],
+  },
+  {
+    term: '國產署',
+    category: 'person',
+    aliases: ['國有財產署', '國產處', '國產屬'],
   },
   {
     term: '金管會',
@@ -155,6 +209,11 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
     term: '行政院',
     category: 'person',
     aliases: ['行正院'],
+  },
+  {
+    term: '報告主席',
+    category: 'jargon',
+    aliases: ['官方主席', '廣方主席', '大方主席', '防方主席', '報到主席'],
   },
   {
     term: '處內',
@@ -198,7 +257,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   {
     term: '工項',
     category: 'project',
-    aliases: ['功項', '工象', '攻項', '公項', '工向', '功象', '供項'],
+    aliases: ['功項', '工象', '攻項', '公項', '工向', '功象', '供項', '空向'],
   },
   {
     term: '後續擴充',
@@ -231,6 +290,16 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
     aliases: ['省查委員', '審查委原'],
   },
   {
+    term: '工作會報',
+    category: 'project',
+    aliases: ['工作回報', '工作匯報', '工作會報的'],
+  },
+  {
+    term: '工作會議',
+    category: 'project',
+    aliases: ['工作匯議', '工作會意'],
+  },
+  {
     term: '徵件',
     category: 'project',
     aliases: ['成見', '針見', '真見', '政見', '爭件', '徵見', '真劍'],
@@ -259,6 +328,16 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
     term: '補助金',
     category: 'project',
     aliases: ['捕助金', '補住金'],
+  },
+  {
+    term: '機具補助',
+    category: 'project',
+    aliases: ['機俱補助', '積聚補助', '機具捕助'],
+  },
+  {
+    term: '產業培訓',
+    category: 'project',
+    aliases: ['產業陪訓', '產業賠訓', '展業培訓'],
   },
   {
     term: '配合款',
@@ -312,12 +391,65 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   },
 
   // ==========================================================================
-  // 三、 地方創生核心計畫、媒體合作與高頻專有名詞（精選自 HybTransPlus 地方創生字典）
+  // 三、 地方創生核心計畫、公有空間活化與高頻專有名詞
   // ==========================================================================
   {
     term: '地方創生',
     category: 'project',
     aliases: ['地方創身', '地方創聲', '地方創深'],
+  },
+  {
+    term: '公有空間活化',
+    category: 'project',
+    aliases: [
+      '風天活化',
+      '風間活化',
+      '公空間活化',
+      '罐空間活化',
+      '公有空間文化',
+      '公有空間火化',
+    ],
+  },
+  {
+    term: '公有空間',
+    category: 'project',
+    aliases: ['罐空間', '光有空間', '共有空間', '公空間'],
+  },
+  {
+    term: '優先推動區',
+    category: 'project',
+    aliases: [
+      '優秀性追蹤區',
+      '優先性追蹤區',
+      '優秀推動區',
+      '優先推動區區預',
+      '優先推動區域',
+    ],
+  },
+  {
+    term: '苦茶油',
+    category: 'project',
+    aliases: ['埔茶油', '古茶油', '苦茶由', '苦茶遊'],
+  },
+  {
+    term: '幸福巴士',
+    category: 'project',
+    aliases: ['信福巴士', '幸褔巴士'],
+  },
+  {
+    term: '吊橋工程',
+    category: 'project',
+    aliases: ['釣橋工程', '調橋工程', '一有工程'],
+  },
+  {
+    term: '林下經濟',
+    category: 'project',
+    aliases: ['林夏經濟', '臨下經濟', '零下經濟'],
+  },
+  {
+    term: '台灣白及',
+    category: 'project',
+    aliases: ['台灣白吉', '台灣白急', '臺灣白及', '臺灣白吉'],
   },
   {
     term: '地方創生專案辦公室',
@@ -385,6 +517,186 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
     aliases: ['麻祖', '媽祖', '馬組', '麻組'],
   },
   {
+    term: '尖石',
+    category: 'jargon',
+    aliases: ['監時', '堅石', '兼時', '間時'],
+  },
+  {
+    term: '五峰',
+    category: 'jargon',
+    aliases: ['武功', '武風', '五風', '午峰'],
+  },
+  {
+    term: '石磊部落',
+    category: 'jargon',
+    aliases: ['十壘部落', '石壘部絡', '石雷部落'],
+  },
+  {
+    term: '南庄',
+    category: 'jargon',
+    aliases: ['南莊', '難庄', '藍庄'],
+  },
+  {
+    term: '獅潭',
+    category: 'jargon',
+    aliases: ['師潭', '詩潭', '施潭', '獅壇'],
+  },
+  {
+    term: '卓蘭',
+    category: 'jargon',
+    aliases: ['竹蘭', '著蘭', '卓藍'],
+  },
+  {
+    term: '秀水',
+    category: 'jargon',
+    aliases: ['袖水', '鏽水'],
+  },
+  {
+    term: '竹塘',
+    category: 'jargon',
+    aliases: ['竹堂', '足塘'],
+  },
+  {
+    term: '二林',
+    category: 'jargon',
+    aliases: ['二霖', '餓林'],
+  },
+  {
+    term: '溪湖',
+    category: 'jargon',
+    aliases: ['西湖', '希湖'],
+  },
+  {
+    term: '中寮',
+    category: 'jargon',
+    aliases: ['忠寮', '終寮'],
+  },
+  {
+    term: '台西',
+    category: 'jargon',
+    aliases: ['臺西', '抬西'],
+  },
+  {
+    term: '崙背',
+    category: 'jargon',
+    aliases: ['輪背', '倫背', '論背'],
+  },
+  {
+    term: '東山',
+    category: 'jargon',
+    aliases: ['冬山', '東衫'],
+  },
+  {
+    term: '西港',
+    category: 'jargon',
+    aliases: ['希港', '溪港'],
+  },
+  {
+    term: '麻豆',
+    category: 'jargon',
+    aliases: ['麻逗', '馬豆'],
+  },
+  {
+    term: '佳里',
+    category: 'jargon',
+    aliases: ['家裡', '嘉里', '佳裡'],
+  },
+  {
+    term: '南化',
+    category: 'jargon',
+    aliases: ['難化', '南話'],
+  },
+  {
+    term: '內門',
+    category: 'jargon',
+    aliases: ['那門', '內們'],
+  },
+  {
+    term: '關廟',
+    category: 'jargon',
+    aliases: ['觀廟', '官廟'],
+  },
+  {
+    term: '燕巢',
+    category: 'jargon',
+    aliases: ['驗巢', '宴巢'],
+  },
+  {
+    term: '田寮',
+    category: 'jargon',
+    aliases: ['甜寮', '填寮'],
+  },
+  {
+    term: '旗津',
+    category: 'jargon',
+    aliases: ['齊津', '奇津'],
+  },
+  {
+    term: '茂林',
+    category: 'jargon',
+    aliases: ['冒林', '貿林'],
+  },
+  {
+    term: '萬丹',
+    category: 'jargon',
+    aliases: ['萬單', '慢丹'],
+  },
+  {
+    term: '九如',
+    category: 'jargon',
+    aliases: ['久如', '酒如'],
+  },
+  {
+    term: '鹽埔',
+    category: 'jargon',
+    aliases: ['炎埔', '言埔', '鹽捕'],
+  },
+  {
+    term: '枋山',
+    category: 'jargon',
+    aliases: ['方山', '芳山'],
+  },
+  {
+    term: '新埤',
+    category: 'jargon',
+    aliases: ['心埤', '新皮'],
+  },
+  {
+    term: '崁頂',
+    category: 'jargon',
+    aliases: ['砍頂', '坎頂'],
+  },
+  {
+    term: '南州',
+    category: 'jargon',
+    aliases: ['難州', '南洲'],
+  },
+  {
+    term: '南澳',
+    category: 'jargon',
+    aliases: ['難澳', '南奧'],
+  },
+  {
+    term: '鳳林',
+    category: 'jargon',
+    aliases: ['奉林', '縫林'],
+  },
+  {
+    term: '玉里',
+    category: 'jargon',
+    aliases: ['玉裡', '育里'],
+  },
+  {
+    term: '瑞穗',
+    category: 'jargon',
+    aliases: ['瑞歲', '銳穗'],
+  },
+  {
+    term: '蘭嶼',
+    category: 'jargon',
+    aliases: ['藍嶼', '攔嶼'],
+  },
+  {
     term: '業師',
     category: 'person',
     aliases: ['夜師', '夜食', '業室', '業勢', '夜視', '葉師'],
@@ -442,7 +754,7 @@ export const TAIWAN_MEETING_DICTIONARY_SEEDS: BuiltinDictSeed[] = [
   },
 
   // ==========================================================================
-  // 四、 國發會與地方創生專案辦公室核心常駐與會人名與稱謂（零碰撞高識別度）
+  // 四、 國發會與地方創生專案辦公室核心常駐與會人名與稱謂
   // ==========================================================================
   {
     term: '葉俊顯',
